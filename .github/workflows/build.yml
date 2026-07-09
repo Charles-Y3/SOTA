@@ -1,0 +1,94 @@
+name: Build SOTA
+
+on:
+  workflow_dispatch:      # "Run workflow" button on the Actions tab
+  push:
+    branches: [main]
+    tags: ["v*"]
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+
+      - name: Build SOTA.exe
+        run: >
+          pyinstaller --noconfirm --clean --windowed --name SOTA
+          --collect-all customtkinter
+          --collect-all tkinterdnd2
+          --collect-all sounddevice
+          --collect-all av
+          --collect-all docx
+          --collect-data faster_whisper
+          --collect-all ctranslate2
+          --hidden-import onnxruntime
+          app.py
+
+      - name: Zip the app
+        run: Compress-Archive -Path dist\SOTA\* -DestinationPath SOTA-windows.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SOTA-windows
+          path: SOTA-windows.zip
+
+  build-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+
+      - name: Build SOTA.app
+        run: >
+          pyinstaller --noconfirm --clean --windowed --name SOTA
+          --collect-all customtkinter
+          --collect-all tkinterdnd2
+          --collect-all sounddevice
+          --collect-all av
+          --collect-all docx
+          --collect-data faster_whisper
+          --collect-all ctranslate2
+          --hidden-import onnxruntime
+          app.py
+
+      - name: Zip the app (preserves permissions)
+        run: ditto -c -k --keepParent dist/SOTA.app SOTA-macOS.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SOTA-macOS
+          path: SOTA-macOS.zip
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build-windows, build-macos]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/SOTA-windows/SOTA-windows.zip
+            artifacts/SOTA-macOS/SOTA-macOS.zip
