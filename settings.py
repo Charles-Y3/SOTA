@@ -5,6 +5,8 @@ import os
 import sys
 import traceback
 
+APP_VERSION = "1.1.0"
+
 APP_DIR = os.path.join(
     os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "SOTA"
 )
@@ -28,6 +30,14 @@ DEFAULTS = {
     "transcribe_language": "auto",
     "timestamps": False,
     "ui_language": "en",
+    "llm_mode": "summarize",
+    "llm_target": "zh-hant",
+    "llm_quality": "balanced",
+    "editor_font_size": 14,
+    "llm_source_font_size": 13,
+    "llm_output_font_size": 13,
+    "llm_panel_split": 0.5,
+    "punct_pad_visible": False,
 }
 
 

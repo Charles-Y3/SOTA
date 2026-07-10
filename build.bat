@@ -39,12 +39,16 @@ pyinstaller --noconfirm --clean --windowed --name SOTA ^
   --collect-all docx ^
   --collect-data faster_whisper ^
   --collect-all ctranslate2 ^
+  --collect-all llama_cpp ^
   --hidden-import onnxruntime ^
   app.py || (echo Build failed.& pause & exit /b 1)
 
+echo Bundling README.md with the app...
+copy /Y README.md dist\SOTA\README.md >nul
+
 echo.
 echo ============================================================
-echo  Build complete:  dist\SOTA\SOTA.exe
+echo  Build complete:  dist\SOTA\SOTA.exe  (+ README.md alongside it)
 echo  Share the app by zipping the whole dist\SOTA folder.
 echo ============================================================
 pause

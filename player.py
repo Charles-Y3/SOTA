@@ -1,8 +1,9 @@
 """Simple, dependency-light audio player with variable-speed playback.
 
 Audio is decoded to a mono float32 array (via faster-whisper's PyAV helper,
-so no external ffmpeg is needed). Speed changes use an overlap-add time
-stretch so the pitch stays natural — 1.0x is bit-exact passthrough.
+so no external ffmpeg is needed). Speed changes use WSOLA (Waveform
+Similarity Overlap-Add) time-stretching so the pitch stays natural — 1.0x is
+bit-exact passthrough.
 
 The player is UI-agnostic: it talks to the GUI only through the optional
 `ready_callback` (fired when a speed's audio finishes preparing) so the app
@@ -12,45 +13,113 @@ can marshal that back onto the Tk thread.
 import threading
 
 import numpy as np
+from numpy.lib.stride_tricks import sliding_window_view
 
 PLAYBACK_RATE = 22050  # Hz — plenty for reviewing speech, keeps files small.
 SPEED_OPTIONS = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0]
 
+_FRAME = 1024                     # ~46ms at 22050Hz
+# A larger synthesis hop means fewer (and thus faster) iterations for the
+# same audio, at some cost in splice quality. 384 was chosen by measuring
+# actual splice-join correlation on real speech across several hop sizes:
+# it keeps ~92% of the quality of the smoothest (but ~1.7x slower) setting,
+# while both remain dramatically better than naive fixed-hop overlap-add
+# (which measured ~0.008 splice correlation — see wsola_test.py).
+_SYN_HOP = 384
+_SEARCH = 128                    # +/- search range for the best alignment
 
-def time_stretch(x, rate):
-    """Change tempo by `rate` while preserving pitch (overlap-add)."""
-    if abs(rate - 1.0) < 1e-3 or x.size == 0:
-        return x.astype(np.float32, copy=True)
 
-    frame = 1024
-    syn_hop = frame // 4                       # 256
+def time_stretch(x, rate, frame=_FRAME, syn_hop=_SYN_HOP, search=_SEARCH,
+                 progress_callback=None):
+    """Change tempo by `rate` while preserving pitch, using WSOLA.
+
+    Plain fixed-hop overlap-add (the naive approach) blindly takes evenly
+    spaced frames and glues them together; any phase mismatch between
+    consecutive frames causes the warbling/garbled "phasiness" that makes
+    speech unintelligible at extreme rates. WSOLA fixes this by, at each
+    step, searching a small window around the ideal next frame for the
+    position whose waveform best matches (via normalized cross-correlation)
+    the tail of the previously placed frame, so consecutive frames splice
+    together with minimal phase discontinuity.
+
+    progress_callback(fraction: float), if given, is called as the
+    stretch progresses (throttled to whole-percent changes).
+    """
+    x = np.asarray(x, dtype=np.float32)
+    n = len(x)
+    if n == 0 or abs(rate - 1.0) < 1e-3:
+        return x.copy()
+
     ana_hop = max(1, int(round(syn_hop * rate)))
-    win = np.hanning(frame).astype(np.float32)
+    window = np.hanning(frame).astype(np.float32)
+    overlap = frame - syn_hop
 
-    n_frames = 1 + max(0, (len(x) - frame) // ana_hop)
-    out_len = frame + syn_hop * (n_frames - 1)
+    # Pad so any candidate frame (including the search margin) can always be
+    # sliced without bounds-checking every access.
+    xp = np.pad(x, (search, frame + search), mode="constant")
+
+    out_len = int(n / rate) + frame + syn_hop
     out = np.zeros(out_len, dtype=np.float32)
     norm = np.zeros(out_len, dtype=np.float32)
 
-    for i in range(n_frames):
-        a = i * ana_hop
-        seg = x[a:a + frame]
-        if len(seg) < frame:
-            seg = np.pad(seg, (0, frame - len(seg)))
-        s = i * syn_hop
-        out[s:s + frame] += seg * win
-        norm[s:s + frame] += win
+    syn_pos = 0
+    # `ideal_ana` is a fixed grid that always advances by exactly `ana_hop`
+    # per step, independent of what the search below finds. It only ever
+    # picks *which frame* to use; it must never determine the next search
+    # center, or a run of "the leftmost candidate matches best" (common in
+    # silence/pauses) could leave the position stuck with zero net progress.
+    ideal_ana = 0
+    prev_tail = None  # last `overlap` raw (unwindowed) samples placed
+    last_reported_pct = -1
 
+    while ideal_ana < n:
+        if progress_callback is not None:
+            pct = int(ideal_ana / n * 100)
+            if pct != last_reported_pct:
+                last_reported_pct = pct
+                progress_callback(pct / 100)
+
+        lo = max(0, ideal_ana - search)
+        hi = min(n - 1, ideal_ana + search)
+        best = min(max(ideal_ana, lo), hi)
+
+        if prev_tail is not None and overlap > 0 and hi > lo:
+            width = hi - lo + 1
+            base = search + lo  # index into xp corresponding to input pos `lo`
+            candidates = sliding_window_view(xp[base:base + width + overlap - 1], overlap)
+            dots = candidates @ prev_tail
+            cand_norms = np.sqrt((candidates * candidates).sum(axis=1)) + 1e-8
+            best = lo + int(np.argmax(dots / cand_norms))
+
+        raw_frame = xp[search + best: search + best + frame]
+        end = syn_pos + frame
+        if end > len(out):
+            grow = end - len(out) + syn_hop * 8
+            out = np.concatenate([out, np.zeros(grow, dtype=np.float32)])
+            norm = np.concatenate([norm, np.zeros(grow, dtype=np.float32)])
+        out[syn_pos:end] += raw_frame * window
+        norm[syn_pos:end] += window
+
+        prev_tail = raw_frame[-overlap:] if overlap > 0 else None
+        syn_pos += syn_hop
+        ideal_ana += ana_hop
+
+    if progress_callback is not None:
+        progress_callback(1.0)
+
+    final_len = min(len(out), syn_pos + frame)
+    out = out[:final_len]
+    norm = norm[:final_len]
     norm[norm < 1e-6] = 1.0
-    out /= norm
+    out = out / norm
     peak = float(np.max(np.abs(out))) if out.size else 0.0
     if peak > 1.0:
-        out /= peak
-    return out
+        out = out / peak
+    return out.astype(np.float32)
 
 
 class Player:
-    def __init__(self, ready_callback=None):
+    def __init__(self, ready_callback=None, progress_callback=None):
         self._sd = None  # sounddevice, imported lazily
         self._base = np.zeros(0, dtype=np.float32)
         self.duration = 0.0
@@ -64,6 +133,9 @@ class Player:
         self._stream = None
         self._prepare_token = 0
         self.ready_callback = ready_callback
+        # progress_callback(speed, fraction) fires while a new (uncached)
+        # speed is being prepared in the background.
+        self.progress_callback = progress_callback
 
     # -- loading ------------------------------------------------------------
 
@@ -169,17 +241,30 @@ class Player:
             self._speed = speed
             return
         frac = self.get_fraction()
+        # Every call invalidates any in-flight background stretch from a
+        # previous call, even one that resolves synchronously below (e.g.
+        # switching back to an already-cached speed) -- otherwise a slow
+        # speed-up still computing in the background can finish *after* the
+        # user has switched back down and silently overwrite that choice.
+        self._prepare_token += 1
+        token = self._prepare_token
+
         cached = self._cache.get(speed)
         if cached is not None:
             self._apply_speed_buffer(speed, cached, frac)
             return
 
-        self._prepare_token += 1
-        token = self._prepare_token
         base = self._base
 
+        def on_progress(fraction):
+            if token == self._prepare_token and self.progress_callback:
+                self.progress_callback(speed, fraction)
+
         def work():
-            stretched = time_stretch(base, speed)
+            stretched = time_stretch(
+                base, speed,
+                progress_callback=on_progress if self.progress_callback else None,
+            )
             if token != self._prepare_token:
                 return  # a newer speed change superseded this one
             self._cache[speed] = stretched

@@ -23,13 +23,20 @@ pyinstaller --noconfirm --clean --windowed --name SOTA \
   --collect-all docx \
   --collect-data faster_whisper \
   --collect-all ctranslate2 \
+  --collect-all llama_cpp \
   --hidden-import onnxruntime \
   app.py
 
+echo "Bundling README.md with the app..."
+rm -rf dist/SOTA-release
+mkdir -p dist/SOTA-release
+cp -R dist/SOTA.app dist/SOTA-release/
+cp README.md dist/SOTA-release/
+
 echo
 echo "============================================================"
-echo " Build complete: dist/SOTA.app"
-echo " Share the app by zipping dist/SOTA.app (use 'ditto' to"
-echo " preserve permissions, e.g.:"
-echo "   ditto -c -k --keepParent dist/SOTA.app SOTA-macOS.zip"
+echo " Build complete: dist/SOTA-release/ (SOTA.app + README.md)"
+echo " Share it by zipping that folder (use 'ditto' to preserve"
+echo " the app bundle's permissions, e.g.:"
+echo "   ditto -c -k --keepParent dist/SOTA-release SOTA-macOS.zip"
 echo "============================================================"

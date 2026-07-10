@@ -30,8 +30,12 @@ jobs:
           --collect-all docx
           --collect-data faster_whisper
           --collect-all ctranslate2
+          --collect-all llama_cpp
           --hidden-import onnxruntime
           app.py
+
+      - name: Bundle README with the app
+        run: Copy-Item README.md dist\SOTA\README.md
 
       - name: Zip the app
         run: Compress-Archive -Path dist\SOTA\* -DestinationPath SOTA-windows.zip
@@ -64,11 +68,18 @@ jobs:
           --collect-all docx
           --collect-data faster_whisper
           --collect-all ctranslate2
+          --collect-all llama_cpp
           --hidden-import onnxruntime
           app.py
 
+      - name: Bundle README with the app
+        run: |
+          mkdir -p dist/SOTA-release
+          cp -R dist/SOTA.app dist/SOTA-release/
+          cp README.md dist/SOTA-release/
+
       - name: Zip the app (preserves permissions)
-        run: ditto -c -k --keepParent dist/SOTA.app SOTA-macOS.zip
+        run: ditto -c -k --keepParent dist/SOTA-release SOTA-macOS.zip
 
       - uses: actions/upload-artifact@v4
         with:

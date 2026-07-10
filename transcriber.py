@@ -14,6 +14,7 @@ import os
 import threading
 
 import settings
+from progress import make_progress_tqdm_class
 
 # Canonical quality keys -> Whisper model sizes (kept small so downloads
 # stay reasonable and CPU transcription stays usable). Display names for
@@ -24,6 +25,33 @@ QUALITY_MODELS = {
     "accurate": "small",
 }
 MODEL_DOWNLOAD_MB = {"tiny": 75, "base": 145, "small": 480}
+
+# Rough total-RAM guidance (generous, accounting for OS + app overhead —
+# not just the model file) so we can warn before a download if the whole
+# system looks too tight to run comfortably. Whisper models are small
+# enough that this rarely bites, but it keeps the check symmetric with the
+# LLM one in llm.py.
+QUALITY_RAM_GB = {"fast": 1.0, "balanced": 1.5, "accurate": 2.5}
+
+
+def recommended_quality(ram_gb):
+    """Highest quality tier likely to run comfortably with `ram_gb` of
+    total RAM. Defaults to "balanced" if RAM couldn't be determined."""
+    if ram_gb is None:
+        return "balanced"
+    best = "fast"
+    for key in ("fast", "balanced", "accurate"):
+        if ram_gb >= QUALITY_RAM_GB[key]:
+            best = key
+    return best
+
+# Matches faster_whisper.utils.download_model — we replicate its snapshot
+# download ourselves (instead of letting WhisperModel do it) so we can pass
+# our own tqdm_class and report real progress.
+_WHISPER_ALLOW_PATTERNS = [
+    "config.json", "preprocessor_config.json", "model.bin",
+    "tokenizer.json", "vocabulary.*",
+]
 
 AUDIO_EXTENSIONS = {
     ".mp3", ".wav", ".m4a", ".flac", ".ogg", ".oga", ".opus", ".wma",
@@ -133,21 +161,46 @@ class TranscriberWorker(threading.Thread):
     def _load_model(self):
         size = QUALITY_MODELS[self.quality]
         first_run = not model_is_downloaded(size)
+        os.makedirs(settings.MODELS_DIR, exist_ok=True)
+        os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+
+        model_path = size
         if first_run:
-            self._emit(
-                "line", "downloading",
-                {"quality": self.quality, "size_mb": MODEL_DOWNLOAD_MB[size]},
-            )
+            self._emit("line", "downloading",
+                       {"quality": self.quality, "size_mb": MODEL_DOWNLOAD_MB[size], "pct": 0})
+            last_pct = {"value": -1}
+
+            def on_progress(downloaded, total):
+                pct = int(downloaded / total * 100)
+                if pct != last_pct["value"]:
+                    last_pct["value"] = pct
+                    self._emit("line", "downloading", {
+                        "quality": self.quality, "size_mb": MODEL_DOWNLOAD_MB[size], "pct": pct,
+                    })
+
+            try:
+                import huggingface_hub
+
+                model_path = huggingface_hub.snapshot_download(
+                    f"Systran/faster-whisper-{size}",
+                    cache_dir=settings.MODELS_DIR,
+                    allow_patterns=_WHISPER_ALLOW_PATTERNS,
+                    tqdm_class=make_progress_tqdm_class(on_progress),
+                )
+            except Exception:
+                settings.log_exception("Model download failed:")
+                self._emit("line", "download_failed", {})
+                for job in self.jobs:
+                    self._emit("job", job.index, "failed_model", {}, None)
+                return None
         else:
             self._emit("line", "loading", {"quality": self.quality})
 
-        os.makedirs(settings.MODELS_DIR, exist_ok=True)
-        os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
         from faster_whisper import WhisperModel  # deferred: heavy import
 
         try:
             return WhisperModel(
-                size,
+                model_path,
                 device="cpu",
                 compute_type="int8",
                 cpu_threads=max(1, (os.cpu_count() or 4) - 1),
@@ -155,7 +208,7 @@ class TranscriberWorker(threading.Thread):
             )
         except Exception:
             settings.log_exception("Model load failed:")
-            self._emit("line", "download_failed" if first_run else "load_failed", {})
+            self._emit("line", "load_failed", {})
             for job in self.jobs:
                 self._emit("job", job.index, "failed_model", {}, None)
             return None
@@ -197,6 +250,14 @@ class TranscriberWorker(threading.Thread):
                 language=self.language_code,
                 beam_size=5,
                 condition_on_previous_text=False,
+                # When auto-detecting, re-run language detection for every
+                # segment instead of committing the whole file to a single
+                # guess from the first ~30s. Without this, a short ambiguous
+                # opening (or genuinely mixed-language audio) can lock the
+                # entire transcription into the wrong language, producing
+                # text that is not just mistranslated but phonetically
+                # nonsensical.
+                multilingual=self.language_code is None,
             )
             duration = info.duration or 0.0
 
