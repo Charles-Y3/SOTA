@@ -133,8 +133,16 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         self.transcribe_frame = ctk.CTkFrame(self.content, fg_color="transparent")
         self.edit_frame = ctk.CTkFrame(self.content, fg_color="transparent")
         self.llm_frame = ctk.CTkFrame(self.content, fg_color="transparent")
-        for f in (self.transcribe_frame, self.edit_frame, self.llm_frame):
-            f.grid(row=0, column=0, sticky="nsew")
+        # Only the Transcribe tab is gridded up front. All three occupy the
+        # same cell, and Tk stacks later-gridded widgets on top — gridding
+        # all three here (as before) put the AI tab (gridded last) on top
+        # of the stack from the very first paint, until _show_tab(0) later
+        # sorted it out. That's a no-op on a fast dev machine, but left a
+        # real window on a slower one (e.g. a packaged .exe) where the
+        # wrong tab could actually be what gets painted first. _show_tab()
+        # grids whichever tab is active, so the other two never need to be
+        # gridded here at all.
+        self.transcribe_frame.grid(row=0, column=0, sticky="nsew")
 
         self._build_transcribe_tab(self.transcribe_frame)
         self._build_edit_tab(self.edit_frame)
@@ -176,7 +184,7 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         self.drop_title = ctk.CTkLabel(
             self.drop_zone, text="", font=ctk.CTkFont(size=15, weight="bold"))
         self.drop_title.grid(row=0, column=0, sticky="s")
-        self.drop_sub = ctk.CTkLabel(self.drop_zone, text="", text_color="gray")
+        self.drop_sub = ctk.CTkLabel(self.drop_zone, text="", text_color=self.MUTED_TEXT)
         self.drop_sub.grid(row=1, column=0, sticky="n")
         for widget in (self.drop_zone, self.drop_title, self.drop_sub):
             widget.bind("<Button-1>", lambda _e: self._browse_files())
@@ -209,15 +217,17 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
 
         self.clear_button = ctk.CTkButton(
             bottom, text="", height=36, width=90, fg_color="transparent",
+            text_color=self.OUTLINE_BUTTON_TEXT,
             border_width=1, command=self._clear_list)
         self.clear_button.grid(row=1, column=2, padx=(0, 8))
 
         self.open_folder_button = ctk.CTkButton(
             bottom, text="", height=36, width=150, fg_color="transparent",
+            text_color=self.OUTLINE_BUTTON_TEXT,
             border_width=1, command=self._open_output_folder)
         self.open_folder_button.grid(row=1, column=3)
 
-        self.status_line = ctk.CTkLabel(parent, text="", anchor="w", text_color="gray")
+        self.status_line = ctk.CTkLabel(parent, text="", anchor="w", text_color=self.MUTED_TEXT)
         self.status_line.grid(row=4, column=0, sticky="ew", padx=16, pady=(2, 8))
 
     # ------------------------------------------------------------ edit tab
@@ -249,7 +259,7 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         self.play_button.grid(row=0, column=0, padx=(12, 6), pady=10)
         self.stop_button = ctk.CTkButton(
             controls, text="", width=96, fg_color="transparent", border_width=1,
-            command=self._stop_play)
+            text_color=self.OUTLINE_BUTTON_TEXT, command=self._stop_play)
         self.stop_button.grid(row=0, column=1, padx=(0, 12), pady=10)
 
         self.time_label = ctk.CTkLabel(controls, text="00:00 / 00:00", width=110)
@@ -273,7 +283,7 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         hint_row = ctk.CTkFrame(parent, fg_color="transparent")
         hint_row.grid(row=2, column=0, sticky="ew", padx=16, pady=(0, 2))
         hint_row.grid_columnconfigure(0, weight=1)
-        self.editor_hint_label = ctk.CTkLabel(hint_row, text="", anchor="w", text_color="gray")
+        self.editor_hint_label = ctk.CTkLabel(hint_row, text="", anchor="w", text_color=self.MUTED_TEXT)
         self.editor_hint_label.grid(row=0, column=0, sticky="w")
         self.editor_font = ctk.CTkFont(size=self.prefs["editor_font_size"])
         self._build_font_size_row(
@@ -281,7 +291,8 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         ).grid(row=0, column=1, sticky="e", padx=(0, 8))
         self.punct_toggle_button = ctk.CTkButton(
             hint_row, text="", width=90, height=24, font=ctk.CTkFont(size=12),
-            fg_color="transparent", border_width=1, command=self._toggle_punct_pad)
+            fg_color="transparent", text_color=self.OUTLINE_BUTTON_TEXT,
+            border_width=1, command=self._toggle_punct_pad)
         self.punct_toggle_button.grid(row=0, column=2, sticky="e")
 
         # punctuation pad — hidden until toggled on; sits above the editor
@@ -294,7 +305,9 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         self.editor = ctk.CTkTextbox(parent, wrap="word", font=self.editor_font)
         self.editor.grid(row=4, column=0, sticky="nsew", padx=12, pady=6)
 
-        self._set_punct_pad_visible(bool(self.prefs.get("punct_pad_visible", False)))
+        # A session-only convenience, not a saved preference — always
+        # starts hidden so it never surprises you on the next launch.
+        self._set_punct_pad_visible(False)
 
         # save row
         saverow = ctk.CTkFrame(parent, fg_color="transparent")
@@ -306,9 +319,10 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         self.save_button.grid(row=0, column=0, padx=(0, 8))
         self.edit_open_folder_button = ctk.CTkButton(
             saverow, text="", height=36, width=150, fg_color="transparent",
+            text_color=self.OUTLINE_BUTTON_TEXT,
             border_width=1, command=self._open_output_folder)
         self.edit_open_folder_button.grid(row=0, column=1, padx=(0, 10))
-        self.edit_status_line = ctk.CTkLabel(saverow, text="", anchor="w", text_color="gray")
+        self.edit_status_line = ctk.CTkLabel(saverow, text="", anchor="w", text_color=self.MUTED_TEXT)
         self.edit_status_line.grid(row=0, column=2, sticky="ew")
 
         self._set_player_enabled(False)
@@ -358,7 +372,7 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         # Sits in the stretchy column right after the quality picker it's
         # advising on, with the generate button pinned past it on the right.
         self.llm_ram_caption = ctk.CTkLabel(
-            actions, text="", anchor="w", text_color="gray",
+            actions, text="", anchor="w", text_color=self.MUTED_TEXT,
             font=ctk.CTkFont(size=11))
         self.llm_ram_caption.grid(row=0, column=6, sticky="w", padx=(0, 8), pady=10)
 
@@ -392,7 +406,7 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         left_header.grid(row=0, column=0, sticky="ew", pady=(0, 2))
         left_header.grid_columnconfigure(0, weight=1)
         self.llm_left_title = ctk.CTkLabel(left_header, text="", anchor="w",
-                                           text_color="gray")
+                                           text_color=self.MUTED_TEXT)
         self.llm_left_title.grid(row=0, column=0, sticky="w")
         self._build_font_size_row(
             left_header, self.llm_source_font, "llm_source_font_size"
@@ -423,7 +437,7 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         right_header.grid(row=0, column=0, sticky="ew", pady=(0, 2))
         right_header.grid_columnconfigure(0, weight=1)
         self.llm_right_title = ctk.CTkLabel(right_header, text="", anchor="w",
-                                            text_color="gray")
+                                            text_color=self.MUTED_TEXT)
         self.llm_right_title.grid(row=0, column=0, sticky="w")
         self._build_font_size_row(
             right_header, self.llm_output_font, "llm_output_font_size"
@@ -446,10 +460,11 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         self.llm_save_button.grid(row=0, column=0, padx=(0, 8))
         self.llm_open_folder_button = ctk.CTkButton(
             saverow, text="", height=36, width=150, fg_color="transparent",
+            text_color=self.OUTLINE_BUTTON_TEXT,
             border_width=1, command=self._open_output_folder)
         self.llm_open_folder_button.grid(row=0, column=1, padx=(0, 10))
         self.llm_status_line = ctk.CTkLabel(saverow, text="", anchor="w",
-                                            text_color="gray")
+                                            text_color=self.MUTED_TEXT)
         self.llm_status_line.grid(row=0, column=2, sticky="ew")
 
     # --------------------------------------------- AI tab: resizable panels
@@ -522,12 +537,12 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
 
         minus = ctk.CTkButton(
             frame, text="A-", width=30, height=24, font=ctk.CTkFont(size=12),
-            fg_color="transparent", border_width=1,
+            fg_color="transparent", text_color=self.OUTLINE_BUTTON_TEXT, border_width=1,
             command=lambda: _step(-self.FONT_SIZE_STEP))
         minus.grid(row=0, column=0, padx=(0, 4))
         plus = ctk.CTkButton(
             frame, text="A+", width=30, height=24, font=ctk.CTkFont(size=12),
-            fg_color="transparent", border_width=1,
+            fg_color="transparent", text_color=self.OUTLINE_BUTTON_TEXT, border_width=1,
             command=lambda: _step(self.FONT_SIZE_STEP))
         plus.grid(row=0, column=1)
         return frame
@@ -540,18 +555,17 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         "，", "。", "、", "；", "：", "？", "！", "～", "—", "…", "‧", "·",
         "（", "）", "【", "】", "「", "」", "『", "』", "《", "》", "〈", "〉",
     ]
-    PUNCT_COLS = 12
 
     def _build_punct_pad(self, frame):
-        for col in range(self.PUNCT_COLS):
+        # All marks in a single row rather than wrapping to a second one.
+        for col in range(len(self.PUNCT_CHARS)):
             frame.grid_columnconfigure(col, weight=1)
-        for i, ch in enumerate(self.PUNCT_CHARS):
-            row, col = divmod(i, self.PUNCT_COLS)
+        for col, ch in enumerate(self.PUNCT_CHARS):
             btn = ctk.CTkButton(
-                frame, text=ch, width=36, height=28, font=ctk.CTkFont(size=14),
-                fg_color="transparent", border_width=1,
-                command=lambda c=ch: self._insert_punct(c))
-            btn.grid(row=row, column=col, padx=3, pady=3, sticky="ew")
+                frame, text=ch, width=28, height=26, font=ctk.CTkFont(size=13),
+                fg_color="transparent", text_color=self.OUTLINE_BUTTON_TEXT,
+                border_width=1, command=lambda c=ch: self._insert_punct(c))
+            btn.grid(row=0, column=col, padx=2, pady=3, sticky="ew")
 
     def _insert_punct(self, char):
         self.editor.insert("insert", char)
@@ -559,8 +573,6 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
 
     def _toggle_punct_pad(self):
         self._set_punct_pad_visible(not self.punct_pad_visible)
-        self.prefs["punct_pad_visible"] = self.punct_pad_visible
-        settings.save(self.prefs)
 
     def _set_punct_pad_visible(self, visible):
         self.punct_pad_visible = visible
@@ -578,12 +590,25 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
     TAB_UNSELECTED_BG = ("gray86", "gray17")
     TAB_UNSELECTED_HOVER = ("gray80", "gray23")
 
+    # CTkButton's built-in default text_color is a single pale color meant
+    # to sit on the button's own filled, colored background — on an
+    # outline-style button (fg_color="transparent") that text then sits
+    # directly on the window background instead, and is nearly invisible in
+    # light mode (pale-on-near-white). Any transparent-background button
+    # needs this explicit override.
+    OUTLINE_BUTTON_TEXT = ("gray10", "gray90")
+    # Secondary/hint text (status lines, captions) — readable on both.
+    MUTED_TEXT = ("gray35", "gray65")
+
     def _show_tab(self, index):
         self.current_tab = index
         frames = [self.transcribe_frame, self.edit_frame, self.llm_frame]
         for i, frame in enumerate(frames):
             if i == index:
-                frame.grid()
+                # Explicit args, not a bare grid() — the edit/AI frames may
+                # never have been gridded before (see _build_ui), so there's
+                # no remembered geometry for a bare call to restore.
+                frame.grid(row=0, column=0, sticky="nsew")
             else:
                 frame.grid_remove()
         if index == 1:
@@ -784,13 +809,17 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
             ". ".join(parts) + "." if parts else i18n.t(self.ui_lang, "no_audio_found"))
 
     def _add_row(self, path):
-        frame = ctk.CTkFrame(self.file_list, fg_color=("gray86", "gray20"))
+        # The scrollable list itself is theme gray86/gray17 — in light mode
+        # that's the exact same "gray86" this used to use for rows, so rows
+        # were invisible against the list background. Rows need a shade
+        # that's clearly different from the container's in BOTH modes.
+        frame = ctk.CTkFrame(self.file_list, fg_color=("gray95", "gray24"))
         frame.pack(fill="x", pady=3, padx=2)
         frame.grid_columnconfigure(0, weight=1)
         name_label = ctk.CTkLabel(frame, text=os.path.basename(path), anchor="w")
         name_label.grid(row=0, column=0, sticky="ew", padx=(10, 8), pady=8)
         status_label = ctk.CTkLabel(
-            frame, text="", anchor="e", text_color="gray", wraplength=300)
+            frame, text="", anchor="e", text_color=self.MUTED_TEXT, wraplength=300)
         status_label.grid(row=0, column=1, sticky="e", padx=(0, 8), pady=8)
         row = {
             "path": path, "frame": frame, "name_label": name_label,
@@ -799,6 +828,7 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         }
         remove_btn = ctk.CTkButton(
             frame, text="✕", width=28, height=24, fg_color="transparent",
+            text_color=self.OUTLINE_BUTTON_TEXT,
             hover_color=("gray75", "gray30"), command=lambda r=row: self._remove_row(r))
         remove_btn.grid(row=0, column=2, padx=(0, 8), pady=8)
         row["remove_btn"] = remove_btn
@@ -973,7 +1003,7 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
 
     def _render_row_status(self, row):
         text = i18n.job_status_text(self.ui_lang, row["status_key"], row["status_detail"])
-        color = "gray"
+        color = self.MUTED_TEXT
         if row["status_key"].startswith("done"):
             color = "#4caf50"
         elif row["status_key"].startswith("failed"):

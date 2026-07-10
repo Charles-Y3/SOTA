@@ -37,7 +37,6 @@ DEFAULTS = {
     "llm_source_font_size": 13,
     "llm_output_font_size": 13,
     "llm_panel_split": 0.5,
-    "punct_pad_visible": False,
 }
 
 
