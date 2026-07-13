@@ -10,28 +10,59 @@ UI can render them in whichever language the user has selected:
     ("finished",)                     -> the whole batch is over
 """
 
+import contextlib
 import os
+import re
 import threading
 
 import settings
 from progress import make_progress_tqdm_class
 
-# Canonical quality keys -> Whisper model sizes (kept small so downloads
-# stay reasonable and CPU transcription stays usable). Display names for
-# these keys live in i18n.py.
+# Canonical quality keys -> Whisper model sizes. Display names for these
+# keys live in i18n.py.
 QUALITY_MODELS = {
-    "fast": "tiny",
-    "balanced": "base",
-    "accurate": "small",
+    "fast": "base",
+    "balanced": "small",
+    # A pruned-decoder large-v3: near-large-v3 transcription accuracy (the
+    # decoder pruning mainly costs X->English *translation* quality, a mode
+    # this app never uses — Whisper always runs in transcribe mode here,
+    # with translation handled separately by the local LLM) at a fraction
+    # of large-v3's CPU cost — the only "large-class" Whisper model that's
+    # actually practical without a GPU.
+    "accurate": "large-v3-turbo",
 }
-MODEL_DOWNLOAD_MB = {"tiny": 75, "base": 145, "small": 480}
+
+# huggingface_hub repo id for each size. Not a simple f"Systran/faster-
+# whisper-{size}" pattern: Systran never published a CT2 conversion of
+# large-v3-turbo, so that model's weights live under a different
+# maintainer's repo. Getting this wrong means a silent 404 on first
+# download, so every lookup (download, and the on-disk folder-name check)
+# goes through this map rather than re-deriving the repo id inline.
+WHISPER_MODEL_REPOS = {
+    "tiny": "Systran/faster-whisper-tiny",
+    "base": "Systran/faster-whisper-base",
+    "small": "Systran/faster-whisper-small",
+    "medium": "Systran/faster-whisper-medium",
+    "large-v3": "Systran/faster-whisper-large-v3",
+    "large-v3-turbo": "mobiuslabsgmbh/faster-whisper-large-v3-turbo",
+}
+# Measured directly (HEAD on each repo's model.bin + the small config/
+# tokenizer files) rather than assumed, since download size scales with
+# parameter count, not with the short "model size" label.
+MODEL_DOWNLOAD_MB = {"base": 145, "small": 480, "large-v3-turbo": 1550}
+
+
+def whisper_repo_dirname(size):
+    """The huggingface_hub cache folder name for `size`'s snapshot —
+    derived from WHISPER_MODEL_REPOS rather than assumed, for the same
+    reason the repo id itself isn't derived from a pattern."""
+    return "models--" + WHISPER_MODEL_REPOS[size].replace("/", "--")
+
 
 # Rough total-RAM guidance (generous, accounting for OS + app overhead —
 # not just the model file) so we can warn before a download if the whole
-# system looks too tight to run comfortably. Whisper models are small
-# enough that this rarely bites, but it keeps the check symmetric with the
-# LLM one in llm.py.
-QUALITY_RAM_GB = {"fast": 1.0, "balanced": 1.5, "accurate": 2.5}
+# system looks too tight to run comfortably.
+QUALITY_RAM_GB = {"fast": 1.5, "balanced": 2.5, "accurate": 4.0}
 
 
 def recommended_quality(ram_gb):
@@ -65,9 +96,510 @@ def is_supported(path):
     return os.path.splitext(path)[1].lower() in AUDIO_EXTENSIONS
 
 
+# --------------------------------------------------------------------------- #
+# Traditional Chinese conversion (OpenCC).
+# SenseVoice always emits Mandarin as Simplified Chinese, and whisper's zh
+# output is unpredictable (either script, sometimes mixed within one file) —
+# for the Traditional-Chinese users this app targets, that's a constant
+# irritation. s2t is safe to run over text that's already Traditional (those
+# characters map to themselves), so no "is it Simplified?" pre-check is
+# needed. It MUST stay gated on the transcript language being Chinese,
+# though: Japanese shares codepoints with Simplified Chinese (e.g. 国, 学)
+# that s2t would "convert", mangling correct Japanese into Chinese forms.
+# --------------------------------------------------------------------------- #
+CHINESE_LANGS = {"zh", "yue"}
+
+_OPENCC_CACHE = {}
+
+
+def to_traditional(text):
+    """Converts Simplified Chinese in `text` to Traditional. Returns the
+    text unchanged if opencc isn't available or fails — a transcript in the
+    wrong script is a much smaller problem than losing it."""
+    if not text:
+        return text
+    try:
+        converter = _OPENCC_CACHE.get("s2t")
+        if converter is None:
+            from opencc import OpenCC
+
+            converter = _OPENCC_CACHE["s2t"] = OpenCC("s2t")
+        return converter.convert(text)
+    except Exception:
+        settings.log_exception("OpenCC conversion failed:")
+        return text
+
+
+def apply_chinese_conversion(text, language, enabled):
+    """to_traditional(), applied only when the user wants it and the
+    transcript is actually Chinese (see CHINESE_LANGS note above for why
+    the language gate is load-bearing, not cosmetic)."""
+    if enabled and language in CHINESE_LANGS:
+        return to_traditional(text)
+    return text
+
+
+# --------------------------------------------------------------------------- #
+# SenseVoice engine (Transcribe tab toggle + Live Transcription tab).
+# SenseVoiceSmall (FunASR) covers exactly these 5 languages, natively, in one
+# model — everything else stays on whisper. It's non-streaming (whole-buffer
+# decode) and has no per-word timestamps, so it always returns one blob of
+# text for whatever audio it's given rather than timestamped segments.
+# --------------------------------------------------------------------------- #
+SENSEVOICE_LANGUAGES = {"en", "zh", "yue", "ja", "ko"}
+SENSEVOICE_SAMPLE_RATE = 16000
+SENSEVOICE_DOWNLOAD_MB = 900  # approximate — funasr/modelscope don't expose a
+                              # byte-level download hook like huggingface_hub's
+
+_SENSEVOICE_CACHE = {}
+_SENSEVOICE_TAG_RE = re.compile(r"<\|[^|]*\|>")
+_SENSEVOICE_LOCK = threading.Lock()
+_SENSEVOICE_PROGRESS_LISTENERS = []
+_SENSEVOICE_LISTENERS_LOCK = threading.Lock()
+
+
+def _broadcast_sensevoice_progress(downloaded, total):
+    """The single on_progress actually passed to the download — fans out
+    to every caller currently waiting on get_sensevoice_model(), not just
+    whichever one happens to be the lock owner doing the real work (see
+    get_sensevoice_model's docstring for why that distinction matters)."""
+    with _SENSEVOICE_LISTENERS_LOCK:
+        listeners = list(_SENSEVOICE_PROGRESS_LISTENERS)
+    for fn in listeners:
+        try:
+            fn(downloaded, total)
+        except Exception:
+            pass
+
+
+def sensevoice_is_available():
+    import importlib.util
+    try:
+        return importlib.util.find_spec("funasr") is not None
+    except Exception:
+        return False
+
+
+def sensevoice_model_loaded():
+    """True once get_sensevoice_model() has succeeded in this process —
+    lets a caller show a "loading/downloading" status only the first time."""
+    return _SENSEVOICE_CACHE.get("model") is not None
+
+
+# On-disk folder names modelscope uses under MODELS_DIR for SenseVoice and
+# its fsmn-vad front-end (see settings.py's MODELSCOPE_CACHE note for how
+# they end up there). The Settings tab's model manager treats the pair as
+# one unit — they're only ever useful together.
+SENSEVOICE_MODEL_DIRNAMES = (
+    "iic--SenseVoiceSmall",
+    "iic--speech_fsmn_vad_zh-cn-16k-common-pytorch",
+)
+
+
+def sensevoice_model_dirs():
+    return [os.path.join(settings.MODELS_DIR, name)
+            for name in SENSEVOICE_MODEL_DIRNAMES]
+
+
+def sensevoice_is_downloaded():
+    """True if both SenseVoice model folders exist on disk with content —
+    a best-effort check for the Settings tab (funasr itself revalidates on
+    load and re-fetches anything missing)."""
+    for folder in sensevoice_model_dirs():
+        if not os.path.isdir(folder):
+            return False
+        if not any(files for _root, _dirs, files in os.walk(folder)):
+            return False
+    return True
+
+
+@contextlib.contextmanager
+def _sensevoice_download_progress(on_progress):
+    """Best-effort byte-level download progress for funasr's model fetch.
+
+    Unlike huggingface_hub (used for whisper models, which accepts a
+    tqdm_class override directly), modelscope_hub — funasr's download
+    backend — exposes no public progress hook. This patches the tqdm class
+    it builds its own per-file byte-progress bars with, for the duration of
+    this call only, reusing the same aggregating tqdm subclass whisper's
+    downloads use (progress.make_progress_tqdm_class). If modelscope_hub's
+    internals have moved, this just silently does nothing — a missing
+    progress readout is a much smaller problem than crashing the download.
+    """
+    if on_progress is None:
+        yield
+        return
+    try:
+        import modelscope_hub._download as _msd
+    except Exception:
+        yield
+        return
+    original = getattr(_msd, "tqdm", None)
+    if original is None:
+        yield
+        return
+    _msd.tqdm = make_progress_tqdm_class(on_progress)
+    try:
+        yield
+    finally:
+        _msd.tqdm = original
+
+
+def monotonic_pct_reporter(on_pct):
+    """Wraps an on_pct(whole_number_percent) callback so it only ever fires
+    on a new, non-decreasing whole-number percentage.
+
+    SenseVoice's download spans ~28 files across two models (SenseVoiceSmall
+    + its fsmn-vad front-end) fetched with 4-way parallelism — the "total"
+    isn't known upfront, so it grows as new files start downloading, which
+    can make the raw aggregate fraction dip backwards (e.g. 100% -> 5%) each
+    time a new file's bytes are added to the denominator. A visible progress
+    readout that jumps backward reads as broken; clamping to non-decreasing
+    keeps it looking like real progress even though the underlying estimate
+    isn't monotonic. Returns an on_progress(downloaded, total) callable
+    suitable for get_sensevoice_model()."""
+    state = {"value": -1}
+
+    def on_progress(downloaded, total):
+        if not total:
+            return
+        pct = max(state["value"], int(downloaded / total * 100))
+        if pct != state["value"]:
+            state["value"] = pct
+            on_pct(pct)
+
+    return on_progress
+
+
+def get_sensevoice_model(on_progress=None):
+    """Loads iic/SenseVoiceSmall once per process and caches it — shared by
+    the Transcribe tab's batch worker and the Live Transcription tab.
+
+    Loaded with an fsmn-vad front-end (FunASR's own documented pairing for
+    SenseVoice), not the bare model. Measured directly: without it, a 10-
+    minute clip took ~175-193s (self-attention over the whole un-chunked
+    sequence scales quadratically with length) — with it, ~22s for the same
+    clip, same completeness, because VAD splits the audio into bounded
+    segments first. The bare model isn't just slower on long audio, it's a
+    real crash/hang risk on genuinely long recordings (an hour-long meeting
+    would be an attention matrix over the entire sequence at once) — this
+    is why FunASR's own SenseVoice examples always pair it with a VAD model
+    rather than feeding raw long audio directly to the encoder.
+
+    on_progress(downloaded_bytes, total_bytes), if given, fires while any
+    part of the model is actually being downloaded (SenseVoiceSmall plus
+    its fsmn-vad front-end) — it's never called at all if everything was
+    already cached on disk, so a caller can safely treat "no calls" as
+    "this was just a fast local load", same distinction whisper's own
+    downloading-vs-loading status already makes.
+
+    Thread-safe / single-flight: the Live tab preloads this in the
+    background as soon as its tab is opened, while Start Recording (or a
+    batch job) can also trigger a load — without the lock, two concurrent
+    callers would both kick off a full download/construction. The second
+    caller here just blocks until the first finishes, then gets the same
+    cached instance, instead of duplicating the work.
+
+    That single-flight lock has a catch: only the caller that actually
+    acquires it and does the work gets to pass its on_progress into the
+    download — a second caller blocked on the lock would otherwise sit
+    there with its own progress callback never firing at all, even though
+    real work is happening on its behalf (this shipped as a bug: opening
+    the Live tab starts a background preload, and starting a Transcribe-tab
+    job with SenseVoice checked while that's still in flight would show
+    "loading" frozen the whole time — downloading for real, just reporting
+    to nobody). Every caller with a real on_progress registers itself in
+    _SENSEVOICE_PROGRESS_LISTENERS *before* attempting the lock, and
+    whichever caller ends up doing the actual download broadcasts to all
+    of them via _broadcast_sensevoice_progress, not just its own callback.
+    """
+    model = _SENSEVOICE_CACHE.get("model")
+    if model is not None:
+        return model
+    if on_progress is not None:
+        with _SENSEVOICE_LISTENERS_LOCK:
+            _SENSEVOICE_PROGRESS_LISTENERS.append(on_progress)
+    try:
+        with _SENSEVOICE_LOCK:
+            model = _SENSEVOICE_CACHE.get("model")
+            if model is None:
+                from funasr import AutoModel
+
+                # Natively registered in funasr (funasr/models/sense_voice/model.py)
+                # — deliberately NOT passing trust_remote_code=True, which would
+                # download+execute a model.py from the ModelScope repo instead of
+                # using the library's own vetted implementation.
+                with _sensevoice_download_progress(_broadcast_sensevoice_progress):
+                    model = AutoModel(
+                        model="iic/SenseVoiceSmall",
+                        vad_model="fsmn-vad", vad_kwargs={"max_single_segment_time": 30000},
+                        device="cpu", disable_update=True,
+                    )
+                _SENSEVOICE_CACHE["model"] = model
+            return model
+    finally:
+        if on_progress is not None:
+            with _SENSEVOICE_LISTENERS_LOCK:
+                try:
+                    _SENSEVOICE_PROGRESS_LISTENERS.remove(on_progress)
+                except ValueError:
+                    pass
+
+
+def sensevoice_transcribe(audio, language="auto"):
+    """Runs SenseVoice over `audio` (16kHz mono float32 numpy array).
+    Returns (clean_text, detected_language) — detected_language is one of
+    SENSEVOICE_LANGUAGES, or "" if the tag couldn't be parsed.
+
+    Deliberately does NOT use funasr's rich_transcription_postprocess: raw
+    output looks like "<|en|><|SAD|><|Speech|><|withitn|>hello there", and
+    that helper renders the emotion tag as an emoji glyph — fine for a chat
+    UI, wrong for dictation. We just strip every <|...|> tag and keep the
+    plain (already ITN-normalized) text.
+    """
+    model = get_sensevoice_model()
+    res = model.generate(
+        input=audio, cache={}, language=(language or "auto"),
+        use_itn=True, batch_size_s=60, merge_vad=True, merge_length_s=15,
+    )
+    raw = (res[0].get("text", "") if res else "") or ""
+    text = _SENSEVOICE_TAG_RE.sub("", raw).strip()
+    m = re.match(r"<\|(\w+)\|>", raw)
+    detected = m.group(1) if m and m.group(1) in SENSEVOICE_LANGUAGES else ""
+    return text, detected
+
+
+_VAD_CACHE = {}
+_VAD_LOCK = threading.Lock()
+
+# Paragraph grouping. PARAGRAPH_GAP_S is shared by both engines: a real
+# silence gap longer than this always starts a new paragraph. Beyond that,
+# whisper (build_text() further down) and batch SenseVoice
+# (sensevoice_transcribe_timed) diverge on purpose:
+#
+# Whisper's own decode already breaks its output into short, linguistically
+# -informed segments, so PARAGRAPH_MAX_SPAN_S there just chooses among
+# boundaries the model already picked — that reliably lands near a natural
+# seam even short of a full pause, so a plain duration cap looks fine.
+#
+# SenseVoice's timestamps instead come from fsmn-vad, which has no concept
+# of language at all — telling it "never emit a segment longer than N
+# seconds" makes it chop continuous speech at the wall clock, mid-sentence,
+# with no awareness of where a sentence actually ends. That produced the
+# exact symptom this was built to avoid: the back half of one sentence
+# reading as an unrelated new paragraph. SENSEVOICE_SOFT_TARGET_S /
+# SENSEVOICE_HARD_MAX_S below replace that hard cap with a target-plus-seam
+# rule (see sensevoice_transcribe_timed) that only breaks at a duration
+# boundary as an absolute last resort.
+PARAGRAPH_GAP_S = 2.0
+PARAGRAPH_MAX_SPAN_S = 20.0        # whisper only — see note above
+SENSEVOICE_SOFT_TARGET_S = 20.0    # aim for roughly this long...
+SENSEVOICE_HARD_MAX_S = 32.0       # ...but never exceed this without a seam
+
+# Sentence-final punctuation SenseVoice's own ITN may place at a true
+# sentence boundary — covers all 5 SenseVoice languages (full-width for
+# zh/yue/ja, half-width also common for ko and always for en). Used to
+# prefer breaking a paragraph at the end of a sentence once the soft
+# target is reached, rather than wherever the clock happens to be.
+_SENTENCE_END_CHARS = "。！？.!?"
+
+
+def join_pieces(prefix, addition, lang):
+    """Glues two independently-decoded pieces of the same paragraph back
+    together — no separator for CJK languages (SenseVoice's own decode
+    never inserts spaces between adjacent CJK words, so adding one here
+    would look wrong), a single space otherwise. Shared by batch
+    SenseVoice's per-segment paragraph assembly and the Live tab's
+    continuation-commit joining (live_transcription.py) — both are
+    stitching separately-decoded pieces of one spoken thought back
+    together and need to do it the same way."""
+    addition = (addition or "").strip()
+    if not addition:
+        return prefix
+    if not prefix:
+        return addition
+    sep = "" if (lang or "") in ("zh", "yue", "ja", "ko") else " "
+    return f"{prefix}{sep}{addition}"
+
+
+def get_vad_model():
+    """Loads FunASR's fsmn-vad standalone, once per process. Its model
+    files are the same ones already downloaded as SenseVoice's front-end,
+    so this never triggers a new download — it exists because AutoModel's
+    bundled-VAD pipeline (get_sensevoice_model) never exposes the segment
+    times it computes internally (verified: merge_vad=False still returns
+    a single {key, text} result), and paragraph timestamps need them.
+
+    max_single_segment_time is set to SENSEVOICE_SOFT_TARGET_S here, at
+    construction — it's a constructor-only parameter of FunASR's VAD model
+    (read once into self.vad_opts in __init__; confirmed by reading the
+    source, since passing it to generate() instead is silently accepted
+    and does nothing).
+
+    Deliberately NOT set to SENSEVOICE_HARD_MAX_S: found on real audio
+    that VAD's own natural silence detection sometimes produces one
+    genuinely long segment on its own (no cap involved — the speaker just
+    never paused long enough for VAD's ~800ms threshold to trigger), and
+    sensevoice_transcribe_timed's pass 2 can only check/break *between*
+    whatever segments VAD hands it. With the cap set to HARD_MAX itself,
+    one such oversized segment could jump a paragraph's span from just
+    under the cap straight past it in a single step — e.g. observed
+    32s + 28s = 60s, a 28-second overshoot past a 32s ceiling that was
+    supposed to be absolute. Capping at the smaller SOFT_TARGET instead
+    keeps every piece pass 2 sees small enough that it always gets a
+    chance to enforce SENSEVOICE_HARD_MAX_S close to where it's actually
+    set, at the cost of a little more decode overhead — a fine trade for
+    the batch tab, where latency was never the constraint.
+
+    This still isn't the primary segmentation mechanism — VAD's own
+    silence detection produces far shorter natural segments than either
+    number in the vast majority of real speech, which is exactly what
+    pass 2 needs to make sentence-aware grouping decisions. This cap only
+    matters when a stretch of speech has no detectable pause at all for
+    SENSEVOICE_SOFT_TARGET_S straight."""
+    model = _VAD_CACHE.get("model")
+    if model is not None:
+        return model
+    with _VAD_LOCK:
+        model = _VAD_CACHE.get("model")
+        if model is None:
+            from funasr import AutoModel
+
+            model = AutoModel(
+                model="fsmn-vad", device="cpu", disable_update=True,
+                max_single_segment_time=int(SENSEVOICE_SOFT_TARGET_S * 1000),
+            )
+            _VAD_CACHE["model"] = model
+        return model
+
+
+def sensevoice_transcribe_timed(audio, language="auto", on_progress=None):
+    """SenseVoice transcription with per-paragraph start times.
+
+    Two passes. First, fsmn-vad segments the whole clip on real silence
+    (its own default ~800ms end-silence threshold, not a fixed duration
+    cap), and each segment is decoded independently. This is not a
+    quality tradeoff versus the simple merged path (sensevoice_transcribe
+    with merge_vad=True): that path already decodes per raw VAD segment
+    internally and only differs in how the text gets glued back together
+    — spot-checked against it on real audio, same text quality either
+    way. Decoding independently here just gives visibility into each
+    segment's own text and timing, which the second pass needs.
+
+    Second, the decoded (start, end, text) segments are assembled into
+    paragraphs: a gap over PARAGRAPH_GAP_S is always a real pause and
+    always breaks; short of that, a paragraph keeps absorbing segments
+    past SENSEVOICE_SOFT_TARGET_S only until one ends in sentence-final
+    punctuation (see _SENTENCE_END_CHARS) — that's treated as a natural
+    seam and breaks there, so a paragraph boundary lands at the end of a
+    sentence rather than wherever a fixed-duration clock happens to be;
+    if no such seam turns up before SENSEVOICE_HARD_MAX_S, a break is
+    forced anyway, as an absolute ceiling. This replaces the old design's
+    failure mode: a hard wall-clock cut landing mid-sentence, so the back
+    half of one sentence read as an unrelated new paragraph.
+
+    Decoding per-segment (rather than one merge_vad=True call) is also
+    what makes real progress reporting possible at all: SenseVoice has no
+    per-token/per-chunk callback of its own, so without visibility into
+    each segment as it's decoded, a caller has nothing to report progress
+    from between "started" and "done" (the original bug this was built
+    to fix — SenseVoice jobs in the Transcribe tab sat at 0% and jumped
+    straight to done).
+
+    on_progress(pct), if given, is called after each segment is decoded —
+    pct is 0-99, the fraction of the audio's total duration covered so
+    far by time position (not by segment count, so it stays accurate
+    even when some segments decode to no text and get dropped). Same
+    convention _transcribe_whisper's per-segment pct already uses (100 is
+    left for the caller to report once saving is actually done).
+
+    Returns (paragraphs, detected) where paragraphs is [(start_seconds,
+    text), ...] with empty decodes dropped, and detected is the first
+    non-empty segment's language tag ("" if none parsed).
+    """
+    vad = get_vad_model()
+    res = vad.generate(input=audio, cache={})
+    segments_ms = res[0].get("value", []) if res else []
+    if not segments_ms:
+        return [], ""
+
+    duration = len(audio) / SENSEVOICE_SAMPLE_RATE
+
+    # -- pass 1: decode every VAD segment independently --------------------
+    decoded, detected = [], ""  # decoded: [(start_s, end_s, text), ...]
+    for start_ms, end_ms in segments_ms:
+        piece = audio[int(start_ms / 1000 * SENSEVOICE_SAMPLE_RATE):
+                      int(end_ms / 1000 * SENSEVOICE_SAMPLE_RATE)]
+        text, piece_lang = sensevoice_transcribe(piece, language)
+        text = text.strip()
+        if text:
+            if not detected and piece_lang:
+                detected = piece_lang
+            decoded.append((start_ms / 1000.0, end_ms / 1000.0, text))
+        if on_progress and duration > 0:
+            on_progress(int(min(99, end_ms / 1000.0 / duration * 100)))
+
+    # -- pass 2: assemble into sentence-aware paragraphs --------------------
+    # Below SENSEVOICE_SOFT_TARGET_S, nothing but a real pause ever breaks
+    # a paragraph — no seam-hunting yet. Once a fold-in pushes the span
+    # past that target, the paragraph keeps absorbing segments until one
+    # of them ends in sentence-final punctuation (checked on that segment
+    # itself, not on whatever text happened to precede it — a segment
+    # that both crosses the target *and* completes a sentence is exactly
+    # the natural place to stop), and breaks right there. If none ever
+    # does before SENSEVOICE_HARD_MAX_S, a break is forced anyway, as an
+    # absolute ceiling — the only path left that can land mid-sentence,
+    # and only after ~32s of speech with no detectable sentence end at
+    # all. This is what actually fixes the old failure mode: a fixed
+    # 20-second wall-clock cut landing mid-sentence regardless of context,
+    # making the back half of one sentence read as an unrelated new
+    # paragraph.
+    effective_lang = detected or language
+    paragraphs = []
+    cur_start = cur_end = None
+    cur_text = ""
+    for start_s, end_s, text in decoded:
+        if cur_start is None:
+            cur_start, cur_end, cur_text = start_s, end_s, text
+            continue
+
+        if start_s - cur_end > PARAGRAPH_GAP_S:
+            # A real pause always breaks, regardless of span or seams.
+            paragraphs.append((cur_start, cur_text))
+            cur_start, cur_end, cur_text = start_s, end_s, text
+            continue
+
+        cur_text = join_pieces(cur_text, text, effective_lang)
+        cur_end = end_s
+        span = cur_end - cur_start
+        at_seam = text.rstrip()[-1:] in _SENTENCE_END_CHARS
+        if span > SENSEVOICE_HARD_MAX_S or (span > SENSEVOICE_SOFT_TARGET_S and at_seam):
+            paragraphs.append((cur_start, cur_text))
+            cur_start = cur_end = None
+            cur_text = ""
+    if cur_start is not None:
+        paragraphs.append((cur_start, cur_text))
+
+    return paragraphs, detected
+
+
+def detect_language_fast(model, audio):
+    """Cheap language ID using whisper's encoder plus a single language-token
+    classification over ~30s of audio — much cheaper than a full transcribe
+    pass. Used to decide, for "auto" + SenseVoice-preferred, whether a file
+    should be routed to SenseVoice at all. Returns an ISO code, or "" if
+    detection wasn't confident or failed."""
+    try:
+        language, probability, _all = model.detect_language(
+            audio, vad_filter=True, language_detection_segments=1)
+        return language if probability >= 0.5 else ""
+    except Exception:
+        return ""
+
+
 def model_is_downloaded(size):
     snapshots = os.path.join(
-        settings.MODELS_DIR, f"models--Systran--faster-whisper-{size}", "snapshots"
+        settings.MODELS_DIR, whisper_repo_dirname(size), "snapshots"
     )
     if not os.path.isdir(snapshots):
         return False
@@ -88,38 +620,33 @@ def unique_path(path):
     return f"{base} ({os.getpid()}){ext}"
 
 
-def _format_timestamp(seconds):
-    s = int(max(0, seconds))
-    hours, rest = divmod(s, 3600)
-    minutes, secs = divmod(rest, 60)
-    if hours:
-        return f"[{hours}:{minutes:02d}:{secs:02d}]"
-    return f"[{minutes:02d}:{secs:02d}]"
-
-
-def build_text(segments, timestamps):
-    if timestamps:
-        lines = [
-            f"{_format_timestamp(seg.start)} {seg.text.strip()}"
-            for seg in segments
-            if seg.text.strip()
-        ]
-        return "\n".join(lines) + ("\n" if lines else "")
-
-    # Group segments into paragraphs on pauses longer than 2 seconds.
-    paragraphs, current, prev_end = [], [], None
+def build_text(segments):
+    """Groups whisper segments into paragraphs on pauses longer than
+    PARAGRAPH_GAP_S, or once a paragraph's span exceeds
+    PARAGRAPH_MAX_SPAN_S (same rule sensevoice_transcribe_timed uses, so
+    both engines paragraph the same way and get comparable timestamp
+    density). Returns (text, times): one start-time (seconds, from the
+    paragraph's first segment) per paragraph, for the Edit tab's clickable
+    timestamps."""
+    paragraphs, times, current, start, prev_end = [], [], [], None, None
     for seg in segments:
         text = seg.text.strip()
         if not text:
             continue
-        if current and prev_end is not None and seg.start - prev_end > 2.0:
+        gap_broke = current and prev_end is not None and seg.start - prev_end > PARAGRAPH_GAP_S
+        span_broke = current and start is not None and seg.end - start > PARAGRAPH_MAX_SPAN_S
+        if gap_broke or span_broke:
             paragraphs.append(" ".join(current))
-            current = []
+            times.append(start)
+            current, start = [], None
+        if start is None:
+            start = seg.start
         current.append(text)
         prev_end = seg.end
     if current:
         paragraphs.append(" ".join(current))
-    return "\n\n".join(paragraphs) + ("\n" if paragraphs else "")
+        times.append(start)
+    return "\n\n".join(paragraphs) + ("\n" if paragraphs else ""), times
 
 
 def _short_error(exc):
@@ -140,14 +667,16 @@ class Job:
 class TranscriberWorker(threading.Thread):
     """Transcribes a list of jobs sequentially; results go to `events`."""
 
-    def __init__(self, jobs, quality, language_code, timestamps, output_folder, events):
+    def __init__(self, jobs, quality, language_code, sensevoice_preferred,
+                 output_folder, events, traditional_chinese=False):
         super().__init__(daemon=True)
         self.jobs = jobs
         self.quality = quality  # "fast" | "balanced" | "accurate"
         self.language_code = language_code  # None (auto) or an ISO code
-        self.timestamps = timestamps
+        self.sensevoice_preferred = sensevoice_preferred
         self.output_folder = output_folder
         self.events = events
+        self.traditional_chinese = traditional_chinese
         self.cancel_event = threading.Event()
 
     def cancel(self):
@@ -182,7 +711,7 @@ class TranscriberWorker(threading.Thread):
                 import huggingface_hub
 
                 model_path = huggingface_hub.snapshot_download(
-                    f"Systran/faster-whisper-{size}",
+                    WHISPER_MODEL_REPOS[size],
                     cache_dir=settings.MODELS_DIR,
                     allow_patterns=_WHISPER_ALLOW_PATTERNS,
                     tqdm_class=make_progress_tqdm_class(on_progress),
@@ -245,54 +774,127 @@ class TranscriberWorker(threading.Thread):
                 self._emit("job", job.index, "failed_not_found", {}, None)
                 return
 
-            segments_iter, info = model.transcribe(
-                job.path,
-                language=self.language_code,
-                beam_size=5,
-                condition_on_previous_text=False,
-                # When auto-detecting, re-run language detection for every
-                # segment instead of committing the whole file to a single
-                # guess from the first ~30s. Without this, a short ambiguous
-                # opening (or genuinely mixed-language audio) can lock the
-                # entire transcription into the wrong language, producing
-                # text that is not just mistranslated but phonetically
-                # nonsensical.
-                multilingual=self.language_code is None,
-            )
-            duration = info.duration or 0.0
+            from faster_whisper.audio import decode_audio
 
-            segments = []
-            for seg in segments_iter:
-                if self.cancel_event.is_set():
-                    self._emit("job", job.index, "cancelled", {}, None)
-                    return
-                segments.append(seg)
-                if duration > 0:
-                    pct = int(min(99, seg.end / duration * 100))
-                    self._emit("job", job.index, "transcribing", {"pct": pct}, pct)
+            audio = decode_audio(job.path, sampling_rate=SENSEVOICE_SAMPLE_RATE)
 
-            text = build_text(segments, self.timestamps)
-            stem = os.path.splitext(os.path.basename(job.path))[0]
-            folder = self.output_folder or os.path.dirname(job.path)
-            try:
-                import docx_export  # lazy: avoids an import cycle
-
-                output_path, _kind = docx_export.save_transcript(text, folder, stem)
-            except (PermissionError, OSError):
-                settings.log_exception(f"Write failed in {folder}:")
-                self._emit("job", job.index, "failed_write", {}, None)
+            sv_language = self._resolve_sensevoice_language(model, audio)
+            if sv_language and self._try_sensevoice(job, audio, sv_language):
                 return
 
-            self._emit("saved", job.index, output_path)
-            if not text.strip():
-                self._emit("job", job.index, "done_no_speech", {}, 100)
-            elif self.language_code is None and info.language:
-                self._emit("job", job.index, "done_lang", {"code": info.language}, 100)
-            else:
-                self._emit("job", job.index, "done", {}, 100)
+            self._transcribe_whisper(model, job, audio)
 
         except Exception as exc:
             settings.log_exception(f"Transcription failed for {job.path}:")
             self._emit(
                 "job", job.index, "failed_error", {"error": _short_error(exc)}, None
             )
+
+    def _resolve_sensevoice_language(self, model, audio):
+        """Returns an ISO code to route this job to SenseVoice with, or ""
+        to use whisper. An explicit language pick is checked directly
+        against SENSEVOICE_LANGUAGES; "auto" runs a cheap upfront whisper
+        language-ID pass first, since SenseVoice itself isn't safe to try
+        blind on a language outside its known 5 (see detect_language_fast)."""
+        if not (self.sensevoice_preferred and sensevoice_is_available()):
+            return ""
+        if self.language_code:
+            return self.language_code if self.language_code in SENSEVOICE_LANGUAGES else ""
+        detected = detect_language_fast(model, audio)
+        return detected if detected in SENSEVOICE_LANGUAGES else ""
+
+    def _try_sensevoice(self, job, audio, language):
+        """Returns True once SenseVoice has produced and saved a result for
+        this job; False to fall back to whisper (SenseVoice unavailable,
+        model download failed, or a runtime error)."""
+        try:
+            if not sensevoice_model_loaded():
+                self._emit("line", "sensevoice_loading", {})
+
+                def on_pct(pct):
+                    self._emit("line", "sensevoice_downloading",
+                               {"size_mb": SENSEVOICE_DOWNLOAD_MB, "pct": pct})
+                    if pct >= 100:
+                        # Byte transfer is done, but constructing the model
+                        # (loading weights into memory) is a separate,
+                        # unmeasurable step that still takes real time —
+                        # switch back to "loading" so 100% doesn't just sit
+                        # there looking stuck for the next 10-30s.
+                        self._emit("line", "sensevoice_loading", {})
+
+                get_sensevoice_model(monotonic_pct_reporter(on_pct))  # populates the cache
+
+            def on_decode_pct(pct):
+                self._emit("job", job.index, "transcribing", {"pct": pct}, pct)
+
+            paragraphs, detected = sensevoice_transcribe_timed(
+                audio, language, on_progress=on_decode_pct)
+        except Exception:
+            settings.log_exception("SenseVoice failed, falling back to whisper:")
+            return False
+        effective_lang = detected or language
+        parts = [(start, apply_chinese_conversion(text, effective_lang,
+                                                  self.traditional_chinese))
+                 for start, text in paragraphs]
+        text = "\n\n".join(t for _s, t in parts)
+        times = [s for s, _t in parts]
+        lang_for_status = detected if (self.language_code is None and detected) else None
+        self._save_result(job, (text + "\n") if text else "", lang_for_status, times)
+        return True
+
+    def _transcribe_whisper(self, model, job, audio):
+        segments_iter, info = model.transcribe(
+            audio,
+            language=self.language_code,
+            beam_size=5,
+            condition_on_previous_text=False,
+            # When auto-detecting, re-run language detection for every
+            # segment instead of committing the whole file to a single
+            # guess from the first ~30s. Without this, a short ambiguous
+            # opening (or genuinely mixed-language audio) can lock the
+            # entire transcription into the wrong language, producing
+            # text that is not just mistranslated but phonetically
+            # nonsensical.
+            multilingual=self.language_code is None,
+        )
+        duration = info.duration or (len(audio) / SENSEVOICE_SAMPLE_RATE)
+
+        segments = []
+        for seg in segments_iter:
+            if self.cancel_event.is_set():
+                self._emit("job", job.index, "cancelled", {}, None)
+                return
+            segments.append(seg)
+            if duration > 0:
+                pct = int(min(99, seg.end / duration * 100))
+                self._emit("job", job.index, "transcribing", {"pct": pct}, pct)
+
+        text, times = build_text(segments)
+        text = apply_chinese_conversion(
+            text, self.language_code or info.language, self.traditional_chinese)
+        lang_for_status = info.language if (self.language_code is None and info.language) else None
+        self._save_result(job, text, lang_for_status, times)
+
+    def _save_result(self, job, text, lang_for_status, times=None):
+        stem = os.path.splitext(os.path.basename(job.path))[0]
+        folder = self.output_folder or os.path.dirname(job.path)
+        try:
+            import docx_export  # lazy: avoids an import cycle
+
+            output_path, _kind = docx_export.save_transcript(text, folder, stem)
+        except (PermissionError, OSError):
+            settings.log_exception(f"Write failed in {folder}:")
+            self._emit("job", job.index, "failed_write", {}, None)
+            return
+
+        if times and text.strip():
+            import timestamps
+
+            timestamps.save_sidecar(output_path, times)
+        self._emit("saved", job.index, output_path)
+        if not text.strip():
+            self._emit("job", job.index, "done_no_speech", {}, 100)
+        elif lang_for_status:
+            self._emit("job", job.index, "done_lang", {"code": lang_for_status}, 100)
+        else:
+            self._emit("job", job.index, "done", {}, 100)

@@ -1,9 +1,26 @@
 --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu
+--extra-index-url https://download.pytorch.org/whl/cpu
 faster-whisper>=1.0.3
 customtkinter>=5.2.2
+# Simplified -> Traditional Chinese conversion for transcripts. The pure-
+# Python reimplementation on purpose: identical dictionaries, no native
+# wheel to go wrong under PyInstaller on either platform.
+opencc-python-reimplemented>=0.1.7
 tkinterdnd2>=0.4.2
 sounddevice>=0.4.6
 python-docx>=1.1.0
 # 0.3.19 pinned deliberately: newer wheels (0.3.21+) are compiled with CPU
 # instructions that crash on pre-AVX512 processors (illegal instruction).
 llama-cpp-python==0.3.19
+# SenseVoice engine (Transcribe tab toggle + Live Transcription tab).
+# funasr does not declare torch as an install dependency, so it's pinned
+# here explicitly. Versions are bare (no "+cpu" local suffix) on purpose:
+# that suffix only exists on the Windows/Linux wheels the pytorch.org CPU
+# index above serves — macOS wheels for the same version have no local
+# suffix at all, so pinning it would break the macOS build. Leaving it off
+# still resolves to the ~120MB CPU-only build on Windows/Linux (pip matches
+# "==2.13.0" against a "2.13.0+cpu" wheel from that index) and to the
+# (already CPU/MPS-only) default macOS wheel.
+torch==2.13.0
+torchaudio==2.11.0
+funasr>=1.3.14

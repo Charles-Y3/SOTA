@@ -2,12 +2,20 @@
 the machine) or plain .txt otherwise."""
 
 import os
+import sys
 
 from transcriber import unique_path
 
 
 def word_available():
-    """True if Microsoft Word appears to be installed (Windows registry)."""
+    """True if Microsoft Word appears to be installed — Windows registry on
+    Windows, the standard install locations on macOS (winreg doesn't exist
+    there, so before this check Mac users with Word still always got .txt)."""
+    if sys.platform == "darwin":
+        return any(os.path.isdir(p) for p in (
+            "/Applications/Microsoft Word.app",
+            os.path.expanduser("~/Applications/Microsoft Word.app"),
+        ))
     try:
         import winreg
     except ImportError:

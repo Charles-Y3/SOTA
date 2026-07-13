@@ -1,8 +1,10 @@
 """SOTA — Smart Offline Transcription Application.
 
-Three tabs:
+Four tabs:
   • Transcribe — drop audio files in, click Transcribe All, get a transcript
     each (.docx when Word is installed, .txt otherwise).
+  • Live Transcription — dictate from the microphone via SenseVoice
+    (English/Mandarin/Cantonese/Japanese/Korean only); auto-saves on Stop.
   • Edit & Export — replay a file (adjustable speed), fix the transcript,
     save a copy.
   • AI Summary & Translate — run a local LLM over a transcript to summarize
@@ -11,8 +13,12 @@ Three tabs:
 
 import os
 import queue
+import shutil
+import subprocess
 import sys
 import threading
+import webbrowser
+import tkinter as tk
 from tkinter import filedialog, messagebox
 
 import customtkinter as ctk
@@ -20,9 +26,11 @@ from tkinterdnd2 import DND_FILES, TkinterDnD
 
 import docx_export
 import i18n
+import live_transcription
 import llm
 import settings
 import sysinfo
+import timestamps
 import transcriber
 from llm import LLMWorker
 from player import SPEED_OPTIONS, Player
@@ -37,6 +45,49 @@ def _fmt_time(seconds):
     return f"{seconds // 60:02d}:{seconds % 60:02d}"
 
 
+def _open_path(path):
+    """Opens a file or folder in the system's file manager / default app.
+    os.startfile only exists on Windows — on macOS every 'Open output
+    folder' button silently did nothing before this."""
+    if os.name == "nt":
+        os.startfile(path)
+    elif sys.platform == "darwin":
+        subprocess.Popen(["open", path])
+    else:
+        subprocess.Popen(["xdg-open", path])
+
+
+def _fmt_size(num_bytes):
+    """Human-readable size for the Settings tab's model list."""
+    gb = num_bytes / (1024 ** 3)
+    if gb >= 1:
+        return f"{gb:.1f} GB"
+    return f"{num_bytes / (1024 ** 2):.0f} MB"
+
+
+def _folder_size(path):
+    total = 0
+    for root, _dirs, files in os.walk(path):
+        for name in files:
+            try:
+                total += os.path.getsize(os.path.join(root, name))
+            except OSError:
+                pass
+    return total
+
+
+def _version_tuple(version):
+    parts = []
+    for piece in str(version).strip().lstrip("vV").split("."):
+        digits = "".join(ch for ch in piece if ch.isdigit())
+        parts.append(int(digits) if digits else 0)
+    return tuple(parts)
+
+
+UPDATE_API_URL = "https://api.github.com/repos/Charles-Y3/SOTA/releases/latest"
+RELEASES_PAGE_URL = "https://github.com/Charles-Y3/SOTA/releases/latest"
+
+
 def _speed_label(speed):
     return (f"{speed:g}×")
 
@@ -46,14 +97,23 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         super().__init__()
         self.TkdndVersion = TkinterDnD._require(self)
 
+        # A concrete starting size (also the floor for un-maximizing) plus
+        # minsize; the actual maximize call is deferred (see
+        # _maximize_on_startup's docstring for why it can't just run here).
+        # minsize's width is 720, not 680: measured empirically as the
+        # smallest width the Edit tab's player-controls row (two buttons +
+        # time label + slider + speed picker) needs without clipping.
         self.geometry("820x680")
-        self.minsize(680, 560)
+        self.minsize(720, 560)
 
         self.prefs = settings.load()
-        for key in ("editor_font_size", "llm_source_font_size", "llm_output_font_size"):
+        settings.set_output_base(self.prefs.get("output_folder"))
+        for key in ("editor_font_size", "llm_source_font_size", "llm_output_font_size",
+                    "live_text_font_size"):
             self.prefs[key] = self._clamp_font_size(self.prefs.get(key, 14))
         self.sys_ram_gb = sysinfo.total_ram_gb()
         self.ui_lang = self.prefs["ui_language"] if self.prefs["ui_language"] in i18n.UI_LANGUAGES else "en"
+        self.sensevoice_available = transcriber.sensevoice_is_available()
         self.rows = []
         self.worker = None
         self.events = queue.Queue()
@@ -61,6 +121,14 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         self.status_key = None
         self.status_detail = None
         self.current_tab = 0
+
+        # Live Transcription tab state
+        self.live_worker = None
+        self.live_running = False
+        self.live_session_started = False
+        self.live_preload_started = False
+        self.live_status_key = None
+        self.live_status_detail = None
 
         # Edit tab state
         self.player = Player(
@@ -72,6 +140,8 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         self.edit_current = None   # current {label, audio, txt}
         self.edit_status_key = None
         self.edit_status_detail = None
+        self._edit_loaded_text = None  # editor content as of the last load — lets
+                                        # auto-refresh detect unsaved typing and back off
 
         # AI tab state
         self.llm_worker = None
@@ -79,6 +149,16 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         self.llm_current = None
         self.llm_status_key = None
         self.llm_status_detail = None
+
+        # Settings tab state
+        self.model_rows = {}        # row key -> {"spec", "status", "button"}
+        self.model_downloads = set()  # row keys with a download in flight
+        self.update_checking = False
+        self.update_status_key = None
+        self.update_status_detail = None
+
+        # Shown at most once per session — see _offer_output_folder_fix.
+        self._save_failure_hint_shown = False
 
         self._build_ui()
         self._apply_prefs()
@@ -91,6 +171,31 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(POLL_MS, self._poll_events)
         self.after(TICK_MS, self._tick_player)
+        self.after(0, self._maximize_on_startup)
+
+    def _maximize_on_startup(self):
+        """'zoomed' is a real Tk window state on Windows (and most Linux
+        window managers) but isn't reliably supported on macOS across Tk
+        builds — falling back to sizing the window to the full screen
+        keeps the same "maximized" outcome there instead of silently
+        leaving the small fallback geometry from __init__ in place.
+
+        Scheduled via after(0, ...) from __init__ rather than called
+        directly: on Windows, CustomTkinter's own CTk.__init__ (which runs
+        as our super().__init__() before any of our code) synchronously
+        withdraws the window to set the dark-mode titlebar color, and its
+        restore-afterward logic silently drops the window state because
+        the window didn't exist yet when it captured what to restore to.
+        A state('zoomed') called from our __init__ therefore lands on a
+        window that's about to be quietly left un-maximized. Deferring to
+        the next idle tick runs this after that whole dance (and the rest
+        of __init__) has settled, so it's the last thing to touch window
+        state before the window is actually shown."""
+        try:
+            self.state("zoomed")
+        except Exception:
+            self.update_idletasks()
+            self.geometry(f"{self.winfo_screenwidth()}x{self.winfo_screenheight()}+0+0")
 
     # ================================================================== UI
 
@@ -98,31 +203,81 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(1, weight=1)
 
-        # --- top bar: tabs (left) + UI language toggle (right)
+        # --- top bar: tabs (left, scrollable) + UI language toggle (right)
         topbar = ctk.CTkFrame(self, fg_color="transparent")
         topbar.grid(row=0, column=0, sticky="ew", padx=12, pady=(10, 0))
+        # Column 1 (the tab viewport) is the only one that stretches — the
+        # arrow buttons and language toggle stay fixed-width on either side.
         topbar.grid_columnconfigure(1, weight=1)
+
+        # Five tabs at their natural (uniform) width don't fit every real
+        # screen even maximized — e.g. English measures ~1215px for the tab
+        # row alone, which overflows common 1280/1366px-wide laptop
+        # displays. Rather than shrink or wrap the tabs, the strip scrolls:
+        # it lives inside a plain tkinter.Canvas viewport (CTk has no
+        # scrollable-row widget) whose width tracks the available space:
+        # when the tabs fit, it's just a static row; when they don't, "<"/
+        # ">" arrows appear to pan it, the same pattern Word's ribbon uses
+        # for overflowing tabs.
+        self.tab_scroll_left = ctk.CTkButton(
+            topbar, text="<", width=22, corner_radius=6,
+            command=lambda: self._scroll_tabs(-1))
+        self.tab_scroll_left.grid(row=0, column=0, padx=(0, 3))
+        self.tab_scroll_left.grid_remove()  # shown only when the tabs overflow
+
+        # Height is set after the tab buttons exist below, from their own
+        # actual rendered height — not a guessed constant. CTkButton's
+        # height=32 constructor argument is a request, not the final
+        # rendered size (padding/border push it a few px taller, more at
+        # some DPI scales); a canvas fixed to the requested-but-not-actual
+        # height clips the bottom of every embedded tab.
+        self.tab_canvas = tk.Canvas(topbar, highlightthickness=0, bd=0)
+        self.tab_canvas.grid(row=0, column=1, sticky="ew")
+        self._sync_tab_canvas_bg()
 
         # Flat rectangular tabs (not the pill-shaped segmented-button look):
         # the selected tab's background matches the content panel below it,
         # so it visually merges into it, like tabs in a regular desktop app.
-        self.tab_bar = ctk.CTkFrame(topbar, fg_color="transparent")
-        self.tab_bar.grid(row=0, column=0, sticky="w")
+        self.tab_bar = ctk.CTkFrame(self.tab_canvas, fg_color="transparent")
+        self._tab_bar_window = self.tab_canvas.create_window(
+            (0, 0), window=self.tab_bar, anchor="nw")
         self.tab_buttons = []
         for i in range(len(self.TAB_KEYS)):
             btn = ctk.CTkButton(
                 self.tab_bar, text="", height=32, corner_radius=6,
                 border_spacing=0, command=lambda idx=i: self._show_tab(idx),
             )
+            # No uniform width group: each tab is sized to its own label in
+            # _retranslate() instead — narrower in aggregate than forcing
+            # every tab to match the widest one, which helps but doesn't
+            # alone solve the overflow (hence the scrolling viewport above).
             btn.grid(row=0, column=i, sticky="ew", padx=1)
-            self.tab_bar.grid_columnconfigure(i, weight=0, uniform="tabbar")
+            self.tab_bar.grid_columnconfigure(i, weight=0)
             self.tab_buttons.append(btn)
+
+        self.tab_scroll_right = ctk.CTkButton(
+            topbar, text=">", width=22, corner_radius=6,
+            command=lambda: self._scroll_tabs(1))
+        self.tab_scroll_right.grid(row=0, column=2, padx=(3, 8))
+        self.tab_scroll_right.grid_remove()
+
+        # Now that a tab button exists, measure its real rendered height
+        # and size the canvas (and the flanking arrow buttons, so they
+        # don't look short next to full-height tabs) to match exactly.
+        self.tab_bar.update_idletasks()
+        tab_h = self.tab_buttons[0].winfo_reqheight()
+        self.tab_canvas.configure(height=tab_h)
+        self.tab_scroll_left.configure(height=tab_h)
+        self.tab_scroll_right.configure(height=tab_h)
 
         self.ui_lang_button = ctk.CTkSegmentedButton(
             topbar, values=["EN", "繁中"], command=self._on_ui_lang_change,
         )
-        self.ui_lang_button.grid(row=0, column=2, sticky="e")
+        self.ui_lang_button.grid(row=0, column=3, sticky="e")
         self._equalize_segments(self.ui_lang_button, 52)
+
+        self.tab_canvas.bind("<Configure>", self._on_tab_canvas_resize)
+        self.tab_bar.bind("<Configure>", self._on_tab_bar_resize)
 
         # --- content area holds both tab frames in the same cell
         self.content = ctk.CTkFrame(self, fg_color="transparent")
@@ -131,22 +286,26 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         self.content.grid_rowconfigure(0, weight=1)
 
         self.transcribe_frame = ctk.CTkFrame(self.content, fg_color="transparent")
+        self.live_frame = ctk.CTkFrame(self.content, fg_color="transparent")
         self.edit_frame = ctk.CTkFrame(self.content, fg_color="transparent")
         self.llm_frame = ctk.CTkFrame(self.content, fg_color="transparent")
-        # Only the Transcribe tab is gridded up front. All three occupy the
+        self.settings_frame = ctk.CTkFrame(self.content, fg_color="transparent")
+        # Only the Transcribe tab is gridded up front. All four occupy the
         # same cell, and Tk stacks later-gridded widgets on top — gridding
-        # all three here (as before) put the AI tab (gridded last) on top
+        # all four here (as before) put the AI tab (gridded last) on top
         # of the stack from the very first paint, until _show_tab(0) later
         # sorted it out. That's a no-op on a fast dev machine, but left a
         # real window on a slower one (e.g. a packaged .exe) where the
         # wrong tab could actually be what gets painted first. _show_tab()
-        # grids whichever tab is active, so the other two never need to be
+        # grids whichever tab is active, so the other three never need to be
         # gridded here at all.
         self.transcribe_frame.grid(row=0, column=0, sticky="nsew")
 
         self._build_transcribe_tab(self.transcribe_frame)
+        self._build_live_tab(self.live_frame)
         self._build_edit_tab(self.edit_frame)
         self._build_llm_tab(self.llm_frame)
+        self._build_settings_tab(self.settings_frame)
 
     # ------------------------------------------------------ transcribe tab
 
@@ -169,11 +328,17 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         )
         self.language_menu.grid(row=0, column=3, padx=(0, 16), pady=10)
 
-        self.timestamps_var = ctk.BooleanVar(value=False)
-        self.timestamps_box = ctk.CTkCheckBox(
-            options, text="", variable=self.timestamps_var, command=self._on_pref_change,
+        self.sensevoice_var = ctk.BooleanVar(value=False)
+        self.sensevoice_box = ctk.CTkCheckBox(
+            options, text="", variable=self.sensevoice_var, command=self._on_pref_change,
         )
-        self.timestamps_box.grid(row=0, column=4, padx=(0, 8), pady=10)
+        # Its own row, not crammed onto the quality/language row — the full
+        # language-name label this checkbox needs is too long to share a
+        # row with the pickers at the window's default (or minimum) width.
+        # The English text also has an explicit line break (i18n.py) so it
+        # never relies on the window being wide enough to avoid overflow.
+        self.sensevoice_box.grid(
+            row=1, column=0, columnspan=4, sticky="w", padx=12, pady=(0, 12))
 
         # drop zone
         self.drop_zone = ctk.CTkFrame(parent, height=92, border_width=2, corner_radius=10)
@@ -195,19 +360,21 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
             parent, label_text=i18n.t(self.ui_lang, "double_click_tip"))
         self.file_list.grid(row=2, column=0, sticky="nsew", padx=12, pady=6)
 
-        # bottom bar
+        # bottom bar — buttons + trailing status line share one row, same
+        # pattern as the Live/Edit/AI tabs' bottom rows, instead of the
+        # status line sitting on its own line below everything.
         bottom = ctk.CTkFrame(parent, fg_color="transparent")
-        bottom.grid(row=3, column=0, sticky="ew", padx=12, pady=(6, 2))
-        bottom.grid_columnconfigure(0, weight=1)
+        bottom.grid(row=3, column=0, sticky="ew", padx=12, pady=(6, 4))
+        bottom.grid_columnconfigure(4, weight=1)
 
         self.progress_bar = ctk.CTkProgressBar(bottom)
         self.progress_bar.set(0)
-        self.progress_bar.grid(row=0, column=0, columnspan=4, sticky="ew", pady=(0, 8))
+        self.progress_bar.grid(row=0, column=0, columnspan=5, sticky="ew", pady=(0, 8))
 
         self.transcribe_button = ctk.CTkButton(
             bottom, text="", height=36, font=ctk.CTkFont(size=14, weight="bold"),
             command=self._start_transcription)
-        self.transcribe_button.grid(row=1, column=0, sticky="ew", padx=(0, 8))
+        self.transcribe_button.grid(row=1, column=0, padx=(0, 8))
 
         self.cancel_button = ctk.CTkButton(
             bottom, text="", height=36, fg_color="#8a3535",
@@ -225,10 +392,92 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
             bottom, text="", height=36, width=150, fg_color="transparent",
             text_color=self.OUTLINE_BUTTON_TEXT,
             border_width=1, command=self._open_output_folder)
-        self.open_folder_button.grid(row=1, column=3)
+        self.open_folder_button.grid(row=1, column=3, padx=(0, 10))
 
-        self.status_line = ctk.CTkLabel(parent, text="", anchor="w", text_color=self.MUTED_TEXT)
-        self.status_line.grid(row=4, column=0, sticky="ew", padx=16, pady=(2, 8))
+        self.status_line = ctk.CTkLabel(bottom, text="", anchor="w", text_color=self.MUTED_TEXT)
+        self.status_line.grid(row=1, column=4, sticky="ew")
+
+    # ------------------------------------------------------------- live tab
+
+    def _build_live_tab(self, parent):
+        parent.grid_columnconfigure(0, weight=1)
+        parent.grid_rowconfigure(2, weight=1)
+
+        options = ctk.CTkFrame(parent)
+        options.grid(row=0, column=0, sticky="ew", padx=12, pady=(8, 6))
+        options.grid_columnconfigure(6, weight=1)
+
+        self.live_language_label = ctk.CTkLabel(options, text="")
+        self.live_language_label.grid(row=0, column=0, padx=(12, 6), pady=(10, 4))
+        self.live_language_menu = ctk.CTkOptionMenu(
+            options, width=130, command=self._on_live_pref_change,
+        )
+        self.live_language_menu.grid(row=0, column=1, padx=(0, 16), pady=(10, 4))
+
+        self.live_mic_label = ctk.CTkLabel(options, text="")
+        self.live_mic_label.grid(row=0, column=2, padx=(0, 6), pady=(10, 4))
+        # Persisted by device *name* (indices shuffle when devices come and
+        # go); values are refreshed every time the tab is shown so a mic
+        # plugged in mid-session appears without a restart.
+        self.live_mic_menu = ctk.CTkOptionMenu(
+            options, width=230, command=self._on_live_pref_change,
+            dynamic_resizing=False,
+        )
+        self.live_mic_menu.grid(row=0, column=3, sticky="w", padx=(0, 16), pady=(10, 4))
+
+        # Input level meter, grouped right next to the device it reports
+        # on — live feedback that the chosen mic is actually hearing
+        # something (the most common "nothing transcribes" cause is the
+        # wrong/muted device, which otherwise just looks like silence).
+        # Fed from the worker's per-chunk RMS by _tick_player.
+        self.live_level_label = ctk.CTkLabel(options, text="")
+        self.live_level_label.grid(row=0, column=4, padx=(0, 6), pady=(10, 4))
+        self.live_level_bar = ctk.CTkProgressBar(options, width=90)
+        self.live_level_bar.set(0)
+        self.live_level_bar.grid(row=0, column=5, sticky="w", padx=(0, 12), pady=(10, 4))
+
+        self.live_hint_label = ctk.CTkLabel(
+            options, text="", anchor="w", text_color=self.MUTED_TEXT, wraplength=640,
+            justify="left")
+        self.live_hint_label.grid(row=1, column=0, columnspan=7, sticky="ew",
+                                  padx=12, pady=(0, 10))
+
+        # hint (left) + font size row (right) — same layout as the Edit
+        # tab's hint_row, sitting directly above the text area it resizes.
+        font_row = ctk.CTkFrame(parent, fg_color="transparent")
+        font_row.grid(row=1, column=0, sticky="ew", padx=16, pady=(0, 2))
+        font_row.grid_columnconfigure(0, weight=1)
+        self.live_text_hint_label = ctk.CTkLabel(
+            font_row, text="", anchor="w", text_color=self.MUTED_TEXT)
+        self.live_text_hint_label.grid(row=0, column=0, sticky="w")
+        self.live_text_font = ctk.CTkFont(size=self.prefs["live_text_font_size"])
+        self._build_font_size_row(
+            font_row, self.live_text_font, "live_text_font_size"
+        ).grid(row=0, column=1, sticky="e")
+
+        self.live_text = ctk.CTkTextbox(parent, wrap="word", font=self.live_text_font)
+        self.live_text.grid(row=2, column=0, sticky="nsew", padx=12, pady=6)
+        self.live_text.configure(state="disabled")
+
+        # Same layout as the Edit tab's save row: buttons left-aligned,
+        # status text following immediately after on the same row.
+        bottom = ctk.CTkFrame(parent, fg_color="transparent")
+        bottom.grid(row=3, column=0, sticky="ew", padx=12, pady=(2, 4))
+        bottom.grid_columnconfigure(2, weight=1)
+
+        self.live_toggle_button = ctk.CTkButton(
+            bottom, text="", height=36,
+            font=ctk.CTkFont(size=14, weight="bold"), command=self._toggle_live_recording)
+        self.live_toggle_button.grid(row=0, column=0, padx=(0, 8))
+
+        self.live_open_folder_button = ctk.CTkButton(
+            bottom, text="", height=36, width=150, fg_color="transparent",
+            text_color=self.OUTLINE_BUTTON_TEXT, border_width=1,
+            command=lambda: self._open_output_folder(settings.live_recordings_folder()))
+        self.live_open_folder_button.grid(row=0, column=1, padx=(0, 10))
+
+        self.live_status_line = ctk.CTkLabel(bottom, text="", anchor="w", text_color=self.MUTED_TEXT)
+        self.live_status_line.grid(row=0, column=2, sticky="ew")
 
     # ------------------------------------------------------------ edit tab
 
@@ -289,11 +538,16 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         self._build_font_size_row(
             hint_row, self.editor_font, "editor_font_size"
         ).grid(row=0, column=1, sticky="e", padx=(0, 8))
+        self.ts_toggle_button = ctk.CTkButton(
+            hint_row, text="", width=90, height=24, font=ctk.CTkFont(size=12),
+            fg_color="transparent", text_color=self.OUTLINE_BUTTON_TEXT,
+            border_width=1, command=self._toggle_timestamps)
+        self.ts_toggle_button.grid(row=0, column=2, sticky="e", padx=(0, 8))
         self.punct_toggle_button = ctk.CTkButton(
             hint_row, text="", width=90, height=24, font=ctk.CTkFont(size=12),
             fg_color="transparent", text_color=self.OUTLINE_BUTTON_TEXT,
             border_width=1, command=self._toggle_punct_pad)
-        self.punct_toggle_button.grid(row=0, column=2, sticky="e")
+        self.punct_toggle_button.grid(row=0, column=3, sticky="e")
 
         # punctuation pad — hidden until toggled on; sits above the editor
         # so inserts land wherever the cursor already is.
@@ -304,6 +558,28 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         # editor
         self.editor = ctk.CTkTextbox(parent, wrap="word", font=self.editor_font)
         self.editor.grid(row=4, column=0, sticky="nsew", padx=12, pady=6)
+
+        # Clickable [mm:ss] paragraph markers: styled + bound through Tk
+        # text tags on the underlying Text widget, so they keep their
+        # styling and click behavior while moving naturally with the text
+        # as the user edits around them.
+        tb = self.editor._textbox
+        tb.tag_configure(self.TS_TAG, foreground="#3B8ED0")
+        tb.tag_bind(self.TS_TAG, "<Button-1>", self._on_timestamp_click)
+        tb.tag_bind(self.TS_TAG, "<Enter>",
+                    lambda _e: tb.configure(cursor="hand2"))
+        tb.tag_bind(self.TS_TAG, "<Leave>",
+                    lambda _e: tb.configure(cursor="xterm"))
+        self.edit_times_available = False
+        # Session-only, like punct_pad_visible below — not a saved
+        # preference, so markers never surprise you by appearing (or a
+        # saved copy never surprises you by including them) just because
+        # a previous session happened to leave the toggle on. Rendered
+        # immediately (not left to fire only once a file loads) so the
+        # tag's elide state is deterministically "hidden" from the moment
+        # the tab is built.
+        self.timestamps_visible = False
+        self._render_ts_toggle()
 
         # A session-only convenience, not a saved preference — always
         # starts hidden so it never surprises you on the next launch.
@@ -346,10 +622,15 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
             picker, text="", width=120, command=self._open_file_for_llm)
         self.llm_open_button.grid(row=0, column=2, padx=(0, 10), pady=10)
 
-        # action row
-        actions = ctk.CTkFrame(parent)
-        actions.grid(row=1, column=0, sticky="ew", padx=12, pady=6)
-        actions.grid_columnconfigure(6, weight=1)
+        # action row — Mode, Target, Quality, and the RAM caption all
+        # together on one line, as originally designed. That's wider than
+        # some windows can show even maximized, so — same fix as the tab
+        # bar — it's a scrollable strip: it just looks like a normal card
+        # row when everything fits, and grows "<"/">" arrows to pan across
+        # it when it doesn't.
+        actions, self.llm_actions_canvas, self.llm_actions_left, \
+            self.llm_actions_right = self._make_scroll_strip(
+                parent, row=1, column=0, padx=12, pady=6)
 
         self.llm_mode_label = ctk.CTkLabel(actions, text="")
         self.llm_mode_label.grid(row=0, column=0, padx=(12, 6), pady=10)
@@ -369,19 +650,17 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
             actions, command=self._on_llm_pref_change)
         self.llm_quality_button.grid(row=0, column=5, padx=(0, 12), pady=10)
 
-        # Sits in the stretchy column right after the quality picker it's
-        # advising on, with the generate button pinned past it on the right.
+        # Sits right after the quality picker it's advising on. Kept a
+        # wraplength as a safety net so a long message (the "close other
+        # apps first" variant especially) wraps instead of stretching the
+        # row indefinitely.
         self.llm_ram_caption = ctk.CTkLabel(
-            actions, text="", anchor="w", text_color=self.MUTED_TEXT,
-            font=ctk.CTkFont(size=11))
-        self.llm_ram_caption.grid(row=0, column=6, sticky="w", padx=(0, 8), pady=10)
+            actions, text="", anchor="w", justify="left", text_color=self.MUTED_TEXT,
+            font=ctk.CTkFont(size=11), wraplength=360)
+        self.llm_ram_caption.grid(row=0, column=6, sticky="w", padx=(0, 12), pady=10)
 
-        self.llm_generate_button = ctk.CTkButton(
-            actions, text="", width=130, height=32,
-            font=ctk.CTkFont(size=13, weight="bold"),
-            command=self._generate_or_cancel)
-        self.llm_generate_button.grid(row=0, column=7, sticky="e",
-                                      padx=(0, 12), pady=10)
+        self._finalize_scroll_strip(self.llm_actions_canvas, actions,
+                                    self.llm_actions_left, self.llm_actions_right)
 
         # panels, with a draggable sash between them. Each side's header
         # (title + font-size buttons) lives directly above its own textbox,
@@ -450,22 +729,507 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         self.llm_split = self._clamp_split(self.prefs.get("llm_panel_split", 0.5))
         self._apply_llm_split()
 
-        # save row
+        # save row — Generate leads, same as the primary action button in
+        # every other tab (Transcribe All, Start Recording, Save copy in
+        # Edit), followed by Save copy / Open folder / status.
         saverow = ctk.CTkFrame(parent, fg_color="transparent")
         saverow.grid(row=3, column=0, sticky="ew", padx=12, pady=(2, 4))
-        saverow.grid_columnconfigure(2, weight=1)
+        saverow.grid_columnconfigure(3, weight=1)
+        self.llm_generate_button = ctk.CTkButton(
+            saverow, text="", height=36, font=ctk.CTkFont(size=14, weight="bold"),
+            command=self._generate_or_cancel)
+        self.llm_generate_button.grid(row=0, column=0, padx=(0, 8))
         self.llm_save_button = ctk.CTkButton(
             saverow, text="", height=36, font=ctk.CTkFont(size=14, weight="bold"),
             command=self._save_llm_output)
-        self.llm_save_button.grid(row=0, column=0, padx=(0, 8))
+        self.llm_save_button.grid(row=0, column=1, padx=(0, 8))
         self.llm_open_folder_button = ctk.CTkButton(
             saverow, text="", height=36, width=150, fg_color="transparent",
             text_color=self.OUTLINE_BUTTON_TEXT,
             border_width=1, command=self._open_output_folder)
-        self.llm_open_folder_button.grid(row=0, column=1, padx=(0, 10))
+        self.llm_open_folder_button.grid(row=0, column=2, padx=(0, 10))
         self.llm_status_line = ctk.CTkLabel(saverow, text="", anchor="w",
                                             text_color=self.MUTED_TEXT)
-        self.llm_status_line.grid(row=0, column=2, sticky="ew")
+        self.llm_status_line.grid(row=0, column=3, sticky="ew")
+
+    # ------------------------------------------------------- settings tab
+
+    def _build_settings_tab(self, parent):
+        parent.grid_columnconfigure(0, weight=1)
+        parent.grid_rowconfigure(0, weight=1)
+
+        scroll = ctk.CTkScrollableFrame(parent, fg_color="transparent")
+        scroll.grid(row=0, column=0, sticky="nsew", padx=8, pady=(8, 4))
+        scroll.grid_columnconfigure(0, weight=1)
+
+        section_font = ctk.CTkFont(size=14, weight="bold")
+
+        # --- Preferences
+        prefs_card = ctk.CTkFrame(scroll)
+        prefs_card.grid(row=0, column=0, sticky="ew", padx=4, pady=(0, 8))
+        prefs_card.grid_columnconfigure(1, weight=1)
+        self.settings_prefs_title = ctk.CTkLabel(
+            prefs_card, text="", font=section_font, anchor="w")
+        self.settings_prefs_title.grid(
+            row=0, column=0, columnspan=4, sticky="w", padx=12, pady=(10, 6))
+
+        self.chinese_trad_var = ctk.BooleanVar(value=True)
+        self.chinese_trad_box = ctk.CTkCheckBox(
+            prefs_card, text="", variable=self.chinese_trad_var,
+            command=self._on_settings_pref_change)
+        self.chinese_trad_box.grid(
+            row=1, column=0, columnspan=4, sticky="w", padx=12, pady=(0, 12))
+
+        self.output_folder_title = ctk.CTkLabel(prefs_card, text="", anchor="w")
+        self.output_folder_title.grid(row=2, column=0, sticky="w",
+                                      padx=(12, 10), pady=(0, 12))
+        self.output_folder_value = ctk.CTkLabel(
+            prefs_card, text="", anchor="w", text_color=self.MUTED_TEXT)
+        self.output_folder_value.grid(row=2, column=1, sticky="ew",
+                                      padx=(0, 10), pady=(0, 12))
+        self.output_change_button = ctk.CTkButton(
+            prefs_card, text="", width=90, height=28, fg_color="transparent",
+            text_color=self.OUTLINE_BUTTON_TEXT, border_width=1,
+            command=self._change_output_folder)
+        self.output_change_button.grid(row=2, column=2, padx=(0, 6), pady=(0, 12))
+        self.output_reset_button = ctk.CTkButton(
+            prefs_card, text="", width=90, height=28, fg_color="transparent",
+            text_color=self.OUTLINE_BUTTON_TEXT, border_width=1,
+            command=self._reset_output_folder)
+        self.output_reset_button.grid(row=2, column=3, padx=(0, 12), pady=(0, 12))
+
+        # --- Models & storage
+        models_card = ctk.CTkFrame(scroll)
+        models_card.grid(row=1, column=0, sticky="ew", padx=4, pady=(0, 8))
+        models_card.grid_columnconfigure(0, weight=1)
+        self.settings_models_title = ctk.CTkLabel(
+            models_card, text="", font=section_font, anchor="w")
+        self.settings_models_title.grid(row=0, column=0, sticky="w",
+                                        padx=12, pady=(10, 2))
+        self.settings_models_hint = ctk.CTkLabel(
+            models_card, text="", anchor="w", justify="left",
+            text_color=self.MUTED_TEXT, wraplength=640)
+        self.settings_models_hint.grid(row=1, column=0, sticky="ew",
+                                       padx=12, pady=(0, 6))
+        self.model_rows_frame = ctk.CTkFrame(models_card, fg_color="transparent")
+        self.model_rows_frame.grid(row=2, column=0, sticky="ew", padx=8, pady=(0, 4))
+        self.model_rows_frame.grid_columnconfigure(0, weight=1)
+        self.settings_total_label = ctk.CTkLabel(
+            models_card, text="", anchor="w", text_color=self.MUTED_TEXT)
+        self.settings_total_label.grid(row=3, column=0, sticky="w",
+                                       padx=12, pady=(0, 10))
+
+        # --- Maintenance
+        maint_card = ctk.CTkFrame(scroll)
+        maint_card.grid(row=2, column=0, sticky="ew", padx=4, pady=(0, 8))
+        maint_card.grid_columnconfigure(0, weight=1)
+        self.settings_maint_title = ctk.CTkLabel(
+            maint_card, text="", font=section_font, anchor="w")
+        self.settings_maint_title.grid(row=0, column=0, sticky="w",
+                                       padx=12, pady=(10, 6))
+
+        update_row = ctk.CTkFrame(maint_card, fg_color="transparent")
+        update_row.grid(row=1, column=0, sticky="ew", padx=12, pady=(0, 8))
+        update_row.grid_columnconfigure(3, weight=1)
+        self.settings_version_label = ctk.CTkLabel(update_row, text="", anchor="w")
+        self.settings_version_label.grid(row=0, column=0, padx=(0, 14))
+        self.update_button = ctk.CTkButton(
+            update_row, text="", width=150, height=28,
+            command=self._check_updates)
+        self.update_button.grid(row=0, column=1, padx=(0, 8))
+        self.update_open_button = ctk.CTkButton(
+            update_row, text="", width=150, height=28, fg_color="transparent",
+            text_color=self.OUTLINE_BUTTON_TEXT, border_width=1,
+            command=lambda: webbrowser.open(RELEASES_PAGE_URL))
+        self.update_open_button.grid(row=0, column=2, padx=(0, 8))
+        self.update_open_button.grid_remove()
+        self.update_status_label = ctk.CTkLabel(
+            update_row, text="", anchor="w", text_color=self.MUTED_TEXT)
+        self.update_status_label.grid(row=0, column=3, sticky="ew")
+
+        tools_row = ctk.CTkFrame(maint_card, fg_color="transparent")
+        tools_row.grid(row=2, column=0, sticky="ew", padx=12, pady=(0, 12))
+        self.open_log_button = ctk.CTkButton(
+            tools_row, text="", width=150, height=28, fg_color="transparent",
+            text_color=self.OUTLINE_BUTTON_TEXT, border_width=1,
+            command=self._open_log_file)
+        self.open_log_button.grid(row=0, column=0, padx=(0, 8))
+        self.open_models_button = ctk.CTkButton(
+            tools_row, text="", width=150, height=28, fg_color="transparent",
+            text_color=self.OUTLINE_BUTTON_TEXT, border_width=1,
+            command=lambda: self._open_output_folder(settings.MODELS_DIR))
+        self.open_models_button.grid(row=0, column=1, padx=(0, 8))
+        self.reset_settings_button = ctk.CTkButton(
+            tools_row, text="", width=150, height=28, fg_color="transparent",
+            text_color=self.OUTLINE_BUTTON_TEXT, border_width=1,
+            command=self._reset_all_settings)
+        self.reset_settings_button.grid(row=0, column=2)
+
+    def _retranslate_settings_tab(self):
+        t = lambda key, **kw: i18n.t(self.ui_lang, key, **kw)  # noqa: E731
+        self.settings_prefs_title.configure(text=t("settings_section_prefs"))
+        self.chinese_trad_box.configure(text=t("settings_chinese_traditional"))
+        self.output_folder_title.configure(text=t("settings_output_folder"))
+        self.output_folder_value.configure(text=settings.output_base())
+        self.output_change_button.configure(text=t("settings_output_change"))
+        self.output_reset_button.configure(text=t("settings_output_reset"))
+        self.settings_models_title.configure(text=t("settings_section_models"))
+        self.settings_models_hint.configure(text=t("settings_models_hint"))
+        self.settings_maint_title.configure(text=t("settings_section_maintenance"))
+        self.settings_version_label.configure(
+            text=t("settings_version", version=settings.APP_VERSION))
+        self.update_button.configure(text=t("settings_check_updates"))
+        self.update_open_button.configure(text=t("settings_update_open"))
+        self.open_log_button.configure(text=t("settings_open_log"))
+        self.open_models_button.configure(text=t("settings_open_models"))
+        self.reset_settings_button.configure(text=t("settings_reset"))
+        self._render_update_status()
+        self._refresh_model_rows()
+
+    def _refresh_settings_tab(self):
+        self.output_folder_value.configure(text=settings.output_base())
+        self._refresh_model_rows()
+
+    # -- model manager ----------------------------------------------------
+
+    def _model_registry(self):
+        """One spec per manageable model (whisper tiers, SenseVoice pair,
+        LLM tiers): where it lives on disk, how big its download is, and
+        how to tell whether it's already present."""
+        specs = []
+        for q in i18n.QUALITY_KEYS:
+            size = transcriber.QUALITY_MODELS[q]
+            specs.append({
+                "key": f"whisper_{q}", "kind": "whisper", "quality": q,
+                "folders": [os.path.join(
+                    settings.MODELS_DIR, transcriber.whisper_repo_dirname(size))],
+                "download_bytes": transcriber.MODEL_DOWNLOAD_MB[size] * 1024 ** 2,
+                "is_downloaded": lambda s=size: transcriber.model_is_downloaded(s),
+            })
+        if self.sensevoice_available:
+            specs.append({
+                "key": "sensevoice", "kind": "sensevoice", "quality": None,
+                "folders": transcriber.sensevoice_model_dirs(),
+                "download_bytes": transcriber.SENSEVOICE_DOWNLOAD_MB * 1024 ** 2,
+                "is_downloaded": transcriber.sensevoice_is_downloaded,
+            })
+        for q in i18n.QUALITY_KEYS:
+            spec = llm.QUALITY_LLM[q]
+            specs.append({
+                "key": f"llm_{q}", "kind": "llm", "quality": q,
+                "folders": [os.path.join(
+                    settings.MODELS_DIR,
+                    "models--" + spec["repo"].replace("/", "--"))],
+                "download_bytes": int(spec["size_gb"] * 1024 ** 3),
+                "is_downloaded": lambda qq=q: llm.llm_model_is_downloaded(qq),
+            })
+        return specs
+
+    def _model_display_name(self, spec):
+        quality = i18n.quality_display(spec["quality"], self.ui_lang) \
+            if spec["quality"] else ""
+        if spec["kind"] == "whisper":
+            return i18n.t(self.ui_lang, "settings_model_whisper", quality=quality)
+        if spec["kind"] == "llm":
+            return i18n.t(self.ui_lang, "settings_model_llm", quality=quality)
+        return i18n.t(self.ui_lang, "settings_model_sensevoice")
+
+    def _refresh_model_rows(self):
+        # Rebuilding mid-download would destroy the label its progress is
+        # being written to; the refresh happens again from the "done"/
+        # "failed" event instead.
+        if self.model_downloads:
+            return
+        t = lambda key, **kw: i18n.t(self.ui_lang, key, **kw)  # noqa: E731
+        for child in self.model_rows_frame.winfo_children():
+            child.destroy()
+        self.model_rows = {}
+        for r, spec in enumerate(self._model_registry()):
+            row = ctk.CTkFrame(self.model_rows_frame, fg_color=("gray95", "gray24"))
+            row.grid(row=r, column=0, sticky="ew", pady=3)
+            row.grid_columnconfigure(0, weight=1)
+            name = ctk.CTkLabel(row, text=self._model_display_name(spec), anchor="w")
+            name.grid(row=0, column=0, sticky="ew", padx=(10, 8), pady=8)
+            downloaded = spec["is_downloaded"]()
+            if downloaded:
+                on_disk = sum(_folder_size(f) for f in spec["folders"]
+                              if os.path.isdir(f))
+                status_text = t("settings_model_downloaded", size=_fmt_size(on_disk))
+            else:
+                status_text = t("settings_model_not_downloaded",
+                                size=_fmt_size(spec["download_bytes"]))
+            status = ctk.CTkLabel(row, text=status_text, anchor="e",
+                                  text_color=self.MUTED_TEXT)
+            status.grid(row=0, column=1, padx=(0, 10), pady=8)
+            if downloaded:
+                button = ctk.CTkButton(
+                    row, text=t("settings_model_delete"), width=88, height=26,
+                    fg_color="transparent", text_color=self.OUTLINE_BUTTON_TEXT,
+                    border_width=1,
+                    command=lambda s=spec: self._delete_model(s))
+            else:
+                button = ctk.CTkButton(
+                    row, text=t("settings_model_download"), width=88, height=26,
+                    command=lambda s=spec: self._download_model(s))
+            button.grid(row=0, column=2, padx=(0, 10), pady=6)
+            self.model_rows[spec["key"]] = {"spec": spec, "status": status,
+                                            "button": button}
+        total = _folder_size(settings.MODELS_DIR) \
+            if os.path.isdir(settings.MODELS_DIR) else 0
+        self.settings_total_label.configure(
+            text=t("settings_total_usage", size=_fmt_size(total)))
+
+    def _models_busy(self):
+        return self.running or self.live_running or self.llm_running
+
+    def _download_model(self, spec):
+        key = spec["key"]
+        row = self.model_rows.get(key)
+        # One download at a time — the progress plumbing (and the tqdm
+        # patching the SenseVoice path does) isn't built for two at once,
+        # and neither is a typical home connection.
+        if self._models_busy() or self.model_downloads:
+            if row:
+                row["status"].configure(
+                    text=i18n.t(self.ui_lang, "settings_model_busy"))
+            return
+        self.model_downloads.add(key)
+        if row:
+            row["button"].configure(state="disabled")
+            row["status"].configure(
+                text=i18n.t(self.ui_lang, "settings_model_downloading", pct=0))
+
+        def emit_pct(pct):
+            self.events.put(("model_dl", key, "downloading", {"pct": pct}))
+
+        def work():
+            try:
+                os.makedirs(settings.MODELS_DIR, exist_ok=True)
+                os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+                from progress import make_progress_tqdm_class
+
+                reporter = make_progress_tqdm_class(
+                    transcriber.monotonic_pct_reporter(emit_pct))
+                if spec["kind"] == "whisper":
+                    import huggingface_hub
+
+                    size = transcriber.QUALITY_MODELS[spec["quality"]]
+                    huggingface_hub.snapshot_download(
+                        transcriber.WHISPER_MODEL_REPOS[size],
+                        cache_dir=settings.MODELS_DIR,
+                        allow_patterns=transcriber._WHISPER_ALLOW_PATTERNS,
+                        tqdm_class=reporter)
+                elif spec["kind"] == "llm":
+                    from huggingface_hub import hf_hub_download
+
+                    llm_spec = llm.QUALITY_LLM[spec["quality"]]
+                    hf_hub_download(llm_spec["repo"], llm_spec["file"],
+                                    cache_dir=settings.MODELS_DIR,
+                                    tqdm_class=reporter)
+                else:
+                    # SenseVoice: same call the Live tab preload makes — it
+                    # loads the model into memory as well, which doubles as
+                    # warming it up for this session.
+                    def on_pct(pct):
+                        emit_pct(pct)
+                        if pct >= 100:
+                            self.events.put(("model_dl", key, "loading", {}))
+
+                    transcriber.get_sensevoice_model(
+                        transcriber.monotonic_pct_reporter(on_pct))
+                self.events.put(("model_dl", key, "done", {}))
+            except Exception:
+                settings.log_exception(f"Model download failed ({key}):")
+                self.events.put(("model_dl", key, "failed", {}))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_model_dl_event(self, key, status, detail):
+        row = self.model_rows.get(key)
+        t = lambda k, **kw: i18n.t(self.ui_lang, k, **kw)  # noqa: E731
+        if status == "downloading":
+            if row:
+                row["status"].configure(
+                    text=t("settings_model_downloading", pct=detail.get("pct", 0)))
+            return
+        if status == "loading":
+            if row:
+                row["status"].configure(text=t("settings_model_loading"))
+            return
+        self.model_downloads.discard(key)
+        if status == "failed":
+            if row:
+                row["status"].configure(text=t("settings_model_dl_failed"))
+                row["button"].configure(state="normal")
+            return
+        self._refresh_model_rows()
+
+    def _delete_model(self, spec):
+        row = self.model_rows.get(spec["key"])
+        if self._models_busy() or self.model_downloads:
+            if row:
+                row["status"].configure(
+                    text=i18n.t(self.ui_lang, "settings_model_busy"))
+            return
+        if not messagebox.askyesno(
+            i18n.t(self.ui_lang, "settings_model_delete_confirm_title"),
+            i18n.t(self.ui_lang, "settings_model_delete_confirm",
+                   name=self._model_display_name(spec))):
+            return
+        if spec["kind"] == "llm":
+            # A loaded .gguf is memory-mapped (= locked on Windows);
+            # dropping the cache first is what makes the delete succeed.
+            llm.unload_cached_model()
+        ok = True
+        for folder in spec["folders"]:
+            if os.path.isdir(folder):
+                try:
+                    shutil.rmtree(folder)
+                except Exception:
+                    settings.log_exception(f"Model delete failed: {folder}")
+                    ok = False
+        self._refresh_model_rows()
+        if not ok:
+            row = self.model_rows.get(spec["key"])
+            if row:
+                row["status"].configure(
+                    text=i18n.t(self.ui_lang, "settings_model_delete_failed"))
+
+    # -- preferences / maintenance -----------------------------------------
+
+    def _on_settings_pref_change(self):
+        self.prefs["chinese_traditional"] = bool(self.chinese_trad_var.get())
+        settings.save(self.prefs)
+
+    def _offer_output_folder_fix(self):
+        """Shown at most once per session, right after a save fails with a
+        permission/OS-level error — the classic symptom of the output
+        folder not actually being writable. Most common on an unsigned
+        macOS build launched straight from Downloads or a mounted disk
+        image (see the README's "Running the unsigned macOS build"
+        section): Gatekeeper silently runs the app from a hidden,
+        read-only copy in that case, so every save fails the same way no
+        matter which tab triggered it. Offers the one fix this app can
+        actually help with directly — jumping to Settings and opening the
+        output-folder picker immediately — rather than leaving the user to
+        find that on their own from a bare error message."""
+        if self._save_failure_hint_shown:
+            return
+        self._save_failure_hint_shown = True
+        key = ("save_failed_folder_message_mac" if sys.platform == "darwin"
+              else "save_failed_folder_message")
+        if messagebox.askyesno(
+            i18n.t(self.ui_lang, "save_failed_folder_title"),
+            i18n.t(self.ui_lang, key),
+        ):
+            self._show_tab(4)
+            self._change_output_folder()
+
+    def _change_output_folder(self):
+        folder = filedialog.askdirectory(
+            title=i18n.t(self.ui_lang, "settings_output_pick_dialog"),
+            initialdir=settings.output_base())
+        if not folder:
+            return
+        folder = os.path.abspath(folder)
+        try:
+            os.makedirs(folder, exist_ok=True)
+            probe = os.path.join(folder, ".sota-write-test")
+            with open(probe, "w"):
+                pass
+            os.remove(probe)
+        except Exception:
+            messagebox.showerror(
+                "SOTA", i18n.t(self.ui_lang, "settings_output_not_writable"))
+            return
+        self.prefs["output_folder"] = folder
+        settings.set_output_base(folder)
+        settings.save(self.prefs)
+        self.output_folder_value.configure(text=settings.output_base())
+
+    def _reset_output_folder(self):
+        self.prefs["output_folder"] = ""
+        settings.set_output_base("")
+        settings.save(self.prefs)
+        self.output_folder_value.configure(text=settings.output_base())
+
+    def _open_log_file(self):
+        try:
+            if os.path.isfile(settings.LOG_FILE):
+                _open_path(settings.LOG_FILE)
+            else:
+                os.makedirs(settings.APP_DIR, exist_ok=True)
+                _open_path(settings.APP_DIR)
+        except Exception:
+            settings.log_exception("Open log file failed:")
+
+    def _check_updates(self):
+        if self.update_checking:
+            return
+        self.update_checking = True
+        self.update_open_button.grid_remove()
+        self._set_update_status("settings_update_checking", {})
+
+        def work():
+            tag = None
+            try:
+                import json
+                import urllib.request
+
+                req = urllib.request.Request(UPDATE_API_URL, headers={
+                    "User-Agent": "SOTA",
+                    "Accept": "application/vnd.github+json",
+                })
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    tag = (json.load(resp).get("tag_name") or "").strip()
+            except Exception:
+                settings.log_exception("Update check failed:")
+            self.events.put(("update_check", tag))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_update_check_result(self, tag):
+        self.update_checking = False
+        if not tag:
+            self._set_update_status("settings_update_failed", {})
+        elif _version_tuple(tag) > _version_tuple(settings.APP_VERSION):
+            self._set_update_status("settings_update_available",
+                                    {"version": tag.lstrip("vV")})
+            self.update_open_button.grid()
+        else:
+            self._set_update_status("settings_update_latest", {})
+
+    def _set_update_status(self, key, detail):
+        self.update_status_key = key
+        self.update_status_detail = detail if isinstance(detail, dict) else {}
+        self._render_update_status()
+
+    def _render_update_status(self):
+        if self.update_status_key is None:
+            self.update_status_label.configure(text="")
+            return
+        self.update_status_label.configure(
+            text=i18n.t(self.ui_lang, self.update_status_key,
+                        **(self.update_status_detail or {})))
+
+    def _reset_all_settings(self):
+        if not messagebox.askyesno(
+            i18n.t(self.ui_lang, "settings_reset_confirm_title"),
+            i18n.t(self.ui_lang, "settings_reset_confirm")):
+            return
+        self.prefs = dict(settings.DEFAULTS)
+        settings.set_output_base("")
+        settings.save(self.prefs)
+        self.ui_lang = self.prefs["ui_language"]
+        self.editor_font.configure(size=self.prefs["editor_font_size"])
+        self.llm_source_font.configure(size=self.prefs["llm_source_font_size"])
+        self.llm_output_font.configure(size=self.prefs["llm_output_font_size"])
+        self.live_text_font.configure(size=self.prefs["live_text_font_size"])
+        self.llm_split = self._clamp_split(self.prefs["llm_panel_split"])
+        self._apply_llm_split()
+        self._apply_prefs()
+        self._retranslate()
+        self._refresh_settings_tab()
 
     # --------------------------------------------- AI tab: resizable panels
 
@@ -574,6 +1338,62 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
     def _toggle_punct_pad(self):
         self._set_punct_pad_visible(not self.punct_pad_visible)
 
+    # ------------------------------------------- edit tab: timestamps
+
+    TS_TAG = "tstamp"
+
+    def _apply_timestamp_markup(self):
+        """Finds every [mm:ss] marker currently in the editor and tags it —
+        the shared TS_TAG for styling/clicks/hiding, plus a per-marker
+        "ts:<seconds>" tag that carries the seek target. Python string
+        offsets convert directly to Tk "1.0+Nc" indices because the widget
+        holds exactly the text that was inserted. Runs on load; markers
+        typed by hand afterwards aren't clickable until reload, but Save
+        still honors them (it re-parses by regex, not by tag)."""
+        tb = self.editor._textbox
+        text = self.editor.get("1.0", "end-1c")
+        found = False
+        for m in timestamps.MARKER_RE.finditer(text):
+            found = True
+            start, end = f"1.0+{m.start()}c", f"1.0+{m.end()}c"
+            tb.tag_add(self.TS_TAG, start, end)
+            tb.tag_add(f"ts:{timestamps.marker_seconds(m)}", start, end)
+        self.edit_times_available = found
+        self._render_ts_toggle()
+
+    def _on_timestamp_click(self, event):
+        tb = self.editor._textbox
+        index = tb.index(f"@{event.x},{event.y}")
+        for tag in tb.tag_names(index):
+            if tag.startswith("ts:"):
+                self._seek_to_seconds(float(tag[3:]))
+                return "break"  # don't also move the insert cursor into the marker
+        return None
+
+    def _seek_to_seconds(self, seconds):
+        if self.player.loaded_path is None or not self.player.duration:
+            return
+        frac = max(0.0, min(1.0, seconds / self.player.duration))
+        self.player.seek_fraction(frac)
+        self.position_slider.set(frac)
+        self.time_label.configure(
+            text=f"{_fmt_time(self.player.get_time())} / {_fmt_time(self.player.duration)}")
+
+    def _toggle_timestamps(self):
+        self.timestamps_visible = not self.timestamps_visible
+        self._render_ts_toggle()
+
+    def _render_ts_toggle(self):
+        """Show/hide is Tk's elide on the shared tag: hidden markers stay
+        in the widget's text (so Save can still parse them and write the
+        sidecar) — they just don't render or take up space."""
+        show = self.timestamps_visible
+        self.editor._textbox.tag_configure(self.TS_TAG, elide=not show)
+        self.ts_toggle_button.configure(
+            state="normal" if self.edit_times_available else "disabled",
+            fg_color=("gray75", "gray30")
+            if (show and self.edit_times_available) else "transparent")
+
     def _set_punct_pad_visible(self, visible):
         self.punct_pad_visible = visible
         if visible:
@@ -583,7 +1403,7 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         self.punct_toggle_button.configure(
             fg_color=("gray75", "gray30") if visible else "transparent")
 
-    TAB_KEYS = ["tab_transcribe", "tab_edit", "tab_llm"]
+    TAB_KEYS = ["tab_transcribe", "tab_live", "tab_edit", "tab_llm", "tab_settings"]
     # Selected tab matches the content panel's background (so it visually
     # merges into it); unselected tabs use the app's normal frame color.
     TAB_SELECTED_BG = ("gray92", "gray14")
@@ -600,22 +1420,217 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
     # Secondary/hint text (status lines, captions) — readable on both.
     MUTED_TEXT = ("gray35", "gray65")
 
+    # -------------------------------------------- generic scrollable strip
+    #
+    # A reusable version of the tab bar's Word-ribbon-style horizontal
+    # scroll (canvas viewport + "<"/">" arrows that appear only on
+    # overflow) for any OTHER row of controls that might not fit a narrow
+    # window — e.g. the AI tab's Mode/Target/Quality/RAM-caption row. The
+    # tab bar itself predates this and keeps its own bespoke
+    # implementation (_sync_tab_canvas_bg / _update_tab_scroll_state /
+    # _scroll_tabs below) rather than being retrofitted onto it, so an
+    # already-verified piece of navigation can't be destabilized by a
+    # refactor it didn't need.
+
+    def _resolve_root_bg(self):
+        try:
+            return self._apply_appearance_mode(self.cget("fg_color"))
+        except Exception:
+            return self.cget("fg_color")
+
+    def _make_scroll_strip(self, parent, row, column=0, columnspan=1,
+                           sticky="ew", padx=0, pady=0, fg_color=None):
+        """Builds '<' arrow / canvas viewport / '>' arrow, gridded into
+        `parent` at (row, column). Returns (content, canvas, left_btn,
+        right_btn) — build your row's actual widgets as children of
+        `content`, then call _finalize_scroll_strip(canvas, content,
+        left_btn, right_btn) once they're all in place to lock in the
+        right height and wire up auto-resize.
+
+        fg_color is the canvas's background (it has no CTk theming of its
+        own, so needs one set explicitly to blend in) — defaults to
+        CTkFrame's own card color, matching a plain ctk.CTkFrame() card;
+        pass "transparent" to match the window's own background instead."""
+        wrapper = ctk.CTkFrame(parent, fg_color="transparent")
+        wrapper.grid(row=row, column=column, columnspan=columnspan,
+                     sticky=sticky, padx=padx, pady=pady)
+        wrapper.grid_columnconfigure(1, weight=1)
+
+        if fg_color is None:
+            fg_color = ctk.ThemeManager.theme["CTkFrame"]["fg_color"]
+        resolved_bg = (self._resolve_root_bg() if fg_color == "transparent"
+                      else self._apply_appearance_mode(fg_color))
+
+        left_btn = ctk.CTkButton(wrapper, text="<", width=22, corner_radius=6)
+        left_btn.grid(row=0, column=0, padx=(0, 3))
+        left_btn.grid_remove()
+
+        canvas = tk.Canvas(wrapper, highlightthickness=0, bd=0, bg=resolved_bg)
+        canvas.grid(row=0, column=1, sticky="ew")
+
+        content = ctk.CTkFrame(canvas, fg_color=fg_color)
+        canvas.create_window((0, 0), window=content, anchor="nw")
+
+        right_btn = ctk.CTkButton(wrapper, text=">", width=22, corner_radius=6)
+        right_btn.grid(row=0, column=2, padx=(3, 0))
+        right_btn.grid_remove()
+
+        left_btn.configure(command=lambda: self._scroll_strip(canvas, content, -1))
+        right_btn.configure(command=lambda: self._scroll_strip(canvas, content, 1))
+        canvas.bind("<Configure>", lambda _e: self._update_strip_overflow(
+            canvas, content, left_btn, right_btn))
+        content.bind("<Configure>", lambda _e: self._on_strip_content_resize(
+            canvas, content, left_btn, right_btn))
+
+        return content, canvas, left_btn, right_btn
+
+    def _finalize_scroll_strip(self, canvas, content, left_btn, right_btn):
+        """Call once content's widgets are all built — measures the real
+        rendered height (a CTkButton's actual height isn't its constructor
+        height= argument; guessing a fixed canvas height clips content,
+        exactly the tab-bar bug this generic version avoids by
+        construction) and locks the canvas + arrows to match."""
+        content.update_idletasks()
+        h = content.winfo_reqheight()
+        canvas.configure(height=h)
+        left_btn.configure(height=h)
+        right_btn.configure(height=h)
+        self._update_strip_overflow(canvas, content, left_btn, right_btn)
+
+    def _on_strip_content_resize(self, canvas, content, left_btn, right_btn):
+        canvas.configure(scrollregion=canvas.bbox("all"))
+        self._update_strip_overflow(canvas, content, left_btn, right_btn)
+
+    def _update_strip_overflow(self, canvas, content, left_btn, right_btn):
+        canvas.update_idletasks()
+        content_w = content.winfo_reqwidth()
+        viewport_w = canvas.winfo_width()
+        if content_w > viewport_w + 1:
+            left_btn.grid()
+            right_btn.grid()
+            max_x = max(0, content_w - viewport_w)
+            if canvas.canvasx(0) > max_x:
+                canvas.xview_moveto(max_x / content_w if content_w else 0)
+        else:
+            left_btn.grid_remove()
+            right_btn.grid_remove()
+            canvas.xview_moveto(0)
+
+    def _scroll_strip(self, canvas, content, direction, step=140):
+        canvas.update_idletasks()
+        content_w = max(1, content.winfo_reqwidth())
+        viewport_w = max(1, canvas.winfo_width())
+        new_x = max(0, min(canvas.canvasx(0) + direction * step,
+                           content_w - viewport_w))
+        canvas.xview_moveto(new_x / content_w)
+
+    # ---------------------------------------------------------- tab bar
+
+    def _sync_tab_canvas_bg(self):
+        """The raw tkinter.Canvas hosting the tab strip has no CTk theming
+        of its own — resolve the root window's (light, dark) fg_color
+        tuple to a concrete color for the current appearance mode, so the
+        canvas doesn't show through as a mismatched flat square behind the
+        tabs. Called once at build time; the app has no live light/dark
+        toggle after launch, so this never needs to re-run."""
+        try:
+            color = self._apply_appearance_mode(self.cget("fg_color"))
+        except Exception:
+            color = self.cget("fg_color")
+        self.tab_canvas.configure(bg=color)
+
+    def _on_tab_canvas_resize(self, _event):
+        self._update_tab_scroll_state()
+
+    def _on_tab_bar_resize(self, _event):
+        self.tab_canvas.configure(scrollregion=self.tab_canvas.bbox("all"))
+        self._update_tab_scroll_state()
+
+    def _update_tab_scroll_state(self):
+        """Shows/hides the </> arrows depending on whether the tab strip's
+        natural width exceeds the viewport it scrolls inside — called after
+        any resize (window resize, or tab widths changing on a language
+        switch) so the arrows track reality instead of a one-time guess
+        made at startup."""
+        self.tab_canvas.update_idletasks()
+        content_w = self.tab_bar.winfo_reqwidth()
+        viewport_w = self.tab_canvas.winfo_width()
+        overflow = content_w > viewport_w + 1
+        if overflow:
+            self.tab_scroll_left.grid()
+            self.tab_scroll_right.grid()
+            # Clamp the current scroll offset in case the viewport just
+            # grew (or the content just shrank) enough that the old
+            # position now runs past the end.
+            max_x = max(0, content_w - viewport_w)
+            if self.tab_canvas.canvasx(0) > max_x:
+                self.tab_canvas.xview_moveto(max_x / content_w if content_w else 0)
+        else:
+            self.tab_scroll_left.grid_remove()
+            self.tab_scroll_right.grid_remove()
+            self.tab_canvas.xview_moveto(0)
+
+    def _scroll_tabs(self, direction):
+        """Pans the tab strip left/right by roughly one tab's width —
+        discrete step navigation (like Word's ribbon overflow arrows),
+        not free-form drag-scrolling."""
+        self.tab_canvas.update_idletasks()
+        content_w = max(1, self.tab_bar.winfo_reqwidth())
+        viewport_w = max(1, self.tab_canvas.winfo_width())
+        step = (self.tab_buttons[0].winfo_width() + 2) if self.tab_buttons else 100
+        new_x = max(0, min(self.tab_canvas.canvasx(0) + direction * step,
+                           content_w - viewport_w))
+        self.tab_canvas.xview_moveto(new_x / content_w)
+
+    def _ensure_active_tab_visible(self):
+        """Pans the tab strip so the currently selected tab's button is
+        fully in view — otherwise a language switch reflowing tab widths
+        (or programmatic tab changes) could leave the active tab scrolled
+        out of sight with no visual indication it's still selected."""
+        if not (0 <= self.current_tab < len(self.tab_buttons)):
+            return
+        self.tab_canvas.update_idletasks()
+        content_w = max(1, self.tab_bar.winfo_reqwidth())
+        viewport_w = max(1, self.tab_canvas.winfo_width())
+        if content_w <= viewport_w:
+            return
+        btn = self.tab_buttons[self.current_tab]
+        btn_x0, btn_x1 = btn.winfo_x(), btn.winfo_x() + btn.winfo_width()
+        cur_x0 = self.tab_canvas.canvasx(0)
+        if btn_x0 < cur_x0:
+            self.tab_canvas.xview_moveto(btn_x0 / content_w)
+        elif btn_x1 > cur_x0 + viewport_w:
+            self.tab_canvas.xview_moveto(max(0, btn_x1 - viewport_w) / content_w)
+
     def _show_tab(self, index):
+        if self.current_tab == 1 and index != 1 and self.live_running:
+            # Navigating away from the Live tab mid-recording — stop it
+            # automatically rather than leaving it recording invisibly in
+            # the background. Same call the Stop button makes: still
+            # auto-saves whatever's been captured so far.
+            self._stop_live_recording()
         self.current_tab = index
-        frames = [self.transcribe_frame, self.edit_frame, self.llm_frame]
+        frames = [self.transcribe_frame, self.live_frame, self.edit_frame,
+                  self.llm_frame, self.settings_frame]
         for i, frame in enumerate(frames):
             if i == index:
-                # Explicit args, not a bare grid() — the edit/AI frames may
-                # never have been gridded before (see _build_ui), so there's
-                # no remembered geometry for a bare call to restore.
+                # Explicit args, not a bare grid() — the live/edit/AI frames
+                # may never have been gridded before (see _build_ui), so
+                # there's no remembered geometry for a bare call to restore.
                 frame.grid(row=0, column=0, sticky="nsew")
             else:
                 frame.grid_remove()
         if index == 1:
-            self._maybe_autoload_edit()
+            self._refresh_mic_menu()
+            self._maybe_preload_sensevoice()
         elif index == 2:
+            self._maybe_autoload_edit()
+        elif index == 3:
             self._maybe_autoload_llm()
+        elif index == 4:
+            self._refresh_settings_tab()
         self._style_tab_buttons()
+        self._ensure_active_tab_visible()
 
     def _style_tab_buttons(self):
         for i, btn in enumerate(self.tab_buttons):
@@ -627,15 +1642,38 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
                 font=ctk.CTkFont(size=13, weight="bold" if selected else "normal"),
             )
 
+    def _edit_has_unsaved_changes(self):
+        if self._edit_loaded_text is None:
+            return False
+        return self.editor.get("1.0", "end-1c") != self._edit_loaded_text
+
     def _maybe_autoload_edit(self):
-        """When the Edit tab has nothing open yet, load the most recent file
-        (its audio and, if present, its transcript) so it's ready to review."""
-        if self.edit_current is None and self.edit_files:
-            self._load_edit_entry(self.edit_files[-1])
+        """Keeps the Edit tab pointed at the most recently finished
+        transcript — a fresh batch job, a live session, or simply nothing
+        open yet — so it's always ready to review without the user having
+        to reselect it from the dropdown. Backs off if there's nothing new,
+        or if the currently-open transcript has unsaved edits: switching
+        out from under those would silently discard them."""
+        if not self.edit_files:
+            return
+        latest = self.edit_files[-1]
+        if self.edit_current is latest:
+            return
+        if self.edit_current is not None and self._edit_has_unsaved_changes():
+            return
+        self._load_edit_entry(latest)
 
     def _maybe_autoload_llm(self):
-        if self.llm_current is None and self.edit_files:
-            self._load_llm_entry(self.edit_files[-1])
+        """Same idea as _maybe_autoload_edit, for the AI tab's source
+        picker. Backs off while a generation is running — switching the
+        source out from under an in-progress (or just-finished, still on
+        screen) generation would be confusing, even though it wouldn't
+        actually destroy the AI output itself."""
+        if not self.edit_files or self.llm_running:
+            return
+        latest = self.edit_files[-1]
+        if self.llm_current is not latest:
+            self._load_llm_entry(latest)
 
     def _apply_prefs(self):
         if self.prefs["quality"] not in i18n.QUALITY_KEYS:
@@ -643,7 +1681,16 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         valid_codes = {code for code, _, _ in i18n.TRANSCRIBE_LANGUAGES}
         if self.prefs["transcribe_language"] not in valid_codes:
             self.prefs["transcribe_language"] = "auto"
-        self.timestamps_var.set(bool(self.prefs["timestamps"]))
+        if not self.sensevoice_available:
+            self.prefs["sensevoice_preferred"] = False
+        self.sensevoice_var.set(bool(self.prefs["sensevoice_preferred"]))
+        self.sensevoice_box.configure(state="normal" if self.sensevoice_available else "disabled")
+        if self.prefs["live_language"] not in i18n.LIVE_LANGUAGE_CODES:
+            self.prefs["live_language"] = "auto"
+        self.live_toggle_button.configure(state="normal" if self.sensevoice_available else "disabled")
+        self.live_language_menu.configure(state="normal" if self.sensevoice_available else "disabled")
+        self.live_mic_menu.configure(state="normal" if self.sensevoice_available else "disabled")
+        self.chinese_trad_var.set(bool(self.prefs.get("chinese_traditional")))
         self.ui_lang_button.set("EN" if self.ui_lang == "en" else "繁中")
         if self.prefs["llm_mode"] not in i18n.LLM_MODES:
             self.prefs["llm_mode"] = "summarize"
@@ -659,15 +1706,26 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         t = lambda key, **kw: i18n.t(self.ui_lang, key, **kw)  # noqa: E731
         self.title(f"{t('app_title')} v{settings.APP_VERSION}")
 
-        # tabs
-        for i, key in enumerate(self.TAB_KEYS):
-            self.tab_buttons[i].configure(text=t(key), width=165)
+        # tabs — all five share one width, sized to fit the widest label
+        # (measured in the bold variant, which the selected tab uses, so
+        # selecting a tab never changes any width). A single fixed constant
+        # stopped fitting once the fifth tab arrived, so it's computed from
+        # the current language's own longest label instead.
+        tab_font = ctk.CTkFont(size=13, weight="bold")
+        texts = [t(key) for key in self.TAB_KEYS]
+        uniform_width = max(64, max(tab_font.measure(text) for text in texts) + 34)
+        for btn, text in zip(self.tab_buttons, texts):
+            btn.configure(text=text, width=uniform_width)
         self._style_tab_buttons()
+        # Tab widths just changed (language switch) — re-check whether the
+        # strip still fits its viewport and keep the active tab in view.
+        self._update_tab_scroll_state()
+        self._ensure_active_tab_visible()
 
         # transcribe tab
         self.quality_label.configure(text=t("quality_label"))
         self.language_label.configure(text=t("language_label"))
-        self.timestamps_box.configure(text=t("timestamps_label"))
+        self.sensevoice_box.configure(text=t("sensevoice_label"))
         self.drop_title.configure(text=t("drop_title"))
         self.drop_sub.configure(text=t("drop_sub"))
         self.clear_button.configure(text=t("clear_button"))
@@ -691,6 +1749,25 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
             self._render_row_status(row)
         self._render_status_line()
 
+        # live transcription tab
+        self.live_language_label.configure(text=t("language_label"))
+        self.live_mic_label.configure(text=t("live_mic_label"))
+        self.live_level_label.configure(text=t("live_level_label"))
+        self.live_hint_label.configure(text=t("live_hint"))
+        self.live_text_hint_label.configure(text=t("live_text_hint"))
+        self.live_open_folder_button.configure(text=t("open_output_folder"))
+        self.live_language_menu.configure(values=i18n.live_language_options(self.ui_lang))
+        self.live_language_menu.set(
+            i18n.language_display(self.prefs["live_language"], self.ui_lang))
+        self._refresh_mic_menu()
+        if not self.live_session_started:
+            self._show_live_placeholder()
+        self._render_live_toggle_button()
+        if self.live_status_key is None and not self.sensevoice_available:
+            self._set_live_status("live_status_engine_failed", {})
+        else:
+            self._render_live_status()
+
         # edit tab
         self.edit_file_label.configure(text=t("edit_file_label"))
         self.edit_open_button.configure(text=t("edit_open_button"))
@@ -699,6 +1776,7 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         self.edit_open_folder_button.configure(text=t("open_output_folder"))
         self.editor_hint_label.configure(text=t("editor_hint"))
         self.punct_toggle_button.configure(text=t("punct_toggle"))
+        self.ts_toggle_button.configure(text=t("timestamps_toggle"))
         self._render_play_button()
         self._refresh_edit_menu()
         self._render_edit_status()
@@ -730,14 +1808,25 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         self._render_llm_status()
         self._update_llm_target_state()
         self._update_ram_caption()
+        # Mode/Target/Quality label widths and the RAM caption text just
+        # changed (language switch) — re-check whether the actions row
+        # still fits its viewport.
+        self._update_strip_overflow(self.llm_actions_canvas, self.llm_mode_button.master,
+                                    self.llm_actions_left, self.llm_actions_right)
+
+        # settings tab
+        self._retranslate_settings_tab()
 
     def _update_ram_caption(self):
         if self.sys_ram_gb is None:
             self.llm_ram_caption.configure(text="")
             return
-        recommended = llm.recommended_quality(self.sys_ram_gb)
+        recommended, close_apps_hint = llm.recommended_quality(
+            self.sys_ram_gb, sysinfo.free_ram_gb(),
+            sysinfo.free_disk_gb(settings.MODELS_DIR))
+        key = "ram_caption_close_apps" if close_apps_hint else "ram_caption"
         self.llm_ram_caption.configure(text=i18n.t(
-            self.ui_lang, "ram_caption",
+            self.ui_lang, key,
             ram=f"{self.sys_ram_gb:.0f}",
             recommended=i18n.quality_display(recommended, self.ui_lang)))
 
@@ -844,7 +1933,7 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         self._register_edit_file(row["path"], row["output"])
         entry = next(e for e in self.edit_files if e["audio"] == row["path"])
         self._load_edit_entry(entry)
-        self._show_tab(1)
+        self._show_tab(2)
 
     def _remove_row(self, row):
         if self.running:
@@ -866,7 +1955,7 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
             self.quality_button.get(), self.ui_lang)
         self.prefs["transcribe_language"] = i18n.language_key_for_display(
             self.language_menu.get(), self.ui_lang)
-        self.prefs["timestamps"] = bool(self.timestamps_var.get())
+        self.prefs["sensevoice_preferred"] = bool(self.sensevoice_var.get())
         settings.save(self.prefs)
 
     def _start_transcription(self):
@@ -896,8 +1985,9 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         self.worker = TranscriberWorker(
             jobs=jobs, quality=self.prefs["quality"],
             language_code=None if code == "auto" else code,
-            timestamps=self.prefs["timestamps"],
-            output_folder=settings.DEFAULT_OUTPUT_FOLDER, events=self.events)
+            sensevoice_preferred=self.prefs["sensevoice_preferred"],
+            output_folder=settings.transcriptions_folder(), events=self.events,
+            traditional_chinese=bool(self.prefs.get("chinese_traditional")))
         self._set_running(True)
         self.progress_bar.set(0)
         self.worker.start()
@@ -914,7 +2004,8 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         state = "disabled" if running else "normal"
         self.quality_button.configure(state=state)
         self.language_menu.configure(state=state)
-        self.timestamps_box.configure(state=state)
+        self.sensevoice_box.configure(
+            state="disabled" if (running or not self.sensevoice_available) else "normal")
         self.clear_button.configure(state=state)
         for row in self.rows:
             row["remove_btn"].configure(state=state)
@@ -968,9 +2059,9 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
             if index < len(self.rows):
                 self.rows[index]["output"] = output_path
                 self._register_edit_file(self.rows[index]["path"], output_path)
-                if self.current_tab == 1:
+                if self.current_tab == 2:
                     self._maybe_autoload_edit()
-                elif self.current_tab == 2:
+                elif self.current_tab == 3:
                     self._maybe_autoload_llm()
         elif kind == "finished":
             self._set_running(False)
@@ -978,6 +2069,8 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
             done = sum(1 for r in self.rows if r["status_key"].startswith("done"))
             self.progress_bar.set(1 if done == len(self.rows) and done
                                   else self.progress_bar.get())
+            if any(r["status_key"] == "failed_write" for r in self.rows):
+                self._offer_output_folder_fix()
         elif kind == "speed_ready":
             if self.edit_status_key == "player_preparing":
                 self._set_edit_status(None, "")
@@ -987,10 +2080,49 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
                 "player_preparing", {"speed": _speed_label(speed), "pct": int(frac * 100)})
         elif kind == "audio_loaded":
             self._on_audio_loaded(event[1], event[2])
+        elif kind == "live_status":
+            _, key, detail = event
+            if key == "ready":
+                # Preload finished (or found the model already loaded) —
+                # nothing to report; revert to the normal idle placeholder,
+                # but only if a real recording session hasn't since taken
+                # over the status line/text area.
+                if not self.live_running:
+                    self._set_live_status(None, "")
+                    self._show_live_placeholder()
+            else:
+                text_key = f"live_status_{key}"
+                self._set_live_status(text_key, detail)
+                # A first-time (or first-this-session) model load can take
+                # real time even with nothing to download — surface it in
+                # the big text area too, not just the small status line, so
+                # it's not mistaken for the app being frozen.
+                if key in ("loading", "downloading"):
+                    self._write_live_text(i18n.t(self.ui_lang, text_key, **(detail or {})))
+                elif key == "recording":
+                    self._write_live_text("")
+                elif key == "save_failed":
+                    self._offer_output_folder_fix()
+        elif kind == "live_text":
+            _, committed, preview, _lang = event
+            self._set_live_text(committed, preview)
+        elif kind == "live_saved":
+            _, audio_path, txt_path = event
+            self._register_live_transcript(audio_path, txt_path)
+        elif kind == "live_stopped":
+            self._on_live_stopped()
         elif kind == "llm_status":
             _, key, detail = event
             self.llm_status_key, self.llm_status_detail = key, detail
             self._render_llm_status()
+            # A first-time model download/load can take a while — surface
+            # it in the big output panel too, not just the small status
+            # line, so it's obvious the app is working rather than stuck.
+            # "llm_reset" (emitted right before real generation starts)
+            # already clears the output panel, so this disappears on its
+            # own the moment there's something real to show instead.
+            if key in ("llm_downloading", "llm_loading"):
+                self._write_llm_output_notice(i18n.t(self.ui_lang, key, **(detail or {})))
         elif kind == "llm_reset":
             self._clear_llm_output()
         elif kind == "llm_finished":
@@ -1000,6 +2132,10 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
             self.llm_output.configure(state="normal")
             if ok:
                 self._save_llm_output()  # always save a copy once generation succeeds
+        elif kind == "model_dl":
+            self._on_model_dl_event(event[1], event[2], event[3])
+        elif kind == "update_check":
+            self._on_update_check_result(event[1])
 
     def _render_row_status(self, row):
         text = i18n.job_status_text(self.ui_lang, row["status_key"], row["status_detail"])
@@ -1030,11 +2166,11 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         current = (pct or 0) / 100 if pct is not None else 0
         self.progress_bar.set(min(1.0, (finished + current) / total))
 
-    def _open_output_folder(self):
-        folder = settings.DEFAULT_OUTPUT_FOLDER
+    def _open_output_folder(self, folder=None):
+        folder = folder or settings.transcriptions_folder()
         try:
             os.makedirs(folder, exist_ok=True)
-            os.startfile(folder)
+            _open_path(folder)
         except Exception:
             settings.log_exception(f"Open output folder failed: {folder}")
 
@@ -1073,6 +2209,145 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
     def _set_status(self, text):
         self.status_key = None
         self.status_line.configure(text=text)
+
+    # ============================================================ live tab
+
+    def _on_live_pref_change(self, _value=None):
+        self.prefs["live_language"] = i18n.live_language_key_for_display(
+            self.live_language_menu.get(), self.ui_lang)
+        mic = self.live_mic_menu.get()
+        self.prefs["live_mic_device"] = \
+            "" if mic == i18n.t(self.ui_lang, "mic_default") else mic
+        settings.save(self.prefs)
+
+    def _refresh_mic_menu(self):
+        """Re-enumerates input devices (cheap) and reselects the remembered
+        one; a device that has vanished falls back to the default entry
+        without erasing the preference — plugging it back in restores it."""
+        default_label = i18n.t(self.ui_lang, "mic_default")
+        devices = live_transcription.list_input_devices()
+        self.live_mic_menu.configure(values=[default_label] + devices)
+        preferred = self.prefs.get("live_mic_device", "")
+        self.live_mic_menu.set(preferred if preferred in devices else default_label)
+
+    def _maybe_preload_sensevoice(self):
+        """First time the Live tab is opened, warm up SenseVoice in the
+        background so the idle placeholder can honestly show download/load
+        progress instead of inviting the user to start recording before the
+        engine is actually ready. Once per session — LiveTranscriber's own
+        load is single-flight against this (see transcriber.py), so it's
+        safe even if the user hits Start before this finishes."""
+        if self.live_preload_started or not self.sensevoice_available:
+            return
+        self.live_preload_started = True
+        live_transcription.SenseVoicePreloader(self.events).start()
+
+    def _toggle_live_recording(self):
+        if self.live_running:
+            self._stop_live_recording()
+        else:
+            self._start_live_recording()
+
+    def _start_live_recording(self):
+        if self.live_running or not self.sensevoice_available:
+            return
+        code = self.prefs["live_language"]
+        language = "" if code == "auto" else code
+        self.live_session_started = True
+        self.live_running = True
+        self._write_live_text("")
+        self.live_language_menu.configure(state="disabled")
+        self.live_mic_menu.configure(state="disabled")
+        self._render_live_toggle_button()
+        # No status set here — the worker's own events ("loading",
+        # "downloading", "mic_failed", or "recording") are the only source
+        # of truth for what's actually happening. Claiming "Recording…"
+        # immediately would be a lie whenever the model still needs to
+        # load (which can take real time even when nothing needs
+        # downloading) or the mic fails to open.
+        self.live_worker = live_transcription.LiveTranscriber(
+            language, self.events,
+            device_name=self.prefs.get("live_mic_device", ""),
+            traditional_chinese=bool(self.prefs.get("chinese_traditional")))
+        self.live_worker.start()
+
+    def _stop_live_recording(self):
+        if self.live_worker:
+            self.live_worker.stop()
+        self.live_toggle_button.configure(state="disabled")
+        self._set_live_status("live_status_finalizing", {})
+
+    def _render_live_toggle_button(self):
+        if self.live_running:
+            self.live_toggle_button.configure(
+                text=i18n.t(self.ui_lang, "live_stop_button"),
+                state="normal", fg_color="#8a3535", hover_color="#a04040")
+        else:
+            theme = ctk.ThemeManager.theme["CTkButton"]
+            self.live_toggle_button.configure(
+                text=i18n.t(self.ui_lang, "live_start_button"),
+                state="normal" if self.sensevoice_available else "disabled",
+                fg_color=theme["fg_color"], hover_color=theme["hover_color"])
+
+    def _write_live_text(self, text):
+        self.live_text.configure(state="normal")
+        self.live_text.delete("1.0", "end")
+        self.live_text.insert("1.0", text)
+        self.live_text.see("end")
+        self.live_text.configure(state="disabled")
+
+    def _show_live_placeholder(self):
+        self._write_live_text(i18n.t(self.ui_lang, "live_placeholder"))
+
+    def _set_live_text(self, committed, preview):
+        # Committed chunks are paragraphs now (one per pause-commit, each
+        # carrying a timestamp in the saved sidecar); the still-changing
+        # preview renders as a trailing paragraph-in-progress.
+        full = committed
+        if preview:
+            full = f"{committed}\n\n{preview}" if committed else preview
+        self._write_live_text(full)
+
+    def _set_live_status(self, key, detail):
+        self.live_status_key = key
+        self.live_status_detail = detail if isinstance(detail, dict) else {}
+        self._render_live_status()
+
+    def _render_live_status(self):
+        if self.live_status_key is None:
+            self.live_status_line.configure(text="")
+            return
+        self.live_status_line.configure(
+            text=i18n.t(self.ui_lang, self.live_status_key, **(self.live_status_detail or {})))
+
+    def _register_live_transcript(self, audio_path, txt_path):
+        # Reuses the same entry shape recorded-file transcripts use — when
+        # both halves saved, this is literally the same call _handle_event's
+        # "saved" case makes for a batch job, so the live recording plays
+        # back in the Edit tab exactly like any other file.
+        if audio_path:
+            self._register_edit_file(audio_path, txt_path)
+        elif txt_path:
+            stem = os.path.splitext(os.path.basename(txt_path))[0]
+            self.edit_files.append(
+                {"label": self._unique_label(stem), "audio": None, "txt": txt_path})
+            self._refresh_edit_menu()
+        else:
+            return
+        self._refresh_llm_menu()
+        if self.current_tab == 2:
+            self._maybe_autoload_edit()
+        elif self.current_tab == 3:
+            self._maybe_autoload_llm()
+
+    def _on_live_stopped(self):
+        self.live_running = False
+        self.live_worker = None
+        state = "normal" if self.sensevoice_available else "disabled"
+        self.live_language_menu.configure(state=state)
+        self.live_mic_menu.configure(state=state)
+        self.live_level_bar.set(0)
+        self._render_live_toggle_button()
 
     # ============================================================= edit tab
 
@@ -1137,15 +2412,15 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         self._load_edit_entry(entry)
 
     def _open_dialog_initialdir(self):
-        """Start 'Open file' dialogs in the output folder — transcripts and
-        exported copies all end up there, so it's usually where the file
+        """Start 'Open file' dialogs in the Transcriptions folder — transcripts
+        and exported copies all end up there, so it's usually where the file
         the user wants to reopen already is."""
-        folder = settings.DEFAULT_OUTPUT_FOLDER
+        folder = settings.transcriptions_folder()
         return folder if os.path.isdir(folder) else None
 
     def _find_transcript_for(self, audio_path):
         stem = os.path.splitext(os.path.basename(audio_path))[0]
-        for folder in (settings.DEFAULT_OUTPUT_FOLDER, os.path.dirname(audio_path)):
+        for folder in (settings.transcriptions_folder(), os.path.dirname(audio_path)):
             for ext in (".docx", ".txt"):
                 candidate = os.path.join(folder, stem + ext)
                 if os.path.isfile(candidate):
@@ -1167,8 +2442,17 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
                 text = ""
         else:
             found = False
+        # Timestamps: a file saved with markers already carries them in its
+        # text; otherwise the transcript's sidecar (if any) supplies the
+        # paragraph times and the markers get inserted here for display.
+        if text and not timestamps.has_markers(text):
+            times = timestamps.load_sidecar(entry["txt"]) if entry["txt"] else None
+            if times:
+                text = timestamps.insert_markers(text, times)
         self.editor.delete("1.0", "end")
         self.editor.insert("1.0", text)
+        self._apply_timestamp_markup()
+        self._edit_loaded_text = self.editor.get("1.0", "end-1c")
 
         # load audio on a worker thread (decoding can take a moment)
         self._set_player_enabled(False)
@@ -1257,7 +2541,11 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
                     "player_preparing", {"speed": _speed_label(speed), "pct": 0})
 
     def _tick_player(self):
-        if self.current_tab == 1 and self.player.loaded_path is not None:
+        if self.current_tab == 1 and self.live_running and self.live_worker:
+            # Rough perceptual scaling: speech RMS sits around 0.02–0.2, so
+            # ×12 maps quiet speech near 1/4 bar and normal speech near full.
+            self.live_level_bar.set(min(1.0, self.live_worker.level * 12))
+        if self.current_tab == 2 and self.player.loaded_path is not None:
             if self.player.is_playing:
                 self.position_slider.set(self.player.get_fraction())
                 self.time_label.configure(
@@ -1268,17 +2556,26 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         self.after(TICK_MS, self._tick_player)
 
     def _save_edit(self):
-        text = self.editor.get("1.0", "end").rstrip("\n")
-        if not text.strip():
+        raw = self.editor.get("1.0", "end").rstrip("\n")
+        if not raw.strip():
             self._set_edit_status("nothing_to_save", {})
             return
+        # Toggle ON: the saved copy keeps the visible [mm:ss] markers.
+        # Toggle OFF: they're stripped from the document. Either way the
+        # sidecar written below preserves the times, so reopening the copy
+        # (or flipping the toggle later) loses nothing.
+        clean, times = timestamps.parse_marked_text(raw)
+        has_times = any(t is not None for t in times)
+        text = raw if (has_times and self.timestamps_visible) else clean
         if self.edit_current:
             stem = os.path.splitext(self.edit_current["label"])[0] + " (edited)"
         else:
             stem = "transcript (edited)"
         try:
             path, kind = docx_export.save_transcript(
-                text, settings.DEFAULT_OUTPUT_FOLDER, stem)
+                text, settings.transcriptions_folder(), stem)
+            if has_times:
+                timestamps.save_sidecar(path, times)
             self._set_edit_status("saved_docx" if kind == "docx" else "saved_txt",
                                   {"path": path})
             if self.edit_current:
@@ -1288,6 +2585,10 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
                 self.edit_current["txt"] = path
                 if self.llm_current is self.edit_current and not self.llm_running:
                     self._load_llm_entry(self.llm_current)
+        except (PermissionError, OSError):
+            settings.log_exception("Save edit failed:")
+            self._set_edit_status("save_failed", {})
+            self._offer_output_folder_fix()
         except Exception:
             settings.log_exception("Save edit failed:")
             self._set_edit_status("save_failed", {})
@@ -1383,7 +2684,12 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         text = ""
         if entry["txt"] and os.path.isfile(entry["txt"]):
             try:
-                text = docx_export.read_transcript(entry["txt"])
+                # Always the clean transcript here, regardless of whether
+                # the saved file has [mm:ss] markers baked in (Timestamps
+                # toggle was on when it was saved) — markers are an Edit-
+                # tab navigation aid, not something a summary/translation
+                # should ever see or display.
+                text = timestamps.strip_markers(docx_export.read_transcript(entry["txt"]))
             except Exception:
                 settings.log_exception(f"Read transcript failed: {entry['txt']}")
         self.llm_source.configure(state="normal")
@@ -1410,10 +2716,13 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         self._on_llm_pref_change()
         quality = self.prefs["llm_quality"]
         if not llm.llm_model_is_downloaded(quality):
+            recommended_key, _close_apps_hint = llm.recommended_quality(
+                self.sys_ram_gb, sysinfo.free_ram_gb(),
+                sysinfo.free_disk_gb(settings.MODELS_DIR))
             if not self._confirm_model_download(
                 quality, llm.QUALITY_RAM_GB[quality],
                 llm.QUALITY_LLM[quality]["size_gb"],
-                llm.recommended_quality(self.sys_ram_gb),
+                recommended_key,
             ):
                 return
         mode = self.prefs["llm_mode"]
@@ -1459,6 +2768,13 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         if self.llm_running:
             self.llm_output.configure(state="disabled")
 
+    def _write_llm_output_notice(self, text):
+        self.llm_output.configure(state="normal")
+        self.llm_output.delete("1.0", "end")
+        self.llm_output.insert("1.0", text)
+        if self.llm_running:
+            self.llm_output.configure(state="disabled")
+
     def _save_llm_output(self):
         text = self.llm_output.get("1.0", "end").rstrip("\n")
         if not text.strip():
@@ -1470,11 +2786,15 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
             self.ui_lang, self.prefs["llm_mode"], self.prefs["llm_target"])
         try:
             path, kind = docx_export.save_transcript(
-                text, settings.DEFAULT_OUTPUT_FOLDER, f"{base} ({suffix})")
+                text, settings.transcriptions_folder(), f"{base} ({suffix})")
             self._set_llm_status(
                 None, i18n.t(self.ui_lang,
                              "saved_docx" if kind == "docx" else "saved_txt",
                              path=path))
+        except (PermissionError, OSError):
+            settings.log_exception("Save AI output failed:")
+            self._set_llm_status(None, i18n.t(self.ui_lang, "save_failed"))
+            self._offer_output_folder_fix()
         except Exception:
             settings.log_exception("Save AI output failed:")
             self._set_llm_status(None, i18n.t(self.ui_lang, "save_failed"))
@@ -1510,6 +2830,14 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
                 i18n.t(self.ui_lang, "confirm_quit_generating")):
                 return
             self.llm_worker.cancel()
+        if self.live_running and self.live_worker:
+            # No confirmation dialog: stopping (unlike Cancel elsewhere)
+            # still auto-saves what's been said, so quitting mid-recording
+            # loses nothing — just briefly wait for that save to land before
+            # the process actually exits (the worker thread is a daemon and
+            # would otherwise be killed mid-write).
+            self.live_worker.stop()
+            self.live_worker.join(timeout=5.0)
         try:
             self.player.stop()
         except Exception:

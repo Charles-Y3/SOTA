@@ -47,16 +47,43 @@ QUALITY_LLM = {
 QUALITY_RAM_GB = {"fast": 3.0, "balanced": 4.0, "accurate": 7.0}
 
 
-def recommended_quality(ram_gb):
-    """Highest quality tier likely to run comfortably with `ram_gb` of
-    total RAM. Defaults to "balanced" if RAM couldn't be determined."""
-    if ram_gb is None:
-        return "balanced"
-    best = "fast"
-    for key in ("fast", "balanced", "accurate"):
-        if ram_gb >= QUALITY_RAM_GB[key]:
-            best = key
-    return best
+def recommended_quality(total_ram_gb, free_ram_gb=None, free_disk_gb=None):
+    """Recommends a quality tier for these GB-sized local LLMs, where RAM
+    (and disk, for the download) are real constraints unlike whisper's
+    much smaller models.
+
+    Returns (quality_key, close_apps_hint):
+      - "accurate" when free RAM already covers it, or the machine has at
+        least 16GB installed (even if a lot of it is in use right now —
+        that's recoverable by closing things, unlike a genuinely small
+        total).
+      - "balanced" for any machine with at least 8GB total RAM.
+      - "fast" otherwise.
+    Either of the first two is skipped if there isn't enough free disk
+    space to download that tier, falling through to the next one down.
+    close_apps_hint is True when the recommended tier's own RAM
+    requirement isn't currently free (only ever set for "balanced" — the
+    "accurate" branch already required free RAM to be sufficient, or relies
+    on total capacity rather than nagging about current usage).
+    """
+    def fits_disk(quality):
+        if free_disk_gb is None:
+            return True  # unknown — don't block the recommendation on it
+        needed = QUALITY_LLM[quality]["size_gb"] * 1.2 + 0.5
+        return free_disk_gb >= needed
+
+    qualifies_accurate = (
+        (free_ram_gb is not None and free_ram_gb >= QUALITY_RAM_GB["accurate"])
+        or (total_ram_gb is not None and total_ram_gb >= 16)
+    )
+    if qualifies_accurate and fits_disk("accurate"):
+        return "accurate", False
+
+    if total_ram_gb is not None and total_ram_gb >= 8 and fits_disk("balanced"):
+        close_apps_hint = free_ram_gb is not None and free_ram_gb < QUALITY_RAM_GB["balanced"]
+        return "balanced", close_apps_hint
+
+    return "fast", False
 
 
 N_CTX = 8192
@@ -70,6 +97,16 @@ SENTENCE_RE = re.compile(r"(?<=[.!?。！？])\s+")
 # One loaded model at a time (they are GB-sized); swapped when quality changes.
 _cache = {"quality": None, "llama": None}
 _cache_lock = threading.Lock()
+
+
+def unload_cached_model():
+    """Drops the cached Llama instance (if any). The Settings tab calls
+    this before deleting an AI model from disk: llama.cpp keeps the .gguf
+    memory-mapped, and on Windows a mapped file is locked — deleting the
+    currently-loaded model would otherwise always fail."""
+    with _cache_lock:
+        _cache["quality"], _cache["llama"] = None, None
+    gc.collect()
 
 
 def llm_model_is_downloaded(quality):

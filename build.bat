@@ -40,6 +40,10 @@ pyinstaller --noconfirm --clean --windowed --name SOTA ^
   --collect-data faster_whisper ^
   --collect-all ctranslate2 ^
   --collect-all llama_cpp ^
+  --collect-all opencc ^
+  --collect-all funasr ^
+  --collect-all torch ^
+  --collect-all torchaudio ^
   --hidden-import onnxruntime ^
   app.py || (echo Build failed.& pause & exit /b 1)
 
