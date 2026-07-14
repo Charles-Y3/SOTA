@@ -370,6 +370,23 @@ class LiveTranscriber(threading.Thread):
             self._emit("live_stopped")
             return
 
+        if self.stop_event.is_set():
+            # Stop was clicked while the load above was still running (a
+            # slow first-time download, or funasr falling back to
+            # ModelScope after Hugging Face failed — both can take minutes
+            # and have no cooperative cancellation point inside them, so
+            # stop_event couldn't interrupt it mid-call). Without this
+            # check, the session would barrel into "recording" anyway,
+            # silently overriding a Stop the user already asked for. The
+            # model load itself still isn't wasted — it's cached for next
+            # time — only this session's recording is abandoned.
+            self._close_stream(stream)
+            audio_path = self._finalize_audio()
+            if audio_path:
+                self._emit("live_saved", audio_path, None)
+            self._emit("live_stopped")
+            return
+
         self._emit("live_status", "recording", {})
         try:
             while not self.stop_event.wait(STEP_S):
@@ -504,18 +521,26 @@ class LiveTranscriber(threading.Thread):
 class SenseVoicePreloader(threading.Thread):
     """Warms up the SenseVoice model as soon as the Live tab is opened,
     instead of waiting for Start Recording — so the idle placeholder can
-    honestly say "downloading"/"loading" up front rather than inviting the
-    user to start recording before the engine is actually ready.
+    honestly say "loading" up front rather than inviting the user to start
+    recording before the engine is actually ready.
+
+    Load-from-disk only, never a download: merely opening this tab must not
+    kick off a ~900 MB fetch the user didn't ask for — it fires even with
+    the SenseVoice checkbox off, and it competes for bandwidth with any
+    Transcribe-tab model download running at the same time. The download
+    belongs to an explicit Start Recording (LiveTranscriber, after app.py's
+    disk-space gate).
 
     get_sensevoice_model() is single-flight (see transcriber.py): if the
     user hits Start Recording before this finishes, LiveTranscriber's own
     load call just blocks on the same lock and reuses whatever this thread
-    already downloaded/loaded, rather than duplicating the work.
+    already loaded, rather than duplicating the work.
 
     Reports through the same ("live_status", key, detail) events as
     LiveTranscriber, plus a "ready" key (not otherwise used) meaning the
-    model is loaded and idle — app.py treats that as "show the normal
-    placeholder", not as a message to display.
+    model is loaded (or intentionally left undownloaded) and idle — app.py
+    treats that as "show the normal placeholder", not as a message to
+    display.
     """
 
     def __init__(self, events):
@@ -532,16 +557,12 @@ class SenseVoicePreloader(threading.Thread):
         if transcriber.sensevoice_model_loaded():
             self._emit("live_status", "ready", {})
             return
+        if not transcriber.sensevoice_is_downloaded():
+            self._emit("live_status", "ready", {})
+            return
         try:
             self._emit("live_status", "loading", {})
-
-            def on_pct(pct):
-                self._emit("live_status", "downloading",
-                           {"size_mb": transcriber.SENSEVOICE_DOWNLOAD_MB, "pct": pct})
-                if pct >= 100:
-                    self._emit("live_status", "loading", {})
-
-            transcriber.get_sensevoice_model(transcriber.monotonic_pct_reporter(on_pct))
+            transcriber.get_sensevoice_model()
             self._emit("live_status", "ready", {})
         except Exception:
             settings.log_exception("SenseVoice preload failed:")

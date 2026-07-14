@@ -67,6 +67,7 @@ jobs:
       - name: Build SOTA.app
         run: >
           pyinstaller --noconfirm --clean --windowed --name SOTA
+          --osx-bundle-identifier com.sota.transcription
           --collect-all customtkinter
           --collect-all tkinterdnd2
           --collect-all sounddevice
@@ -81,6 +82,19 @@ jobs:
           --collect-all torchaudio
           --hidden-import onnxruntime
           app.py
+
+      # Without NSMicrophoneUsageDescription, macOS doesn't prompt for mic
+      # access — it kills the app the moment Live Transcription opens the
+      # input stream. PyInstaller's CLI can't inject plist keys, so patch
+      # the bundle after the build, then re-sign: editing Info.plist breaks
+      # the ad-hoc seal PyInstaller applied, and an app with an invalid
+      # signature won't launch at all on Apple-silicon Macs.
+      - name: Add microphone usage description and re-sign
+        run: |
+          plutil -insert NSMicrophoneUsageDescription \
+            -string "SOTA uses the microphone to record and transcribe your speech in the Live Transcription tab." \
+            dist/SOTA.app/Contents/Info.plist
+          codesign --force --sign - dist/SOTA.app
 
       - name: Bundle README with the app
         run: |

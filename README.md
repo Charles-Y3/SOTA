@@ -1,6 +1,6 @@
 # SOTA — Smart Offline Transcription Application
 
-**Version 1.2.0**
+**Version 1.2.1**
 
 Drop in audio files, click **Transcribe All**, and get a transcript for each
 file — saved as `.docx` if Microsoft Word is installed, otherwise `.txt`. Or

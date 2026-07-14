@@ -148,8 +148,23 @@ def apply_chinese_conversion(text, language, enabled):
 # --------------------------------------------------------------------------- #
 SENSEVOICE_LANGUAGES = {"en", "zh", "yue", "ja", "ko"}
 SENSEVOICE_SAMPLE_RATE = 16000
-SENSEVOICE_DOWNLOAD_MB = 900  # approximate — funasr/modelscope don't expose a
-                              # byte-level download hook like huggingface_hub's
+SENSEVOICE_DOWNLOAD_MB = 900  # approximate combined size shown in the UI
+                              # (SenseVoiceSmall ~880 MB + fsmn-vad ~2 MB)
+
+# Downloaded from Hugging Face first — the same CDN whisper's models use,
+# dramatically faster than ModelScope outside mainland China — with funasr's
+# own ModelScope flow kept as an automatic fallback (which is also what
+# mainland users land on, where Hugging Face is blocked). Both repos belong
+# to the models' original publishers: FunAudioLLM is the SenseVoice team,
+# and funasr/fsmn-vad is the FunASR team's own mirror (the exact mapping
+# funasr's hub="hf" mode uses in name_maps_hf).
+SENSEVOICE_HF_REPOS = ("FunAudioLLM/SenseVoiceSmall", "funasr/fsmn-vad")
+
+# READMEs, demo audio/images, demo.py, and requirements.txt (only consumed
+# under trust_remote_code, which is deliberately off) — ~15 MB of weight the
+# model never loads.
+_SENSEVOICE_HF_IGNORE = ["*.md", "example/*", "examples/*", "image/*",
+                         "fig/*", "demo.py", "requirements.txt"]
 
 _SENSEVOICE_CACHE = {}
 _SENSEVOICE_TAG_RE = re.compile(r"<\|[^|]*\|>")
@@ -186,31 +201,129 @@ def sensevoice_model_loaded():
     return _SENSEVOICE_CACHE.get("model") is not None
 
 
-# On-disk folder names modelscope uses under MODELS_DIR for SenseVoice and
-# its fsmn-vad front-end (see settings.py's MODELSCOPE_CACHE note for how
-# they end up there). The Settings tab's model manager treats the pair as
-# one unit — they're only ever useful together.
-SENSEVOICE_MODEL_DIRNAMES = (
+def sensevoice_load_in_progress():
+    """True while some caller currently holds _SENSEVOICE_LOCK — resolving
+    the local copy, downloading, or constructing. Lets a second caller (a
+    different tab) recognize "already being fetched elsewhere" and skip
+    straight to get_sensevoice_model() (which blocks on the same lock and
+    reuses the result) instead of re-running its own confirm-before-
+    download gate, which would otherwise show a redundant dialog for work
+    that's already underway."""
+    return _SENSEVOICE_LOCK.locked()
+
+
+def unload_sensevoice_model():
+    """Drops the in-memory SenseVoiceSmall + fsmn-vad instances. Without
+    this, deleting the on-disk files via the Settings tab would leave a
+    model already loaded into memory (from an earlier use, in the same
+    running process) fully usable — silently — because sensevoice_model_
+    loaded() only reflects what's in RAM, not what's on disk. Called right
+    after a Settings-tab delete so every tab's "is it downloaded" checks
+    agree with the Settings list from that point on, instead of only after
+    an app restart clears the cache naturally."""
+    _SENSEVOICE_CACHE.pop("model", None)
+    _VAD_CACHE.pop("model", None)
+
+
+# Legacy on-disk folder names modelscope used under MODELS_DIR before the
+# switch to Hugging Face downloads (see settings.py's MODELSCOPE_CACHE note
+# for how they end up there). Still recognized so installs that downloaded
+# SenseVoice through ModelScope keep working without a re-download.
+_SENSEVOICE_MS_DIRNAMES = (
     "iic--SenseVoiceSmall",
     "iic--speech_fsmn_vad_zh-cn-16k-common-pytorch",
 )
 
 
+def _hf_cache_dirname(repo):
+    """huggingface_hub's cache folder name for a repo under cache_dir."""
+    return "models--" + repo.replace("/", "--")
+
+
 def sensevoice_model_dirs():
-    return [os.path.join(settings.MODELS_DIR, name)
-            for name in SENSEVOICE_MODEL_DIRNAMES]
+    """Every folder the SenseVoice pair can occupy under MODELS_DIR — the
+    Hugging Face cache layout (current downloads) plus the legacy ModelScope
+    layout (pre-HF installs). The Settings tab's model manager sums/deletes
+    whichever of these exist; the pair is treated as one unit since the
+    models are only ever useful together."""
+    names = ([_hf_cache_dirname(repo) for repo in SENSEVOICE_HF_REPOS]
+             + list(_SENSEVOICE_MS_DIRNAMES))
+    return [os.path.join(settings.MODELS_DIR, name) for name in names]
+
+
+def _dir_with_model_files(root):
+    """The folder under `root` holding a complete funasr model — config.yaml
+    and model.pt together (model.pt is the payload; both hubs only
+    materialize it in the final location once its transfer finished, so its
+    presence means the copy is usable) — or None. Walks because the layouts
+    nest differently: HF keeps files under snapshots/<revision>/, and
+    modelscope's own layout has varied across versions (flat, or
+    snapshots/<revision>/)."""
+    if not os.path.isdir(root):
+        return None
+    for dirpath, _dirs, files in os.walk(root):
+        if "config.yaml" in files and "model.pt" in files:
+            return dirpath
+    return None
+
+
+def sensevoice_local_paths():
+    """(sensevoice_dir, vad_dir) of complete on-disk copies — HF layout
+    preferred, legacy ModelScope layout accepted — or None if either half
+    is missing. Handing these directory paths to AutoModel makes the load
+    fully local: funasr skips its hub/download code entirely for a `model`
+    that is an existing path, so warm starts are instant and guaranteed
+    offline (no version-check call, no timeout on a machine with no
+    network)."""
+    dirs = sensevoice_model_dirs()  # [hf_sv, hf_vad, legacy_sv, legacy_vad]
+    sv = _dir_with_model_files(dirs[0]) or _dir_with_model_files(dirs[2])
+    vad = _dir_with_model_files(dirs[1]) or _dir_with_model_files(dirs[3])
+    if sv and vad:
+        return sv, vad
+    return None
 
 
 def sensevoice_is_downloaded():
-    """True if both SenseVoice model folders exist on disk with content —
-    a best-effort check for the Settings tab (funasr itself revalidates on
-    load and re-fetches anything missing)."""
-    for folder in sensevoice_model_dirs():
-        if not os.path.isdir(folder):
-            return False
-        if not any(files for _root, _dirs, files in os.walk(folder)):
-            return False
-    return True
+    return sensevoice_local_paths() is not None
+
+
+def _make_sensevoice_progress_callback_class(on_progress, base_cls):
+    """Builds a modelscope_hub ProgressCallback subclass that aggregates
+    bytes across every concurrently-downloading file and reports the
+    running total/downloaded pair — the same aggregation progress.py's
+    make_progress_tqdm_class does for whisper's tqdm-based hook, adapted to
+    modelscope_hub's own (non-tqdm) progress_callbacks interface."""
+    state = {}
+    lock = threading.Lock()
+
+    def _emit():
+        with lock:
+            downloaded = sum(n for n, _ in state.values())
+            total = sum(t for _, t in state.values())
+        if total:
+            on_progress(downloaded, total)
+
+    class _Callback(base_cls):
+        def __init__(self, filename, file_size):
+            super().__init__(filename, file_size)
+            with lock:
+                state[id(self)] = (0, file_size or 0)
+            _emit()
+
+        def update(self, size):
+            with lock:
+                downloaded, total = state.get(id(self), (0, self.file_size or 0))
+                state[id(self)] = (downloaded + size, total)
+            _emit()
+
+        def end(self):
+            with lock:
+                _downloaded, total = state.get(id(self), (0, 0))
+                if total:
+                    state[id(self)] = (total, total)
+            _emit()
+
+    return _Callback
 
 
 @contextlib.contextmanager
@@ -218,13 +331,27 @@ def _sensevoice_download_progress(on_progress):
     """Best-effort byte-level download progress for funasr's model fetch.
 
     Unlike huggingface_hub (used for whisper models, which accepts a
-    tqdm_class override directly), modelscope_hub — funasr's download
-    backend — exposes no public progress hook. This patches the tqdm class
-    it builds its own per-file byte-progress bars with, for the duration of
-    this call only, reusing the same aggregating tqdm subclass whisper's
-    downloads use (progress.make_progress_tqdm_class). If modelscope_hub's
-    internals have moved, this just silently does nothing — a missing
+    tqdm_class override directly), funasr's default hub (ModelScope) has no
+    such hook on the path it actually calls: modelscope.hub.snapshot_download
+    -> modelscope_hub.compat.snapshot_download -> HubApi.download_repo all
+    the way down to DownloadManager.download_repo, which *does* accept a
+    progress_callbacks=[ProgressCallback subclass, ...] list and forwards it
+    to real per-chunk cb.update(nbytes) calls — but nothing in that chain
+    ever passes one in, so it's silently never used. This patches
+    DownloadManager.download_repo for the duration of this call to inject
+    our own ProgressCallback subclass as the default when the caller didn't
+    supply one. If modelscope_hub's internals have moved (class renamed,
+    method signature changed), this just silently does nothing — a missing
     progress readout is a much smaller problem than crashing the download.
+
+    The module's own console tqdm bars (a per-file counter, plus byte bars
+    on the single-stream path) are also swapped for a silent no-report
+    class while patched: in a --windowed build sys.stderr is None and tqdm
+    writing to it crashes the download (the same failure progress.py's
+    _NullFile exists to prevent). Silent on purpose — real byte progress
+    comes from the injected callback; a second reporter with a different
+    denominator (those bars never see the parallel-path files) would fight
+    it.
     """
     if on_progress is None:
         yield
@@ -234,15 +361,27 @@ def _sensevoice_download_progress(on_progress):
     except Exception:
         yield
         return
-    original = getattr(_msd, "tqdm", None)
-    if original is None:
+    original_download_repo = getattr(_msd.DownloadManager, "download_repo", None)
+    progress_callback_base = getattr(_msd, "ProgressCallback", None)
+    if original_download_repo is None or progress_callback_base is None:
         yield
         return
-    _msd.tqdm = make_progress_tqdm_class(on_progress)
+    callback_cls = _make_sensevoice_progress_callback_class(on_progress, progress_callback_base)
+
+    def _patched_download_repo(self, *args, **kwargs):
+        kwargs.setdefault("progress_callbacks", [callback_cls])
+        return original_download_repo(self, *args, **kwargs)
+
+    original_tqdm = getattr(_msd, "tqdm", None)
+    _msd.DownloadManager.download_repo = _patched_download_repo
+    if original_tqdm is not None:
+        _msd.tqdm = make_progress_tqdm_class(lambda _downloaded, _total: None)
     try:
         yield
     finally:
-        _msd.tqdm = original
+        _msd.DownloadManager.download_repo = original_download_repo
+        if original_tqdm is not None:
+            _msd.tqdm = original_tqdm
 
 
 def monotonic_pct_reporter(on_pct):
@@ -263,7 +402,10 @@ def monotonic_pct_reporter(on_pct):
     def on_progress(downloaded, total):
         if not total:
             return
-        pct = max(state["value"], int(downloaded / total * 100))
+        # min(100, …): a resumed/retried fetch re-counts already-downloaded
+        # bytes against the same running total, so the raw ratio can
+        # overshoot 1.0 near the end.
+        pct = max(state["value"], min(100, int(downloaded / total * 100)))
         if pct != state["value"]:
             state["value"] = pct
             on_pct(pct)
@@ -271,9 +413,57 @@ def monotonic_pct_reporter(on_pct):
     return on_progress
 
 
+def _download_sensevoice_hf(on_progress):
+    """Fetches both SenseVoice repos from Hugging Face into MODELS_DIR —
+    the same cache layout and tqdm-class byte-progress hook whisper's
+    downloads use. One make_progress_tqdm_class instance is shared across
+    both repos so listeners see a single growing denominator rather than
+    two disjoint 0-100%% runs. Returns (sensevoice_dir, vad_dir)."""
+    import huggingface_hub
+
+    os.makedirs(settings.MODELS_DIR, exist_ok=True)
+    os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+    tqdm_class = make_progress_tqdm_class(on_progress)
+    return tuple(
+        huggingface_hub.snapshot_download(
+            repo, cache_dir=settings.MODELS_DIR,
+            ignore_patterns=_SENSEVOICE_HF_IGNORE, tqdm_class=tqdm_class)
+        for repo in SENSEVOICE_HF_REPOS)
+
+
+def _construct_sensevoice(model_dir, vad_dir):
+    """Builds the AutoModel from local directory paths, never hub IDs —
+    funasr skips its hub/download code entirely for an existing path, so
+    this is instant-warm and fully offline.
+
+    Natively registered SenseVoiceSmall class (funasr/models/sense_voice/
+    model.py) — deliberately NOT passing trust_remote_code=True, which
+    would execute the repo's own model.py instead of the library's vetted
+    implementation. The modelscope download patch stays wrapped around
+    construction as a safety net: if some sub-config unexpectedly triggers
+    a hub fetch anyway, it reports progress and keeps the console-tqdm
+    silent instead of stalling invisibly (or crashing a windowed build)."""
+    from funasr import AutoModel
+
+    with _sensevoice_download_progress(_broadcast_sensevoice_progress):
+        return AutoModel(
+            model=model_dir,
+            vad_model=vad_dir, vad_kwargs={"max_single_segment_time": 30000},
+            device="cpu", disable_update=True,
+        )
+
+
 def get_sensevoice_model(on_progress=None):
-    """Loads iic/SenseVoiceSmall once per process and caches it — shared by
+    """Loads SenseVoiceSmall once per process and caches it — shared by
     the Transcribe tab's batch worker and the Live Transcription tab.
+
+    Load order: an already-complete local copy (HF or legacy-ModelScope
+    layout) is used directly via its path — instant, zero network. Missing
+    models download from Hugging Face first (fast CDN worldwide except
+    mainland China), and anything that fails — download or a local copy
+    that won't construct — falls back to funasr's own ModelScope flow,
+    which both serves mainland users and self-repairs a broken local copy
+    by re-fetching missing/changed files.
 
     Loaded with an fsmn-vad front-end (FunASR's own documented pairing for
     SenseVoice), not the bare model. Measured directly: without it, a 10-
@@ -323,18 +513,35 @@ def get_sensevoice_model(on_progress=None):
         with _SENSEVOICE_LOCK:
             model = _SENSEVOICE_CACHE.get("model")
             if model is None:
-                from funasr import AutoModel
+                paths = sensevoice_local_paths()
+                if paths is None:
+                    try:
+                        paths = _download_sensevoice_hf(
+                            _broadcast_sensevoice_progress)
+                    except Exception:
+                        settings.log_exception(
+                            "SenseVoice HF download failed, trying ModelScope:")
+                if paths is not None:
+                    try:
+                        model = _construct_sensevoice(*paths)
+                    except Exception:
+                        settings.log_exception(
+                            "SenseVoice local copy failed to load,"
+                            " re-downloading via ModelScope:")
+                if model is None:
+                    # Last resort AND the mainland-China path (HF is blocked
+                    # there): funasr's own ModelScope flow. Also the self-
+                    # repair route — modelscope revalidates an existing local
+                    # copy and re-fetches whatever is missing or changed.
+                    from funasr import AutoModel
 
-                # Natively registered in funasr (funasr/models/sense_voice/model.py)
-                # — deliberately NOT passing trust_remote_code=True, which would
-                # download+execute a model.py from the ModelScope repo instead of
-                # using the library's own vetted implementation.
-                with _sensevoice_download_progress(_broadcast_sensevoice_progress):
-                    model = AutoModel(
-                        model="iic/SenseVoiceSmall",
-                        vad_model="fsmn-vad", vad_kwargs={"max_single_segment_time": 30000},
-                        device="cpu", disable_update=True,
-                    )
+                    with _sensevoice_download_progress(_broadcast_sensevoice_progress):
+                        model = AutoModel(
+                            model="iic/SenseVoiceSmall",
+                            vad_model="fsmn-vad",
+                            vad_kwargs={"max_single_segment_time": 30000},
+                            device="cpu", disable_update=True,
+                        )
                 _SENSEVOICE_CACHE["model"] = model
             return model
     finally:
@@ -465,8 +672,15 @@ def get_vad_model():
         if model is None:
             from funasr import AutoModel
 
+            # Resolved local directory when available — which is always, in
+            # practice: this only runs after get_sensevoice_model succeeded,
+            # so the files are on disk. A path keeps funasr's hub code (and
+            # its network calls) entirely out of the way; the "fsmn-vad"
+            # hub alias remains only as a repair fallback.
+            paths = sensevoice_local_paths()
             model = AutoModel(
-                model="fsmn-vad", device="cpu", disable_update=True,
+                model=paths[1] if paths else "fsmn-vad",
+                device="cpu", disable_update=True,
                 max_single_segment_time=int(SENSEVOICE_SOFT_TARGET_S * 1000),
             )
             _VAD_CACHE["model"] = model
@@ -597,16 +811,28 @@ def detect_language_fast(model, audio):
         return ""
 
 
-def model_is_downloaded(size):
+def whisper_local_model_dir(size):
+    """Snapshot folder of a fully-downloaded whisper model under
+    MODELS_DIR, or None. model.bin is the payload — huggingface_hub only
+    materializes it in a snapshot once its transfer completed, so its
+    presence means the copy is usable. Passing this directory (rather than
+    the model alias) to WhisperModel skips faster_whisper's hub lookup
+    entirely: instant, guaranteed-offline warm starts with no network
+    attempt to time out on."""
     snapshots = os.path.join(
         settings.MODELS_DIR, whisper_repo_dirname(size), "snapshots"
     )
     if not os.path.isdir(snapshots):
-        return False
-    for snap in os.listdir(snapshots):
-        if os.path.isfile(os.path.join(snapshots, snap, "model.bin")):
-            return True
-    return False
+        return None
+    for snap in sorted(os.listdir(snapshots)):
+        candidate = os.path.join(snapshots, snap)
+        if os.path.isfile(os.path.join(candidate, "model.bin")):
+            return candidate
+    return None
+
+
+def model_is_downloaded(size):
+    return whisper_local_model_dir(size) is not None
 
 
 def unique_path(path):
@@ -689,58 +915,77 @@ class TranscriberWorker(threading.Thread):
 
     def _load_model(self):
         size = QUALITY_MODELS[self.quality]
-        first_run = not model_is_downloaded(size)
         os.makedirs(settings.MODELS_DIR, exist_ok=True)
         os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
 
-        model_path = size
-        if first_run:
-            self._emit("line", "downloading",
-                       {"quality": self.quality, "size_mb": MODEL_DOWNLOAD_MB[size], "pct": 0})
-            last_pct = {"value": -1}
-
-            def on_progress(downloaded, total):
-                pct = int(downloaded / total * 100)
-                if pct != last_pct["value"]:
-                    last_pct["value"] = pct
-                    self._emit("line", "downloading", {
-                        "quality": self.quality, "size_mb": MODEL_DOWNLOAD_MB[size], "pct": pct,
-                    })
-
-            try:
-                import huggingface_hub
-
-                model_path = huggingface_hub.snapshot_download(
-                    WHISPER_MODEL_REPOS[size],
-                    cache_dir=settings.MODELS_DIR,
-                    allow_patterns=_WHISPER_ALLOW_PATTERNS,
-                    tqdm_class=make_progress_tqdm_class(on_progress),
-                )
-            except Exception:
-                settings.log_exception("Model download failed:")
-                self._emit("line", "download_failed", {})
-                for job in self.jobs:
-                    self._emit("job", job.index, "failed_model", {}, None)
-                return None
-        else:
+        local_dir = whisper_local_model_dir(size)
+        if local_dir is not None:
             self._emit("line", "loading", {"quality": self.quality})
+            try:
+                return self._construct_whisper(local_dir)
+            except Exception:
+                # The on-disk copy exists but won't load (a file deleted or
+                # corrupted since whisper_local_model_dir's cheap check) —
+                # fall through to the download below, which re-fetches
+                # whatever's missing and tries once more, instead of
+                # failing the whole batch over a broken cache.
+                settings.log_exception(
+                    "Local whisper model failed to load, re-downloading:")
 
-        from faster_whisper import WhisperModel  # deferred: heavy import
+        self._emit("line", "downloading",
+                   {"quality": self.quality, "size_mb": MODEL_DOWNLOAD_MB[size], "pct": 0})
+
+        def on_pct(pct):
+            # Displayed pct is capped at 99: the aggregate total only
+            # includes files whose transfer has started, and a finished
+            # file's bar snaps to its own total — so the raw ratio can
+            # read 100% minutes before the download really completes
+            # (observed in the wild: "100%" sitting there while
+            # model.bin was still crawling in). Real completion is the
+            # switch to "loading" below, after snapshot_download
+            # actually returns.
+            self._emit("line", "downloading", {
+                "quality": self.quality, "size_mb": MODEL_DOWNLOAD_MB[size],
+                "pct": min(pct, 99),
+            })
 
         try:
-            return WhisperModel(
-                model_path,
-                device="cpu",
-                compute_type="int8",
-                cpu_threads=max(1, (os.cpu_count() or 4) - 1),
-                download_root=settings.MODELS_DIR,
+            import huggingface_hub
+
+            model_path = huggingface_hub.snapshot_download(
+                WHISPER_MODEL_REPOS[size],
+                cache_dir=settings.MODELS_DIR,
+                allow_patterns=_WHISPER_ALLOW_PATTERNS,
+                tqdm_class=make_progress_tqdm_class(
+                    monotonic_pct_reporter(on_pct)),
             )
+        except Exception:
+            settings.log_exception("Model download failed:")
+            self._emit("line", "download_failed", {})
+            for job in self.jobs:
+                self._emit("job", job.index, "failed_model", {}, None)
+            return None
+        self._emit("line", "loading", {"quality": self.quality})
+
+        try:
+            return self._construct_whisper(model_path)
         except Exception:
             settings.log_exception("Model load failed:")
             self._emit("line", "load_failed", {})
             for job in self.jobs:
                 self._emit("job", job.index, "failed_model", {}, None)
             return None
+
+    @staticmethod
+    def _construct_whisper(model_dir):
+        from faster_whisper import WhisperModel  # deferred: heavy import
+
+        return WhisperModel(
+            model_dir,
+            device="cpu",
+            compute_type="int8",
+            cpu_threads=max(1, (os.cpu_count() or 4) - 1),
+        )
 
     # -- main loop ----------------------------------------------------------
 
@@ -807,8 +1052,10 @@ class TranscriberWorker(threading.Thread):
         """Returns True once SenseVoice has produced and saved a result for
         this job; False to fall back to whisper (SenseVoice unavailable,
         model download failed, or a runtime error)."""
+        showed_load_status = False
         try:
             if not sensevoice_model_loaded():
+                showed_load_status = True
                 self._emit("line", "sensevoice_loading", {})
 
                 def on_pct(pct):
@@ -823,6 +1070,10 @@ class TranscriberWorker(threading.Thread):
                         self._emit("line", "sensevoice_loading", {})
 
                 get_sensevoice_model(monotonic_pct_reporter(on_pct))  # populates the cache
+                # Load is over — put the status line back on "Transcribing…"
+                # (what _run set before this job), or it would keep reading
+                # "Loading SenseVoice model…" for the rest of the batch.
+                self._emit("line", "transcribing", {})
 
             def on_decode_pct(pct):
                 self._emit("job", job.index, "transcribing", {"pct": pct}, pct)
@@ -831,6 +1082,10 @@ class TranscriberWorker(threading.Thread):
                 audio, language, on_progress=on_decode_pct)
         except Exception:
             settings.log_exception("SenseVoice failed, falling back to whisper:")
+            if showed_load_status:
+                # Same stale-line problem on the failure path: whisper takes
+                # over below, so don't leave "loading SenseVoice" up.
+                self._emit("line", "transcribing", {})
             return False
         effective_lang = detected or language
         parts = [(start, apply_chinese_conversion(text, effective_lang,

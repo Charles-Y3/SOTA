@@ -5,7 +5,7 @@ import os
 import sys
 import traceback
 
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.2.1"
 
 
 def _default_app_dir():

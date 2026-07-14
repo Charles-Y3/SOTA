@@ -119,6 +119,10 @@ STRINGS = {
                              " will appear here as you talk.",
         "live_status_recording": "Recording…",
         "live_status_finalizing": "Finishing up…",
+        "live_status_stopping_load": "Stopping — waiting for the SenseVoice"
+                                      " download/load already in progress to"
+                                      " finish (can't be interrupted mid-way);"
+                                      " no recording will start.",
         "live_status_saved": "Saved — {path}",
         "live_status_no_speech": "No speech detected.",
         "live_status_save_failed": "Could not save the recording — the"
@@ -311,6 +315,9 @@ STRINGS = {
         "live_placeholder": "按下「開始錄音」後開始說話 — 文字會即時顯示於此。",
         "live_status_recording": "錄音中…",
         "live_status_finalizing": "正在完成…",
+        "live_status_stopping_load": "正在停止 — 等待進行中的 SenseVoice"
+                                      "下載／載入完成（無法中途中斷）；"
+                                      "不會開始錄音。",
         "live_status_saved": "已儲存 — {path}",
         "live_status_no_speech": "未偵測到語音。",
         "live_status_save_failed": "無法儲存錄音 — 輸出資料夾無法寫入。",

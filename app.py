@@ -890,6 +890,18 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         self.output_folder_value.configure(text=settings.output_base())
         self._refresh_model_rows()
 
+    def _refresh_models_if_visible(self):
+        """The Settings tab's model list is only built on tab entry — a
+        model that finishes downloading in the background (batch worker,
+        live session) while the user is sitting on the tab would keep
+        reading "Not downloaded" until they switched away and back. Called
+        from the events that mark those completions. Skipped mid-Settings-
+        download for the same reason _refresh_model_rows itself bails: a
+        rebuild would destroy the row label that download's progress is
+        being written to."""
+        if self.current_tab == 4 and not self.model_downloads:
+            self._refresh_model_rows()
+
     # -- model manager ----------------------------------------------------
 
     def _model_registry(self):
@@ -985,9 +997,9 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
     def _download_model(self, spec):
         key = spec["key"]
         row = self.model_rows.get(key)
-        # One download at a time — the progress plumbing (and the tqdm
-        # patching the SenseVoice path does) isn't built for two at once,
-        # and neither is a typical home connection.
+        # One download at a time — the progress plumbing (and the
+        # download-hook patching the SenseVoice path does) isn't built for
+        # two at once, and neither is a typical home connection.
         if self._models_busy() or self.model_downloads:
             if row:
                 row["status"].configure(
@@ -1027,7 +1039,8 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
                                     cache_dir=settings.MODELS_DIR,
                                     tqdm_class=reporter)
                 else:
-                    # SenseVoice: same call the Live tab preload makes — it
+                    # SenseVoice: same loader Start Recording and batch
+                    # jobs use (HF download with ModelScope fallback) — it
                     # loads the model into memory as well, which doubles as
                     # warming it up for this session.
                     def on_pct(pct):
@@ -1080,6 +1093,14 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
             # A loaded .gguf is memory-mapped (= locked on Windows);
             # dropping the cache first is what makes the delete succeed.
             llm.unload_cached_model()
+        elif spec["kind"] == "sensevoice":
+            # Without this, a model already loaded into memory this session
+            # (Transcribe tab, Live tab, or this very Settings download)
+            # keeps working from RAM after its files are gone — every tab's
+            # "is it downloaded" check would then disagree with what
+            # Settings just did, until the app restarts and the cache
+            # clears naturally.
+            transcriber.unload_sensevoice_model()
         ok = True
         for folder in spec["folders"]:
             if os.path.isdir(folder):
@@ -1174,13 +1195,26 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
             tag = None
             try:
                 import json
+                import ssl
                 import urllib.request
+
+                # certifi's CA bundle, not ssl's defaults: in the packaged
+                # macOS build, ssl's default verify paths point at build-
+                # machine locations that don't exist on the user's Mac, so
+                # every HTTPS request fails certificate verification.
+                # certifi ships inside the bundle (requests depends on it),
+                # so it always resolves; fall back to defaults if not.
+                try:
+                    import certifi
+                    context = ssl.create_default_context(cafile=certifi.where())
+                except Exception:
+                    context = None
 
                 req = urllib.request.Request(UPDATE_API_URL, headers={
                     "User-Agent": "SOTA",
                     "Accept": "application/vnd.github+json",
                 })
-                with urllib.request.urlopen(req, timeout=10) as resp:
+                with urllib.request.urlopen(req, timeout=10, context=context) as resp:
                     tag = (json.load(resp).get("tag_name") or "").strip()
             except Exception:
                 settings.log_exception("Update check failed:")
@@ -1976,6 +2010,11 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
                 transcriber.recommended_quality(self.sys_ram_gb),
             ):
                 return
+        # With the SenseVoice box checked, jobs in its 5 languages will pull
+        # its ~900 MB engine mid-batch — run the same disk gate up front
+        # rather than letting that download start as a surprise.
+        if self.prefs["sensevoice_preferred"] and not self._confirm_sensevoice_download():
+            return
         for row in self.rows:
             row["output"] = None
             row["status_key"], row["status_detail"] = "waiting", {}
@@ -2046,6 +2085,11 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
             _, key, detail = event
             self.status_key, self.status_detail = key, detail
             self._render_status_line()
+            # "loading" follows a whisper download completing; "transcribing"
+            # follows a SenseVoice one (see _try_sensevoice) — moments the
+            # Settings model list may have just gone stale.
+            if key in ("loading", "transcribing"):
+                self._refresh_models_if_visible()
         elif kind == "job":
             _, index, key, detail, pct = event
             if index >= len(self.rows):
@@ -2066,6 +2110,7 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         elif kind == "finished":
             self._set_running(False)
             self.worker = None
+            self._refresh_models_if_visible()
             done = sum(1 for r in self.rows if r["status_key"].startswith("done"))
             self.progress_bar.set(1 if done == len(self.rows) and done
                                   else self.progress_bar.get())
@@ -2090,9 +2135,12 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
                 if not self.live_running:
                     self._set_live_status(None, "")
                     self._show_live_placeholder()
+                self._refresh_models_if_visible()
             else:
                 text_key = f"live_status_{key}"
                 self._set_live_status(text_key, detail)
+                if key == "recording":  # a first-session download just finished
+                    self._refresh_models_if_visible()
                 # A first-time (or first-this-session) model load can take
                 # real time even with nothing to download — surface it in
                 # the big text area too, not just the small status line, so
@@ -2123,6 +2171,8 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
             # own the moment there's something real to show instead.
             if key in ("llm_downloading", "llm_loading"):
                 self._write_llm_output_notice(i18n.t(self.ui_lang, key, **(detail or {})))
+            if key == "llm_loading":  # follows a first-run LLM download
+                self._refresh_models_if_visible()
         elif kind == "llm_reset":
             self._clear_llm_output()
         elif kind == "llm_finished":
@@ -2206,6 +2256,25 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
                        recommended=i18n.quality_display(recommended_key, self.ui_lang)))
         return True
 
+    def _confirm_sensevoice_download(self):
+        """Same pre-download gate as whisper's, for the first SenseVoice
+        fetch (~900 MB): silently passes on a machine with room, blocks
+        with a dialog when disk is genuinely too tight. required_ram_gb=0
+        skips _confirm_model_download's RAM branch (and the whisper-quality
+        wording that goes with it) — SenseVoice runs comfortably anywhere
+        whisper does; only disk can realistically block it.
+
+        Also passes silently if another tab is already mid-fetch (single-
+        flight in get_sensevoice_model means this caller will just block on
+        that download and reuse its result, never start a second one) —
+        otherwise the second tab would re-ask "download now?" for work
+        that's already running."""
+        if transcriber.sensevoice_is_downloaded() or transcriber.sensevoice_load_in_progress():
+            return True
+        quality = self.prefs["quality"]
+        return self._confirm_model_download(
+            quality, 0, transcriber.SENSEVOICE_DOWNLOAD_MB / 1024, quality)
+
     def _set_status(self, text):
         self.status_key = None
         self.status_line.configure(text=text)
@@ -2232,11 +2301,11 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
 
     def _maybe_preload_sensevoice(self):
         """First time the Live tab is opened, warm up SenseVoice in the
-        background so the idle placeholder can honestly show download/load
-        progress instead of inviting the user to start recording before the
-        engine is actually ready. Once per session — LiveTranscriber's own
-        load is single-flight against this (see transcriber.py), so it's
-        safe even if the user hits Start before this finishes."""
+        background — load-from-disk only; a model that was never downloaded
+        stays that way until an explicit Start Recording (see
+        SenseVoicePreloader for why). Once per session — LiveTranscriber's
+        own load is single-flight against this (see transcriber.py), so
+        it's safe even if the user hits Start before this finishes."""
         if self.live_preload_started or not self.sensevoice_available:
             return
         self.live_preload_started = True
@@ -2250,6 +2319,11 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
 
     def _start_live_recording(self):
         if self.live_running or not self.sensevoice_available:
+            return
+        # First-ever session downloads the engine (~900 MB) — the tab's
+        # preload deliberately doesn't (see SenseVoicePreloader), so this
+        # is the one place the Live tab can trigger it. Gate on disk room.
+        if not self._confirm_sensevoice_download():
             return
         code = self.prefs["live_language"]
         language = "" if code == "auto" else code
@@ -2275,7 +2349,17 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         if self.live_worker:
             self.live_worker.stop()
         self.live_toggle_button.configure(state="disabled")
-        self._set_live_status("live_status_finalizing", {})
+        # Distinguish "wrapping up a real session" from "still stuck on the
+        # model download/load step" — the latter can run for minutes (or a
+        # ModelScope fallback after Hugging Face fails) with no way to
+        # interrupt it mid-call, and plain "Finishing up…" reads as stuck
+        # when the big text area still shows the old "Loading SenseVoice
+        # model…" message underneath it with nothing having changed.
+        if self.live_status_key in ("live_status_loading", "live_status_downloading"):
+            self._set_live_status("live_status_stopping_load", {})
+            self._write_live_text(i18n.t(self.ui_lang, "live_status_stopping_load"))
+        else:
+            self._set_live_status("live_status_finalizing", {})
 
     def _render_live_toggle_button(self):
         if self.live_running:
@@ -2844,6 +2928,21 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
             pass
         settings.save(self.prefs)
         self.destroy()
+        # Hard-exit instead of letting the interpreter shut down normally.
+        # A model download in flight (whisper via huggingface_hub, or
+        # SenseVoice via modelscope_hub) runs on a concurrent.futures.
+        # ThreadPoolExecutor, and the stdlib registers an atexit hook
+        # (concurrent.futures.thread._python_exit) the first time any
+        # ThreadPoolExecutor is created in the process — it unconditionally
+        # .join()s every worker thread that pool has ever spun up, with no
+        # timeout, before the interpreter is allowed to exit. Closing the
+        # app mid-download would otherwise block on that in-flight network
+        # request (observed: a lingering python.exe after closing mid-
+        # transcription) rather than actually quitting. os._exit() skips
+        # atexit entirely and tears the process down immediately; anything
+        # that must survive the close (prefs, the live recording) is
+        # already saved above.
+        os._exit(0)
 
 
 def _excepthook(exc_type, exc, tb):
