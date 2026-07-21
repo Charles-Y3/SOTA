@@ -19,7 +19,18 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt pyinstaller
+          # setuptools>=81 finishes removing pkg_resources' legacy Provider
+          # classes (setuptools' own deprecation warning says "pin to
+          # Setuptools<81" for pkg_resources compatibility), which breaks
+          # PyInstaller's bundled pyi_rth_pkgres runtime hook — the built
+          # app crashes on launch with "AttributeError: module
+          # 'pkg_resources' has no attribute 'NullProvider'" before any app
+          # code runs. torch==2.13.0 independently requires
+          # setuptools>=77.0.3, so both bounds must be resolved together in
+          # one pip invocation (a separate preceding `pip install
+          # setuptools<81` gets silently overridden when requirements.txt
+          # is resolved next) — pinned range below satisfies both.
+          pip install "setuptools>=77.0.3,<81" -r requirements.txt pyinstaller
 
       - name: Build SOTA.exe
         run: >
@@ -70,7 +81,11 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt pyinstaller
+          # See the matching comment in build-windows: PyInstaller's
+          # pyi_rth_pkgres runtime hook breaks once pkg_resources' legacy
+          # Provider classes are gone (setuptools>=81); torch needs
+          # setuptools>=77.0.3, so both bounds are resolved in one call.
+          pip install "setuptools>=77.0.3,<81" -r requirements.txt pyinstaller
 
       # Built from SOTA-mac.spec, not CLI flags: the spec bakes the
       # microphone-permission key into Info.plist at build time so
