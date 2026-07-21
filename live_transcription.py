@@ -78,6 +78,28 @@ MIN_TAIL_S = 0.4        # skip a tick if there's barely any new audio yet
 # the primary trigger — it only fires if a natural pause never got detected.
 MAX_UNCOMMITTED_S = 20.0
 
+# Long-silence handling for sessions left running while the user works in
+# another tab (see Save Draft). Deliberately two-tier rather than one quick
+# auto-stop: a real dictation pause (thinking, a phone call, checking notes)
+# can easily run past a minute or two, and a *silent* stop risks the worse
+# failure — talking into a session that quietly isn't listening anymore,
+# possibly unnoticed for a while. IDLE_NUDGE_S only asks the UI to note
+# "still idle" (visible from any tab, nothing is cut); only past
+# IDLE_AUTO_STOP_S — comfortably outside any normal pause, "walked away and
+# forgot" territory — does the session actually end itself, same as if
+# Stop had been clicked (everything up to that point is already on disk).
+IDLE_NUDGE_S = 600.0       # 10 min
+IDLE_AUTO_STOP_S = 3000.0  # 50 min
+
+# Floor between automatic draft saves (see _step()'s trigger below) — not a
+# data-loss risk either way (the final save always picks up whatever a
+# debounced tick skipped), purely a cap on write frequency. python-docx has
+# no true incremental append; append_transcript re-reads and re-serializes
+# the whole file every call, so a burst of short, closely-spaced paragraphs
+# (a natural-pause commit can in principle fire every STEP_S) would
+# otherwise mean a docx rewrite that often.
+AUTO_SAVE_MIN_INTERVAL_S = 5.0
+
 
 def _rms(audio):
     if len(audio) == 0:
@@ -151,12 +173,18 @@ class LiveTranscriber(threading.Thread):
     the final (possibly still-uncommitted) tail is transcribed and the whole
     transcript is auto-saved before ("live_stopped",) is emitted."""
 
-    def __init__(self, language, events, device_name="", traditional_chinese=False):
+    def __init__(self, language, events, device_name="", traditional_chinese=False,
+                 custom_stem=None):
         super().__init__(daemon=True)
         self.language = language or ""  # "" = auto; else one of SENSEVOICE_LANGUAGES
         self.events = events
         self.device_name = device_name or ""
         self.traditional_chinese = traditional_chinese
+        # Already validated (illegal characters, Windows-reserved names,
+        # length) by the caller before this thread is even started — see
+        # app.py's _validate_live_filename. None/empty means "use the
+        # automatic timestamp name" (_open_wav).
+        self.custom_stem = custom_stem or None
         self.stop_event = threading.Event()
         self._lock = threading.Lock()
         # Audio is buffered as lists of small chunks, never one array grown
@@ -194,6 +222,25 @@ class LiveTranscriber(threading.Thread):
         self._paragraph_pending = True
         self._tail_start_samples = 0
         self._pinned_lang = self.language
+        # Draft ("partial save") state. The UI's Save-draft button sets the
+        # event; the worker services it between ticks, so all file writes
+        # happen on this thread — no locking of _parts needed (it's only
+        # ever touched from here). _draft_path is the transcript file once
+        # the first draft save created it; every later save (and the final
+        # one at session end) appends to it rather than writing a new file.
+        self._partial_save_requested = threading.Event()
+        self._draft_path = None
+        self._draft_saved_count = 0  # how many of _parts are already on disk
+        # Ready to fire the moment the first paragraph completes — see the
+        # auto-save trigger in _step().
+        self._ticks_since_auto_save = AUTO_SAVE_MIN_INTERVAL_S
+
+        # Long-silence tracking (see IDLE_NUDGE_S/IDLE_AUTO_STOP_S). Counted
+        # in accumulated tick-seconds, not wall-clock time, so it's exact
+        # regardless of how long a tick itself takes to run.
+        self._idle_s = 0.0
+        self._idle_notified = False
+        self._auto_stopped_idle = False
         # Latest mic chunk's RMS — read (without a lock; it's one float
         # assigned atomically under the GIL) by the UI's level meter.
         self.level = 0.0
@@ -203,6 +250,15 @@ class LiveTranscriber(threading.Thread):
 
     def stop(self):
         self.stop_event.set()
+
+    def request_partial_save(self):
+        """Manual trigger for the same save _step() already fires on its own
+        whenever a paragraph completes (see the natural_pause branch there)
+        — this button just forces it right now rather than waiting for the
+        next one, useful mid-debounce-window or right before switching
+        tabs. Thread-safe: just sets a flag; the worker thread does the
+        actual writing."""
+        self._partial_save_requested.set()
 
     # -- internals ------------------------------------------------------
 
@@ -248,7 +304,21 @@ class LiveTranscriber(threading.Thread):
         folder unwritable) is logged and leaves the session running without
         an audio file — the transcript, the part that matters most, is
         unaffected."""
-        self._stem = "Live " + datetime.datetime.now().strftime("%Y-%m-%d %H%M%S")
+        if self.custom_stem:
+            self._stem = self.custom_stem
+        else:
+            # Fullwidth colon (U+FF1A "："), not the ASCII ":" — a real
+            # colon in a Windows filename doesn't error, it silently
+            # truncates: NTFS reads "06:08.txt" as alternate-data-stream
+            # syntax (file "06" with a hidden stream named "08.txt"), so
+            # the visible file loses both its minute and its extension
+            # with no warning. The fullwidth colon is a different Unicode
+            # codepoint that reads almost identically and behaves as an
+            # ordinary character on disk. Minute precision only — two
+            # sessions starting the same minute already get "(2)" etc.
+            # from unique_path below, same as any other name clash.
+            now = datetime.datetime.now()
+            self._stem = "Live " + now.strftime("%Y-%m-%d %H") + "：" + now.strftime("%M")
         try:
             folder = settings.live_recordings_folder()
             os.makedirs(folder, exist_ok=True)
@@ -387,14 +457,40 @@ class LiveTranscriber(threading.Thread):
             self._emit("live_stopped")
             return
 
-        self._emit("live_status", "recording", {})
+        # "stem" lets the UI display the automatic name it ended up using
+        # when the filename field was left blank — harmless extra key when
+        # a custom name was given instead; live_status_recording's template
+        # ("Recording…") doesn't reference it, and str.format ignores
+        # unused kwargs.
+        self._emit("live_status", "recording", {"stem": self._stem})
         try:
             while not self.stop_event.wait(STEP_S):
                 self._flush_audio()
+                self._ticks_since_auto_save += STEP_S
                 self._step()
+                if self._partial_save_requested.is_set():
+                    self._partial_save_requested.clear()
+                    self._partial_save()
+                if self._check_idle():
+                    break
         finally:
             self._close_stream(stream)
             self._finish()
+
+    def _check_idle(self):
+        """Updates idle-nudge state after each tick; returns True once the
+        session should end itself (crossed IDLE_AUTO_STOP_S)."""
+        if self._idle_s >= IDLE_NUDGE_S:
+            if not self._idle_notified:
+                self._idle_notified = True
+                self._emit("live_status", "idle", {})
+        elif self._idle_notified:
+            self._idle_notified = False
+            self._emit("live_status", "idle_cleared", {})
+        if self._idle_s >= IDLE_AUTO_STOP_S:
+            self._auto_stopped_idle = True
+            return True
+        return False
 
     @staticmethod
     def _close_stream(stream):
@@ -408,12 +504,18 @@ class LiveTranscriber(threading.Thread):
         tail = self._tail()
         tail_dur = len(tail) / SAMPLE_RATE
         if tail_dur < MIN_TAIL_S:
+            # Not a silence signal — this fires constantly right after every
+            # commit clears the tail, active session or not. Idle tracking
+            # (_idle_s) is untouched here on purpose; only the branch below,
+            # a real tail that's actually silent, counts toward it.
             return
         # Cheap skip on audio that's silence throughout — avoids a wasted
         # model call (and any residual hallucination risk on pure silence)
         # on a tick where nothing new has actually been said yet.
         if _rms(tail) < SILENCE_RMS:
+            self._idle_s += STEP_S
             return
+        self._idle_s = 0.0
 
         try:
             text, detected = transcriber.sensevoice_transcribe(tail, self._language_for_call())
@@ -436,8 +538,64 @@ class LiveTranscriber(threading.Thread):
             self._commit_text(text.strip(), natural_pause)
             self._commit_tail()
             self._emit("live_text", self._committed_text(), "", self._pinned_lang)
+            if natural_pause and self._ticks_since_auto_save >= AUTO_SAVE_MIN_INTERVAL_S:
+                # The paragraph just committed is now frozen (see
+                # _frozen_count) — surface it in the Edit tab as soon as
+                # it's ready instead of only after a manual Save Draft
+                # click. Same request/flag the button sets; _run()'s loop
+                # services it on this same tick, right after _step()
+                # returns.
+                self._ticks_since_auto_save = 0.0
+                self._partial_save_requested.set()
         elif text:
             self._emit("live_text", self._committed_text(), text, self._pinned_lang)
+
+    def _frozen_count(self):
+        """How many leading paragraphs of _parts can no longer change.
+        Committed paragraphs are append-only with one exception: the most
+        recent one can still grow via continuation-commits (a cap-forced
+        commit glues onto it — see _commit_text). So the last paragraph is
+        only 'frozen' once _paragraph_pending says the next commit will
+        start a NEW paragraph; otherwise it's excluded so a draft save
+        never writes text that a later glue would silently extend."""
+        if self._paragraph_pending:
+            return len(self._parts)
+        return max(0, len(self._parts) - 1)
+
+    def _partial_save(self):
+        """Writes every frozen-but-unsaved paragraph to the session's
+        transcript file — creating it on the first draft save, appending on
+        later ones — and tells the UI, so the file shows up in the Edit tab
+        (and grows in place) while recording continues. Failure never kills
+        the session: the paragraphs stay in _parts and the next save (or
+        the final one at stop) simply retries them."""
+        upto = self._frozen_count()
+        new = self._parts[self._draft_saved_count:upto]
+        if not new:
+            self._emit("live_status", "draft_empty", {})
+            return
+        try:
+            if self._draft_path is None:
+                block = "\n\n".join(text for _start, text in new)
+                self._draft_path, _kind = docx_export.save_transcript(
+                    block + "\n", settings.transcriptions_folder(), self._stem)
+            else:
+                docx_export.append_transcript(
+                    self._draft_path, [text for _start, text in new])
+            timestamps.save_sidecar(
+                self._draft_path,
+                [start for start, _text in self._parts[:upto]])
+        except Exception:
+            settings.log_exception("Live draft save failed:")
+            self._emit("live_status", "save_failed", {})
+            return
+        self._draft_saved_count = upto
+        # Register the (still-growing) transcript + audio with the Edit tab
+        # right away, then hand it the appended paragraphs so an already-
+        # open editor can offer to pull them in instead of going stale.
+        self._emit("live_saved", self._audio_path, self._draft_path)
+        self._emit("live_draft", self._draft_path, list(new))
+        self._emit("live_status", "draft_saved", {"path": self._draft_path})
 
     def _commit_text(self, text, ended_on_pause):
         """Adds `text` to the transcript — as a new paragraph if the
@@ -487,7 +645,28 @@ class LiveTranscriber(threading.Thread):
 
         txt_path = None
         write_failed = False
-        if text:
+        if self._draft_path is not None:
+            # Draft saves already created this session's transcript file —
+            # the final save appends everything not yet on disk (at this
+            # point every paragraph is final, including the previously
+            # still-mutable last one and _finish()'s tail commit) instead
+            # of writing a second file next to the draft.
+            txt_path = self._draft_path
+            remainder = self._parts[self._draft_saved_count:]
+            try:
+                if remainder:
+                    docx_export.append_transcript(
+                        txt_path, [t for _start, t in remainder])
+                    timestamps.save_sidecar(
+                        txt_path, [start for start, _text in self._parts])
+                    self._draft_saved_count = len(self._parts)
+                    self._emit("live_draft", txt_path, list(remainder))
+            except (PermissionError, OSError):
+                settings.log_exception("Live transcript final append failed (write error):")
+                write_failed = True
+            except Exception:
+                settings.log_exception("Live transcript final append failed:")
+        elif text:
             try:
                 txt_path, _kind = docx_export.save_transcript(
                     text + "\n", settings.transcriptions_folder(), self._stem)
@@ -504,10 +683,19 @@ class LiveTranscriber(threading.Thread):
             except Exception:
                 settings.log_exception("Live transcript auto-save failed:")
 
-        if txt_path:
-            self._emit("live_status", "saved", {"path": txt_path})
-        elif write_failed:
+        # write_failed is checked first: with a draft file, txt_path is set
+        # even when the final append just failed — reporting "saved" there
+        # would hide that the session's newest paragraphs never landed.
+        if write_failed:
             self._emit("live_status", "save_failed", {})
+        elif txt_path and self._auto_stopped_idle:
+            # Distinct from plain "saved" so returning to the tab later
+            # explains why the session isn't running anymore, instead of it
+            # just quietly not being there.
+            self._emit("live_status", "saved_idle_stop",
+                       {"path": txt_path, "minutes": int(IDLE_AUTO_STOP_S // 60)})
+        elif txt_path:
+            self._emit("live_status", "saved", {"path": txt_path})
         else:
             # No text either because nothing was said, or because ASR
             # produced nothing usable — the audio (if any) is still saved.

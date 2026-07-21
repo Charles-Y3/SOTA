@@ -156,6 +156,44 @@ class Player:
             self._pos = 0
         return True
 
+    def reload(self, path=None):
+        """Re-decodes `path` (defaults to the currently loaded file), for
+        when it has grown since load() — a live session's WAV, still being
+        appended to on disk. Unlike load(), does not reset playback to the
+        start: old audio is never altered for a growing recording, only
+        appended to, so the current position and speed are captured first
+        and restored afterward. Position is restored in absolute time, not
+        as a fraction — the fraction's meaning shifts as total duration
+        grows, but the same moment in the recording is still the same
+        moment. Always pauses across the swap (a non-1.0x speed needs its
+        own background re-stretch — same async path set_speed always
+        takes, with the same ready_callback/progress_callback — so there's
+        no single instant to resume playback from mid-swap without racing
+        it). Returns True on success, False if there's no path to reload.
+
+        Best-effort like every other call in here that touches a live
+        session's file while it's still being written: decode_audio reads
+        the file at whatever moment this runs, which could in principle
+        land mid-write of the WAV header (the writer patches the data-
+        length field on every flush) — if that produces a read that fails
+        to decode, the exception propagates to the caller, which already
+        treats a failed reload as "the previous, shorter audio stays
+        usable," not a crash. The next reload attempt starts fresh.
+        """
+        path = path or self.loaded_path
+        if path is None:
+            return False
+        position_s = self.get_time()
+        speed = self._speed
+        self.pause()
+        if not self.load(path):
+            return False
+        if self.duration > 0:
+            self.seek_fraction(min(1.0, position_s / self.duration))
+        if speed != 1.0:
+            self.set_speed(speed)
+        return True
+
     # -- transport ----------------------------------------------------------
 
     def _ensure_sd(self):

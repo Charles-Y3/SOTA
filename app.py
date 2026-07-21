@@ -57,6 +57,42 @@ def _open_path(path):
         subprocess.Popen(["xdg-open", path])
 
 
+# Illegal in a Windows filename — importantly including ":", which doesn't
+# error, it silently truncates (NTFS reads "name:rest" as alternate-data-
+# stream syntax, discarding "rest" with no warning — verified directly
+# while building the auto-generated live-session name). Validating up
+# front is the only safe option; letting a bad name reach the filesystem
+# and hoping for a loud error is not, since some of these fail silently.
+_WINDOWS_ILLEGAL_FILENAME_CHARS = set('<>:"/\\|?*') | {chr(c) for c in range(32)}
+_WINDOWS_RESERVED_FILENAMES = {
+    "CON", "PRN", "AUX", "NUL",
+    *(f"COM{i}" for i in range(1, 10)),
+    *(f"LPT{i}" for i in range(1, 10)),
+}
+_LIVE_FILENAME_MAX_LEN = 100
+
+
+def _validate_live_filename(name):
+    """Returns None if `name` (already stripped of surrounding whitespace)
+    is safe to use as a live session's filename stem, or an i18n key
+    naming what's wrong. An empty name is valid — it means "use the
+    automatic name" — so this only rejects genuinely unusable text, not a
+    blank field."""
+    if not name:
+        return None
+    if len(name) > _LIVE_FILENAME_MAX_LEN:
+        return "live_filename_too_long"
+    if _WINDOWS_ILLEGAL_FILENAME_CHARS & set(name):
+        return "live_filename_invalid_chars"
+    if name != name.rstrip(". "):
+        # Windows silently drops trailing dots/spaces from a filename —
+        # same "looks fine, quietly isn't" failure mode as a bare colon.
+        return "live_filename_trailing_dot_space"
+    if name.upper().split(".", 1)[0] in _WINDOWS_RESERVED_FILENAMES:
+        return "live_filename_reserved"
+    return None
+
+
 def _fmt_size(num_bytes):
     """Human-readable size for the Settings tab's model list."""
     gb = num_bytes / (1024 ** 3)
@@ -142,6 +178,18 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         self.edit_status_detail = None
         self._edit_loaded_text = None  # editor content as of the last load — lets
                                         # auto-refresh detect unsaved typing and back off
+        # Live-draft paragraphs saved to a file the editor currently has
+        # open — the on-disk copy already contains them (the worker writes
+        # before announcing), but the open buffer doesn't. Held here until
+        # the user clicks the "add new live text" notice (or saves, which
+        # pulls them in first) — never spliced into the buffer unasked.
+        self.live_pending_appends = []   # [(start_seconds_or_None, text)]
+        self.live_pending_path = None    # transcript path the above belong to
+        # Recording badge on the Live Transcription tab button — the only
+        # reminder a session is still going once you've switched to another
+        # tab (see _style_tab_buttons). Color-only, no text change, so it
+        # can never affect the tab strip's layout/width.
+        self.live_tab_idle = False
 
         # AI tab state
         self.llm_worker = None
@@ -328,17 +376,34 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         )
         self.language_menu.grid(row=0, column=3, padx=(0, 16), pady=10)
 
+        # Checkbox + info icon share one sub-frame (rather than the icon
+        # sitting in its own column of `options`) so the icon lands right
+        # next to the checkbox's own text — a column further along in
+        # `options` starts wherever the widest OTHER row's content in that
+        # column ends, not wherever this checkbox's text happens to end,
+        # which put the icon far off to the right of "Korean" in practice.
+        sv_row = ctk.CTkFrame(options, fg_color="transparent")
+        sv_row.grid(row=1, column=0, columnspan=4, sticky="w", padx=12, pady=(0, 12))
+
         self.sensevoice_var = ctk.BooleanVar(value=False)
+        # The full language-name label this checkbox needs is too long to
+        # share a row with the pickers at the window's default (or
+        # minimum) width — hence its own row. The English text also has an
+        # explicit line break (i18n.py) so it never relies on the window
+        # being wide enough to avoid overflow.
         self.sensevoice_box = ctk.CTkCheckBox(
-            options, text="", variable=self.sensevoice_var, command=self._on_pref_change,
+            sv_row, text="", variable=self.sensevoice_var, command=self._on_pref_change,
         )
-        # Its own row, not crammed onto the quality/language row — the full
-        # language-name label this checkbox needs is too long to share a
-        # row with the pickers at the window's default (or minimum) width.
-        # The English text also has an explicit line break (i18n.py) so it
-        # never relies on the window being wide enough to avoid overflow.
-        self.sensevoice_box.grid(
-            row=1, column=0, columnspan=4, sticky="w", padx=12, pady=(0, 12))
+        self.sensevoice_box.grid(row=0, column=0, sticky="w")
+
+        # Plain-language explainer for the Whisper/SenseVoice choice this
+        # row makes — a messagebox rather than a new dialog widget, same
+        # pattern already used everywhere else in the app.
+        self.model_info_button = ctk.CTkButton(
+            sv_row, text="ⓘ", width=26, height=26, corner_radius=13,
+            fg_color="transparent", text_color=self.MUTED_TEXT,
+            hover_color=("gray80", "gray25"), command=self._show_model_info)
+        self.model_info_button.grid(row=0, column=1, sticky="w", padx=(10, 0))
 
         # drop zone
         self.drop_zone = ctk.CTkFrame(parent, height=92, border_width=2, corner_radius=10)
@@ -436,10 +501,26 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         self.live_level_bar.set(0)
         self.live_level_bar.grid(row=0, column=5, sticky="w", padx=(0, 12), pady=(10, 4))
 
+        self.live_filename_label = ctk.CTkLabel(options, text="")
+        self.live_filename_label.grid(row=1, column=0, padx=(12, 6), pady=(4, 4))
+        self.live_filename_entry = ctk.CTkEntry(options, width=440)
+        self.live_filename_entry.grid(
+            row=1, column=1, columnspan=3, sticky="w", padx=(0, 16), pady=(4, 4))
+        # Cleared any stale validation message the moment the user starts
+        # fixing what they typed — the message itself only (re)appears on
+        # the next Start Recording click, not on every keystroke.
+        self.live_filename_entry.bind(
+            "<KeyRelease>", lambda _e: self._hide_live_filename_error())
+        self.live_filename_error_label = ctk.CTkLabel(
+            options, text="", anchor="w", text_color="#e57373")
+        self.live_filename_error_label.grid(
+            row=2, column=0, columnspan=7, sticky="ew", padx=12, pady=(0, 2))
+        self.live_filename_error_label.grid_remove()
+
         self.live_hint_label = ctk.CTkLabel(
             options, text="", anchor="w", text_color=self.MUTED_TEXT, wraplength=640,
-            justify="left")
-        self.live_hint_label.grid(row=1, column=0, columnspan=7, sticky="ew",
+            justify="left", height=18)
+        self.live_hint_label.grid(row=3, column=0, columnspan=7, sticky="ew",
                                   padx=12, pady=(0, 10))
 
         # hint (left) + font size row (right) — same layout as the Edit
@@ -463,21 +544,30 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         # status text following immediately after on the same row.
         bottom = ctk.CTkFrame(parent, fg_color="transparent")
         bottom.grid(row=3, column=0, sticky="ew", padx=12, pady=(2, 4))
-        bottom.grid_columnconfigure(2, weight=1)
+        bottom.grid_columnconfigure(3, weight=1)
 
         self.live_toggle_button = ctk.CTkButton(
             bottom, text="", height=36,
             font=ctk.CTkFont(size=14, weight="bold"), command=self._toggle_live_recording)
         self.live_toggle_button.grid(row=0, column=0, padx=(0, 8))
 
+        # Saves everything transcribed so far without stopping — so a long
+        # session's early minutes can be edited while dictation continues.
+        # Only meaningful mid-recording; enabled/disabled with the session.
+        self.live_draft_button = ctk.CTkButton(
+            bottom, text="", height=36, width=130, fg_color="transparent",
+            text_color=self.OUTLINE_BUTTON_TEXT, border_width=1,
+            state="disabled", command=self._save_live_draft)
+        self.live_draft_button.grid(row=0, column=1, padx=(0, 8))
+
         self.live_open_folder_button = ctk.CTkButton(
             bottom, text="", height=36, width=150, fg_color="transparent",
             text_color=self.OUTLINE_BUTTON_TEXT, border_width=1,
             command=lambda: self._open_output_folder(settings.live_recordings_folder()))
-        self.live_open_folder_button.grid(row=0, column=1, padx=(0, 10))
+        self.live_open_folder_button.grid(row=0, column=2, padx=(0, 10))
 
         self.live_status_line = ctk.CTkLabel(bottom, text="", anchor="w", text_color=self.MUTED_TEXT)
-        self.live_status_line.grid(row=0, column=2, sticky="ew")
+        self.live_status_line.grid(row=0, column=3, sticky="ew")
 
     # ------------------------------------------------------------ edit tab
 
@@ -588,7 +678,7 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         # save row
         saverow = ctk.CTkFrame(parent, fg_color="transparent")
         saverow.grid(row=5, column=0, sticky="ew", padx=12, pady=(2, 4))
-        saverow.grid_columnconfigure(2, weight=1)
+        saverow.grid_columnconfigure(3, weight=1)
         self.save_button = ctk.CTkButton(
             saverow, text="", height=36, font=ctk.CTkFont(size=14, weight="bold"),
             command=self._save_edit)
@@ -598,8 +688,18 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
             text_color=self.OUTLINE_BUTTON_TEXT,
             border_width=1, command=self._open_output_folder)
         self.edit_open_folder_button.grid(row=0, column=1, padx=(0, 10))
+        # "New live text arrived" notice — appears only while the open file
+        # is a live session's draft that has since grown on disk; clicking
+        # appends the new paragraphs to the end of the buffer. A notice
+        # instead of an automatic splice on purpose: text must never appear
+        # in the editor mid-keystroke without the user asking for it.
+        self.edit_new_live_button = ctk.CTkButton(
+            saverow, text="", height=36,
+            command=self._pull_in_live_content)
+        self.edit_new_live_button.grid(row=0, column=2, padx=(0, 10))
+        self.edit_new_live_button.grid_remove()
         self.edit_status_line = ctk.CTkLabel(saverow, text="", anchor="w", text_color=self.MUTED_TEXT)
-        self.edit_status_line.grid(row=0, column=2, sticky="ew")
+        self.edit_status_line.grid(row=0, column=3, sticky="ew")
 
         self._set_player_enabled(False)
 
@@ -941,7 +1041,8 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         quality = i18n.quality_display(spec["quality"], self.ui_lang) \
             if spec["quality"] else ""
         if spec["kind"] == "whisper":
-            return i18n.t(self.ui_lang, "settings_model_whisper", quality=quality)
+            size = "whisper-" + transcriber.QUALITY_MODELS[spec["quality"]]
+            return i18n.t(self.ui_lang, "settings_model_whisper", quality=quality, size=size)
         if spec["kind"] == "llm":
             return i18n.t(self.ui_lang, "settings_model_llm", quality=quality)
         return i18n.t(self.ui_lang, "settings_model_sensevoice")
@@ -1384,6 +1485,7 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         holds exactly the text that was inserted. Runs on load; markers
         typed by hand afterwards aren't clickable until reload, but Save
         still honors them (it re-parses by regex, not by tag)."""
+        self._clean_orphaned_markers()
         tb = self.editor._textbox
         text = self.editor.get("1.0", "end-1c")
         found = False
@@ -1394,6 +1496,52 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
             tb.tag_add(f"ts:{timestamps.marker_seconds(m)}", start, end)
         self.edit_times_available = found
         self._render_ts_toggle()
+
+    def _clean_orphaned_markers(self):
+        """Removes a [mm:ss] marker that's immediately followed by another
+        one, with nothing in between — the trace left by deleting an
+        entire paragraph while markers were toggled hidden. A hidden
+        marker is elided to zero width, so nothing in the editor marks
+        where it starts or lets a mouse/keyboard gesture select over it;
+        "delete this whole line" aimed at the now-visible text leaves the
+        marker itself behind, jammed against whatever paragraph follows.
+        Left alone, it's not just a display glitch: Save's own parsing
+        (timestamps.parse_marked_text) already collapses a run like this
+        to the last marker, but the editor buffer itself would otherwise
+        keep showing the orphan once markers are revealed, unlike what
+        actually gets saved.
+
+        Finds these the same way parse_marked_text does — repeatedly
+        matching (and slicing off) a leading marker — rather than
+        MARKER_RE.finditer over the whole text: finditer can only find a
+        SECOND glued-together marker if MARKER_RE's ^ anchor sees it as a
+        line start, which it never is here (nothing precedes it but the
+        first marker, no newline) — finditer would silently miss exactly
+        the case this exists to catch. Deletes straight from the Tk widget
+        (not a buffer rewrite) so this can run on every re-tag without
+        disturbing the user's cursor, scroll position, or undo stack
+        elsewhere in the document — only the identified junk text moves.
+        """
+        tb = self.editor._textbox
+        text = self.editor.get("1.0", "end-1c")
+        to_delete = []  # (abs_start, abs_end) in `text`'s own offsets
+        offset = 0
+        for para in text.split("\n\n"):
+            consumed = 0
+            spans = []  # (start, end) within this paragraph
+            remaining = para
+            while True:
+                m = timestamps.MARKER_RE.match(remaining)
+                if not m:
+                    break
+                spans.append((consumed, consumed + m.end()))
+                consumed += m.end()
+                remaining = remaining[m.end():]
+            for start, end in spans[:-1]:  # every marker but the last is an orphan
+                to_delete.append((offset + start, offset + end))
+            offset += len(para) + 2  # +2 for the "\n\n" text.split() consumed
+        for start, end in reversed(to_delete):  # back to front: earlier offsets stay valid
+            tb.delete(f"1.0+{start}c", f"1.0+{end}c")
 
     def _on_timestamp_click(self, event):
         tb = self.editor._textbox
@@ -1415,6 +1563,12 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
 
     def _toggle_timestamps(self):
         self.timestamps_visible = not self.timestamps_visible
+        if self.timestamps_visible:
+            # Revealing is the moment an orphaned marker (see
+            # _clean_orphaned_markers) would otherwise become visible —
+            # clean it up first so turning markers on never shows stale
+            # junk left over from an earlier paragraph deletion.
+            self._clean_orphaned_markers()
         self._render_ts_toggle()
 
     def _render_ts_toggle(self):
@@ -1637,12 +1791,12 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
             self.tab_canvas.xview_moveto(max(0, btn_x1 - viewport_w) / content_w)
 
     def _show_tab(self, index):
-        if self.current_tab == 1 and index != 1 and self.live_running:
-            # Navigating away from the Live tab mid-recording — stop it
-            # automatically rather than leaving it recording invisibly in
-            # the background. Same call the Stop button makes: still
-            # auto-saves whatever's been captured so far.
-            self._stop_live_recording()
+        # A live session deliberately keeps running when you switch away —
+        # that's the point of Save Draft: dictate, then work the early
+        # minutes in Edit & Export while the rest keeps coming in. The
+        # worker thread and its mic stream are already fully independent of
+        # which tab is on screen; _style_tab_buttons' recording badge on
+        # this tab is the reminder that it's still going.
         self.current_tab = index
         frames = [self.transcribe_frame, self.live_frame, self.edit_frame,
                   self.llm_frame, self.settings_frame]
@@ -1666,13 +1820,27 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         self._style_tab_buttons()
         self._ensure_active_tab_visible()
 
+    # Recording-badge tints for the Live Transcription tab button — a color
+    # change only, never text, so the badge can't affect any tab's width or
+    # force a layout recompute when a session starts/stops/goes idle.
+    LIVE_TAB_RECORDING_COLOR = "#e05a5a"
+    LIVE_TAB_IDLE_COLOR = "#d99a30"
+
     def _style_tab_buttons(self):
         for i, btn in enumerate(self.tab_buttons):
             selected = i == self.current_tab
+            text_color = ("gray10", "gray95") if selected else ("gray35", "gray65")
+            # Only tinted while unselected — looking straight at the Live
+            # tab already shows the real status line/text area, a much
+            # richer signal than a tinted label, so the normal selected
+            # styling wins there instead of fighting it for attention.
+            if i == 1 and self.live_running and not selected:
+                text_color = (self.LIVE_TAB_IDLE_COLOR if self.live_tab_idle
+                             else self.LIVE_TAB_RECORDING_COLOR)
             btn.configure(
                 fg_color=self.TAB_SELECTED_BG if selected else self.TAB_UNSELECTED_BG,
                 hover_color=self.TAB_SELECTED_BG if selected else self.TAB_UNSELECTED_HOVER,
-                text_color=("gray10", "gray95") if selected else ("gray35", "gray65"),
+                text_color=text_color,
                 font=ctk.CTkFont(size=13, weight="bold" if selected else "normal"),
             )
 
@@ -1724,6 +1892,7 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         self.live_toggle_button.configure(state="normal" if self.sensevoice_available else "disabled")
         self.live_language_menu.configure(state="normal" if self.sensevoice_available else "disabled")
         self.live_mic_menu.configure(state="normal" if self.sensevoice_available else "disabled")
+        self.live_filename_entry.configure(state="normal" if self.sensevoice_available else "disabled")
         self.chinese_trad_var.set(bool(self.prefs.get("chinese_traditional")))
         self.ui_lang_button.set("EN" if self.ui_lang == "en" else "繁中")
         if self.prefs["llm_mode"] not in i18n.LLM_MODES:
@@ -1787,9 +1956,12 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         self.live_language_label.configure(text=t("language_label"))
         self.live_mic_label.configure(text=t("live_mic_label"))
         self.live_level_label.configure(text=t("live_level_label"))
+        self.live_filename_label.configure(text=t("live_filename_label"))
+        self.live_filename_entry.configure(placeholder_text=t("live_filename_placeholder"))
         self.live_hint_label.configure(text=t("live_hint"))
         self.live_text_hint_label.configure(text=t("live_text_hint"))
         self.live_open_folder_button.configure(text=t("open_output_folder"))
+        self.live_draft_button.configure(text=t("live_draft_button"))
         self.live_language_menu.configure(values=i18n.live_language_options(self.ui_lang))
         self.live_language_menu.set(
             i18n.language_display(self.prefs["live_language"], self.ui_lang))
@@ -1808,6 +1980,7 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         self.speed_caption.configure(text=t("player_speed"))
         self.save_button.configure(text=t("save_button"))
         self.edit_open_folder_button.configure(text=t("open_output_folder"))
+        self.edit_new_live_button.configure(text=t("edit_new_live_button"))
         self.editor_hint_label.configure(text=t("editor_hint"))
         self.punct_toggle_button.configure(text=t("punct_toggle"))
         self.ts_toggle_button.configure(text=t("timestamps_toggle"))
@@ -1880,6 +2053,11 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         except Exception:
             paths = [event.data]
         self._add_paths(paths)
+
+    def _show_model_info(self):
+        messagebox.showinfo(
+            i18n.t(self.ui_lang, "model_info_title"),
+            i18n.t(self.ui_lang, "model_info_body"))
 
     def _browse_files(self):
         if self.running:
@@ -2125,6 +2303,8 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
                 "player_preparing", {"speed": _speed_label(speed), "pct": int(frac * 100)})
         elif kind == "audio_loaded":
             self._on_audio_loaded(event[1], event[2])
+        elif kind == "audio_reloaded":
+            self._on_audio_reloaded(event[1])
         elif kind == "live_status":
             _, key, detail = event
             if key == "ready":
@@ -2149,14 +2329,45 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
                     self._write_live_text(i18n.t(self.ui_lang, text_key, **(detail or {})))
                 elif key == "recording":
                     self._write_live_text("")
+                    # The field was left blank (auto-name requested) — now
+                    # that the worker has settled on one, show it. Still
+                    # disabled/unmodifiable; this is display-only, matching
+                    # what a custom name already does for the rest of the
+                    # session.
+                    stem = (detail or {}).get("stem")
+                    if stem and not self.live_filename_entry.get().strip():
+                        self.live_filename_entry.configure(state="normal")
+                        self.live_filename_entry.delete(0, "end")
+                        self.live_filename_entry.insert(0, stem)
+                        self.live_filename_entry.configure(state="disabled")
                 elif key == "save_failed":
                     self._offer_output_folder_fix()
+                elif key in ("idle", "idle_cleared"):
+                    # The only reminder a long-silent session is still going
+                    # once you've switched away from this tab — see
+                    # _style_tab_buttons. Purely a color change on the tab
+                    # button, so this never touches layout/width.
+                    self.live_tab_idle = (key == "idle")
+                    self._style_tab_buttons()
         elif kind == "live_text":
             _, committed, preview, _lang = event
             self._set_live_text(committed, preview)
         elif kind == "live_saved":
             _, audio_path, txt_path = event
             self._register_live_transcript(audio_path, txt_path)
+        elif kind == "live_draft":
+            # Paragraphs a draft (or the final) save just appended to the
+            # session's transcript file. Only matters when the editor has
+            # that very session open — matched on live_draft_path (stable
+            # for the session), not txt (repoints to an edited copy once
+            # the user saves one — see _register_edit_file — so comparing
+            # against txt would stop matching after the very first save).
+            # Accumulated + surfaced as a click-to-add notice.
+            _, path, parts = event
+            if self.edit_current and self.edit_current.get("live_draft_path") == path:
+                self.live_pending_path = path
+                self.live_pending_appends.extend(parts)
+                self.edit_new_live_button.grid()
         elif kind == "live_stopped":
             self._on_live_stopped()
         elif kind == "llm_status":
@@ -2320,6 +2531,12 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
     def _start_live_recording(self):
         if self.live_running or not self.sensevoice_available:
             return
+        custom_name = self.live_filename_entry.get().strip()
+        error_key = _validate_live_filename(custom_name)
+        if error_key:
+            self._show_live_filename_error(error_key)
+            return
+        self._hide_live_filename_error()
         # First-ever session downloads the engine (~900 MB) — the tab's
         # preload deliberately doesn't (see SenseVoicePreloader), so this
         # is the one place the Live tab can trigger it. Gate on disk room.
@@ -2329,10 +2546,18 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         language = "" if code == "auto" else code
         self.live_session_started = True
         self.live_running = True
+        self.live_tab_idle = False
         self._write_live_text("")
         self.live_language_menu.configure(state="disabled")
         self.live_mic_menu.configure(state="disabled")
+        # Locked for the life of the session (matches every other per-
+        # session choice — device, language): if left blank, the entry
+        # still gets filled in, once the worker settles on one, with
+        # whatever automatic name it ended up using (see _handle_event's
+        # "recording" case) — never editable, just shown.
+        self.live_filename_entry.configure(state="disabled")
         self._render_live_toggle_button()
+        self._style_tab_buttons()
         # No status set here — the worker's own events ("loading",
         # "downloading", "mic_failed", or "recording") are the only source
         # of truth for what's actually happening. Claiming "Recording…"
@@ -2342,13 +2567,76 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         self.live_worker = live_transcription.LiveTranscriber(
             language, self.events,
             device_name=self.prefs.get("live_mic_device", ""),
-            traditional_chinese=bool(self.prefs.get("chinese_traditional")))
+            traditional_chinese=bool(self.prefs.get("chinese_traditional")),
+            custom_stem=custom_name or None)
         self.live_worker.start()
+        self.live_draft_button.configure(state="normal")
+
+    def _show_live_filename_error(self, error_key):
+        self.live_filename_error_label.configure(text=i18n.t(self.ui_lang, error_key))
+        self.live_filename_error_label.grid()
+
+    def _hide_live_filename_error(self):
+        self.live_filename_error_label.grid_remove()
+
+    def _save_live_draft(self):
+        if self.live_running and self.live_worker:
+            self.live_worker.request_partial_save()
+
+    def _pull_in_live_content(self):
+        """Appends the pending live-draft paragraphs to the end of the open
+        editor buffer (with their clickable [mm:ss] markers), leaving the
+        user's cursor, scroll position, and undo history alone. The file on
+        disk already contains this text — this only brings the buffer up to
+        date — so the loaded-text baseline advances too: pulling in isn't a
+        user edit and must not, by itself, read as unsaved changes."""
+        parts, self.live_pending_appends = self.live_pending_appends, []
+        path, self.live_pending_path = self.live_pending_path, None
+        self.edit_new_live_button.grid_remove()
+        if not parts or not self.edit_current or self.edit_current.get("live_draft_path") != path:
+            return
+        add = "\n\n".join(
+            f"{timestamps.format_marker(s)} {t}" if s is not None else t
+            for s, t in parts)
+        current = self.editor.get("1.0", "end-1c")
+        joiner = "\n\n" if current.strip() else ""
+        self.editor.insert("end", joiner + add)
+        self._apply_timestamp_markup()
+        if self._edit_loaded_text is not None:
+            self._edit_loaded_text = self._edit_loaded_text + joiner + add
+        # The recording's WAV keeps growing in the background too — without
+        # this, the player stays frozen at whatever length was on disk when
+        # this entry was first opened, so a marker in the text we just
+        # pulled in could point past audio the player doesn't know exists
+        # yet. Only when the player currently has THIS entry's own audio
+        # loaded (not some unrelated file the user has since opened).
+        audio = self.edit_current.get("audio")
+        if audio and self.player.loaded_path == audio:
+            self._reload_live_audio(audio)
+
+    def _reload_live_audio(self, audio):
+        def work():
+            ok = False
+            try:
+                ok = self.player.reload(audio)
+            except Exception:
+                settings.log_exception(f"Live audio reload failed: {audio}")
+            self.events.put(("audio_reloaded", ok))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_audio_reloaded(self, ok):
+        if not ok:
+            return  # best-effort refresh; the previous, shorter audio stays usable
+        self.time_label.configure(
+            text=f"{_fmt_time(self.player.get_time())} / {_fmt_time(self.player.duration)}")
+        self.position_slider.set(self.player.get_fraction())
+        self._render_play_button()
 
     def _stop_live_recording(self):
         if self.live_worker:
             self.live_worker.stop()
         self.live_toggle_button.configure(state="disabled")
+        self.live_draft_button.configure(state="disabled")
         # Distinguish "wrapping up a real session" from "still stuck on the
         # model download/load step" — the latter can run for minutes (or a
         # ModelScope fallback after Hugging Face fails) with no way to
@@ -2410,11 +2698,22 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         # "saved" case makes for a batch job, so the live recording plays
         # back in the Edit tab exactly like any other file.
         if audio_path:
-            self._register_edit_file(audio_path, txt_path)
+            self._register_edit_file(audio_path, txt_path, is_live=True)
         elif txt_path:
+            # Draft saves re-announce the same transcript as it grows —
+            # update the existing entry instead of adding a duplicate row.
+            # Matched on live_draft_path (stable), not txt — the entry's
+            # txt gets repointed to an edited copy once the user saves one
+            # (see _register_edit_file/_save_edit), but this raw draft path
+            # never changes for the life of the session.
+            for entry in self.edit_files:
+                if entry.get("live_draft_path") == txt_path:
+                    self._refresh_edit_menu()
+                    return
             stem = os.path.splitext(os.path.basename(txt_path))[0]
             self.edit_files.append(
-                {"label": self._unique_label(stem), "audio": None, "txt": txt_path})
+                {"label": self._unique_label(stem), "audio": None, "txt": txt_path,
+                 "live_draft_path": txt_path})
             self._refresh_edit_menu()
         else:
             return
@@ -2426,23 +2725,52 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
 
     def _on_live_stopped(self):
         self.live_running = False
+        self.live_tab_idle = False
         self.live_worker = None
         state = "normal" if self.sensevoice_available else "disabled"
         self.live_language_menu.configure(state=state)
         self.live_mic_menu.configure(state=state)
         self.live_level_bar.set(0)
+        self.live_draft_button.configure(state="disabled")
+        # Cleared rather than left showing the just-finished session's name
+        # — reusing it for the next session (intentionally or by not
+        # noticing) would still work fine (collision handling just appends
+        # "(2)"), but an unclearing field risks looking like "still the
+        # same session" rather than "ready for a new one."
+        self.live_filename_entry.configure(state=state)
+        self.live_filename_entry.delete(0, "end")
+        self._hide_live_filename_error()
         self._render_live_toggle_button()
+        self._style_tab_buttons()
 
     # ============================================================= edit tab
 
-    def _register_edit_file(self, audio_path, txt_path):
+    def _register_edit_file(self, audio_path, txt_path, is_live=False):
         label = os.path.basename(audio_path)
         for entry in self.edit_files:
             if entry["audio"] == audio_path:
-                entry["txt"] = txt_path
+                if is_live:
+                    # live_draft_path is the stable raw-draft identity used
+                    # to match incoming content (see _handle_event's
+                    # live_draft branch) — always the same path for this
+                    # session, safe to re-set every call. txt is what a
+                    # reload of this entry would show, though: once the
+                    # user has an edited copy, a later live_saved firing
+                    # again (new paragraphs landed) must NOT silently
+                    # revert it back to the raw, unedited draft — that new
+                    # content is surfaced through the pending-append
+                    # notice instead, not by clobbering the pointer.
+                    entry["live_draft_path"] = txt_path
+                    if not entry.get("edited_path"):
+                        entry["txt"] = txt_path
+                else:
+                    entry["txt"] = txt_path
                 break
         else:
-            self.edit_files.append({"label": label, "audio": audio_path, "txt": txt_path})
+            entry = {"label": label, "audio": audio_path, "txt": txt_path}
+            if is_live:
+                entry["live_draft_path"] = txt_path
+            self.edit_files.append(entry)
         self._refresh_edit_menu()
 
     def _unique_label(self, base):
@@ -2515,6 +2843,12 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         self.edit_current = entry
         self._stop_play()
         self.speed_menu.set(_speed_label(1.0))
+        # A fresh load reads the file from disk, which already includes any
+        # live-draft paragraphs waiting in the pending buffer — keeping
+        # them would append the same text twice on the next pull-in.
+        self.live_pending_appends = []
+        self.live_pending_path = None
+        self.edit_new_live_button.grid_remove()
 
         # load transcript text (immediately)
         text, found = "", True
@@ -2640,6 +2974,12 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         self.after(TICK_MS, self._tick_player)
 
     def _save_edit(self):
+        # Saving with live-draft text still pending would produce an edited
+        # copy that's missing paragraphs the session already transcribed —
+        # pull them into the buffer first, so what's saved is complete.
+        if (self.live_pending_appends and self.edit_current
+                and self.edit_current.get("live_draft_path") == self.live_pending_path):
+            self._pull_in_live_content()
         raw = self.editor.get("1.0", "end").rstrip("\n")
         if not raw.strip():
             self._set_edit_status("nothing_to_save", {})
@@ -2655,13 +2995,53 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
             stem = os.path.splitext(self.edit_current["label"])[0] + " (edited)"
         else:
             stem = "transcript (edited)"
+        is_live = bool(self.edit_current and self.edit_current.get("live_draft_path"))
         try:
-            path, kind = docx_export.save_transcript(
-                text, settings.transcriptions_folder(), stem)
+            fallback_used = False
+            if is_live:
+                # A live session's edited copy is one evolving file, kept
+                # in place across every save (with a single-backup safety
+                # net) rather than a fresh numbered file each time — unlike
+                # a regular transcript, there's no separate stable
+                # "original" this needs to protect: the draft itself is the
+                # working document, so version-per-save mostly adds
+                # clutter without a matching safety benefit. Path is picked
+                # once and reused; word_available() isn't re-checked on
+                # later saves so a session can't straddle two file kinds.
+                if not self.edit_current.get("edited_path"):
+                    self.edit_current["edited_path"] = docx_export.edited_copy_path(
+                        settings.transcriptions_folder(), stem)
+                path = self.edit_current["edited_path"]
+                try:
+                    docx_export.save_transcript_at(text, path)
+                    kind = "docx" if path.lower().endswith(".docx") else "txt"
+                except (PermissionError, OSError):
+                    # Overwriting in place failed — most likely the file is
+                    # currently open elsewhere (Word holds a .docx locked
+                    # while it's open). Falling straight to save_failed
+                    # would lose this edit until the user notices, closes
+                    # Word, and retries by hand — instead, save as a new
+                    # file (the same numbered-naming rule a regular save
+                    # uses) and adopt it as the session's edited copy going
+                    # forward: the next save just overwrites THIS one in
+                    # place, no different from any other session.
+                    settings.log_exception(
+                        "Live edited copy is locked (open elsewhere?),"
+                        " saving a new copy instead:")
+                    path, kind = docx_export.save_transcript(
+                        text, settings.transcriptions_folder(), stem)
+                    self.edit_current["edited_path"] = path
+                    fallback_used = True
+            else:
+                path, kind = docx_export.save_transcript(
+                    text, settings.transcriptions_folder(), stem)
             if has_times:
                 timestamps.save_sidecar(path, times)
-            self._set_edit_status("saved_docx" if kind == "docx" else "saved_txt",
-                                  {"path": path})
+            if fallback_used:
+                self._set_edit_status("saved_locked_fallback", {"path": path})
+            else:
+                self._set_edit_status("saved_docx" if kind == "docx" else "saved_txt",
+                                      {"path": path})
             if self.edit_current:
                 # Point this entry at the edited copy so anything that loads
                 # it next — the AI tab's autoload, reopening it here later —

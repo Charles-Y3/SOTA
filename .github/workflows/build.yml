@@ -39,6 +39,14 @@ jobs:
           --hidden-import onnxruntime
           app.py
 
+      # Same guard as the macOS job: prove the built exe actually launches
+      # (--selftest opens the real UI and exits by itself after 1.5s).
+      - name: Smoke-test the built app
+        run: |
+          $p = Start-Process -FilePath "dist\SOTA\SOTA.exe" -ArgumentList "--selftest" -PassThru
+          if (-not $p.WaitForExit(60000)) { $p.Kill(); Write-Error "app did not exit within 60s"; exit 1 }
+          if ($p.ExitCode -ne 0) { Write-Error "app exited with code $($p.ExitCode)"; exit 1 }
+
       - name: Bundle README with the app
         run: Copy-Item README.md dist\SOTA\README.md
 
@@ -64,37 +72,35 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt pyinstaller
 
+      # Built from SOTA-mac.spec, not CLI flags: the spec bakes the
+      # microphone-permission key into Info.plist at build time so
+      # PyInstaller signs the bundle exactly once, over its final contents.
+      # (v1.2.1 edited the plist after the build and re-signed — a broken
+      # signature on Apple-silicon means the app dies instantly on launch.)
       - name: Build SOTA.app
-        run: >
-          pyinstaller --noconfirm --clean --windowed --name SOTA
-          --osx-bundle-identifier com.sota.transcription
-          --collect-all customtkinter
-          --collect-all tkinterdnd2
-          --collect-all sounddevice
-          --collect-all av
-          --collect-all docx
-          --collect-data faster_whisper
-          --collect-all ctranslate2
-          --collect-all llama_cpp
-          --collect-all opencc
-          --collect-all funasr
-          --collect-all torch
-          --collect-all torchaudio
-          --hidden-import onnxruntime
-          app.py
+        run: pyinstaller --noconfirm --clean SOTA-mac.spec
 
-      # Without NSMicrophoneUsageDescription, macOS doesn't prompt for mic
-      # access — it kills the app the moment Live Transcription opens the
-      # input stream. PyInstaller's CLI can't inject plist keys, so patch
-      # the bundle after the build, then re-sign: editing Info.plist breaks
-      # the ad-hoc seal PyInstaller applied, and an app with an invalid
-      # signature won't launch at all on Apple-silicon Macs.
-      - name: Add microphone usage description and re-sign
+      # The one failure mode a green build doesn't catch is an app that
+      # builds fine but dies on launch (exactly what v1.2.1 shipped).
+      # --selftest opens the real UI and exits by itself after 1.5s, so a
+      # clean exit here proves the bundle actually launches.
+      - name: Smoke-test the built app
         run: |
-          plutil -insert NSMicrophoneUsageDescription \
-            -string "SOTA uses the microphone to record and transcribe your speech in the Live Transcription tab." \
-            dist/SOTA.app/Contents/Info.plist
-          codesign --force --sign - dist/SOTA.app
+          ./dist/SOTA.app/Contents/MacOS/SOTA --selftest &
+          APP_PID=$!
+          for i in $(seq 1 60); do
+            if ! kill -0 $APP_PID 2>/dev/null; then
+              wait $APP_PID
+              exit $?
+            fi
+            sleep 1
+          done
+          kill $APP_PID
+          echo "app did not exit within 60s"
+          exit 1
+
+      - name: Verify the bundle's code signature
+        run: codesign --verify --deep --strict dist/SOTA.app
 
       - name: Bundle README with the app
         run: |

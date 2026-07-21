@@ -95,17 +95,29 @@ def parse_marked_text(text):
     Tolerant by design: the markers live inside an editable text box, so a
     user may have deleted some, added paragraphs without any, or mangled
     one into plain text (a mangled marker simply stops matching and stays
-    as ordinary words)."""
+    as ordinary words). One more thing markers survive: deleting an entire
+    paragraph while markers are toggled hidden. A hidden marker is elided
+    to zero width, so it can't be clicked or dragged over — nothing marks
+    where it starts, meaning a "delete this whole line" gesture aimed at
+    the now-visible text naturally leaves it behind, jammed directly
+    against whatever paragraph follows (no blank-line gap, since that
+    belonged to the deleted paragraph too). Consuming every leading
+    marker in a loop instead of just one, keeping only the last one's
+    time, cleans that up: the surviving marker is the one that actually
+    matches where the remaining text starts; earlier ones point at
+    content that's gone."""
     paragraphs = text.split("\n\n")
     clean, times = [], []
     for para in paragraphs:
-        m = MARKER_RE.match(para)
-        if m:
-            times.append(marker_seconds(m))
-            clean.append(para[m.end():])
-        else:
-            times.append(None)
-            clean.append(para)
+        seconds = None
+        while True:
+            m = MARKER_RE.match(para)
+            if not m:
+                break
+            seconds = marker_seconds(m)
+            para = para[m.end():]
+        times.append(seconds)
+        clean.append(para)
     return "\n\n".join(clean), times
 
 

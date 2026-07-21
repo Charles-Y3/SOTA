@@ -75,6 +75,17 @@ STRINGS = {
         "ram_caption": "Detected {ram} GB RAM — {recommended} recommended for this PC",
         "ram_caption_close_apps": "Detected {ram} GB RAM — {recommended} recommended;"
                                    " close other apps first for the best experience",
+        "model_info_title": "About the speech models",
+        "model_info_body":
+            "SOTA can transcribe using two different engines.\n\n"
+            "Whisper handles everything by default and works with almost"
+            " any language. The Fast / Balanced / Accurate choice above"
+            " controls how careful (and how slow) it is.\n\n"
+            "SenseVoice is a second engine that's extra accurate"
+            " specifically for English, Mandarin, Cantonese, Japanese, and"
+            " Korean. Turn on the checkbox above to use it automatically"
+            " for those languages — everything else still goes to Whisper.\n\n"
+            "Both run entirely on this computer. Nothing is ever uploaded.",
         # --- Edit & Export tab
         "edit_file_label": "File",
         "edit_open_button": "Open a file…",
@@ -92,6 +103,9 @@ STRINGS = {
         "save_button": "Save copy",
         "saved_docx": "Saved Word document: {path}",
         "saved_txt": "Saved text file: {path}",
+        "saved_locked_fallback": "The file is open elsewhere (e.g. in Word)"
+                                  " and couldn't be overwritten — saved as a"
+                                  " new copy instead: {path}",
         "save_failed": "Could not save. See sota.log for details.",
         "save_failed_folder_title": "SOTA",
         "save_failed_folder_message":
@@ -111,10 +125,23 @@ STRINGS = {
         "no_transcript_found": "Loaded audio, but no transcript was found — you can type one.",
         # --- Live Transcription tab
         "tab_live": "Live Transcription",
-        "live_hint": "Supports English, Mandarin, Cantonese, Japanese, Korean only.",
+        "live_filename_label": "Filename (optional):",
+        "live_filename_placeholder": "e.g. Team meeting — leave blank for an automatic name",
+        "live_filename_invalid_chars": 'That name can\'t include: < > : " / \\ | ? *',
+        "live_filename_trailing_dot_space": "That name can't end with a space or a period.",
+        "live_filename_reserved": "That name is reserved by Windows and can't be"
+                                  " used — try adding another word to it.",
+        "live_filename_too_long": "That name is too long — please shorten it.",
+        "live_hint": "This tab uses the SenseVoice engine, which understands"
+                     " English, Mandarin, Cantonese, Japanese, and Korean.",
         "live_text_hint": "Transcription is shown below as you speak.",
         "live_start_button": "Start Recording",
         "live_stop_button": "Stop",
+        "live_draft_button": "Save draft",
+        "live_status_draft_saved": "Draft saved — {path}. Recording continues…",
+        "live_status_draft_empty": "No new finished paragraph to save yet —"
+                                    " keep going and try again.",
+        "edit_new_live_button": "Add new live text",
         "live_placeholder": "Press Start Recording and speak — the transcript"
                              " will appear here as you talk.",
         "live_status_recording": "Recording…",
@@ -124,6 +151,13 @@ STRINGS = {
                                       " finish (can't be interrupted mid-way);"
                                       " no recording will start.",
         "live_status_saved": "Saved — {path}",
+        "live_status_idle": "Still recording — no speech for a while."
+                             " Switch tabs freely; it keeps going until you"
+                             " click Stop (or after a very long silence).",
+        "live_status_idle_cleared": "Recording…",
+        "live_status_saved_idle_stop": "No speech for {minutes} min, so the"
+                                        " session stopped itself and saved —"
+                                        " {path}.",
         "live_status_no_speech": "No speech detected.",
         "live_status_save_failed": "Could not save the recording — the"
                                     " output folder isn't writable.",
@@ -176,7 +210,7 @@ STRINGS = {
         "settings_models_hint": "Models download automatically the first time they're"
                                  " needed. Pre-download them here while on a good"
                                  " connection, or delete them to free disk space.",
-        "settings_model_whisper": "Speech model — {quality}",
+        "settings_model_whisper": "Speech model — {quality} ({size})",
         "settings_model_sensevoice": "SenseVoice engine (incl. voice-activity model)",
         "settings_model_llm": "AI model — {quality}",
         "settings_model_downloaded": "Downloaded — {size}",
@@ -275,6 +309,15 @@ STRINGS = {
         "ram_caption": "偵測到 {ram} GB 記憶體 — 建議此電腦使用{recommended}",
         "ram_caption_close_apps": "偵測到 {ram} GB 記憶體 — 建議使用{recommended}；"
                                    "為求最佳體驗，請先關閉其他應用程式",
+        "model_info_title": "關於語音模型",
+        "model_info_body":
+            "SOTA 可以使用兩種不同的引擎進行轉錄。\n\n"
+            "Whisper 預設處理所有內容，幾乎支援所有語言。上方的"
+            "「快速／平衡／精確」選項會決定它的仔細程度（也就是速度）。\n\n"
+            "SenseVoice 是第二種引擎，專門針對英文、中文、粵語、日文與"
+            "韓文特別準確。勾選上方的選項即可自動對這些語言使用"
+            "SenseVoice — 其他語言仍會交給 Whisper 處理。\n\n"
+            "兩者都完全在這台電腦上執行，不會上傳任何內容。",
         # --- Edit & Export tab
         "edit_file_label": "檔案",
         "edit_open_button": "開啟檔案…",
@@ -291,6 +334,8 @@ STRINGS = {
         "save_button": "儲存副本",
         "saved_docx": "已儲存 Word 文件：{path}",
         "saved_txt": "已儲存文字檔：{path}",
+        "saved_locked_fallback": "檔案已在其他程式中開啟（例如 Word），"
+                                  "無法覆寫 — 已改儲存為新檔案：{path}",
         "save_failed": "無法儲存。詳情請見 sota.log。",
         "save_failed_folder_title": "SOTA",
         "save_failed_folder_message":
@@ -308,10 +353,21 @@ STRINGS = {
         "no_transcript_found": "已載入音訊，但找不到轉錄稿 — 您可以自行輸入。",
         # --- Live Transcription tab
         "tab_live": "即時轉錄",
-        "live_hint": "僅支援英文、中文、粵語、日文、韓文。",
+        "live_filename_label": "檔名（選填）：",
+        "live_filename_placeholder": "例如：團隊會議 — 留空則自動命名",
+        "live_filename_invalid_chars": "名稱不可包含：< > : \" / \\ | ? *",
+        "live_filename_trailing_dot_space": "名稱結尾不可為空格或句號。",
+        "live_filename_reserved": "此名稱為 Windows 系統保留字，無法使用 —"
+                                  "請嘗試加上其他文字。",
+        "live_filename_too_long": "名稱過長，請縮短。",
+        "live_hint": "此分頁使用 SenseVoice 引擎，支援英文、中文、粵語、日文與韓文。",
         "live_text_hint": "轉錄文字會顯示於下方。",
         "live_start_button": "開始錄音",
         "live_stop_button": "停止",
+        "live_draft_button": "儲存草稿",
+        "live_status_draft_saved": "已儲存草稿 — {path}，錄音持續中…",
+        "live_status_draft_empty": "尚無新的完整段落可儲存 — 請繼續錄音後再試。",
+        "edit_new_live_button": "加入新的即時內容",
         "live_placeholder": "按下「開始錄音」後開始說話 — 文字會即時顯示於此。",
         "live_status_recording": "錄音中…",
         "live_status_finalizing": "正在完成…",
@@ -319,6 +375,12 @@ STRINGS = {
                                       "下載／載入完成（無法中途中斷）；"
                                       "不會開始錄音。",
         "live_status_saved": "已儲存 — {path}",
+        "live_status_idle": "仍在錄音中 — 已有一段時間沒有偵測到語音。"
+                             "可自由切換分頁；錄音會持續進行，直到您按下"
+                             "「停止」（或靜音時間過長後自動停止）。",
+        "live_status_idle_cleared": "錄音中…",
+        "live_status_saved_idle_stop": "已 {minutes} 分鐘沒有語音，"
+                                        "工作階段已自動停止並儲存 — {path}。",
         "live_status_no_speech": "未偵測到語音。",
         "live_status_save_failed": "無法儲存錄音 — 輸出資料夾無法寫入。",
         "live_status_mic_failed": "無法存取麥克風。請確認沒有其他程式正在使用"
@@ -366,7 +428,7 @@ STRINGS = {
         "settings_section_models": "模型與儲存空間",
         "settings_models_hint": "模型會在第一次需要時自動下載。您可以趁網路狀況"
                                  "良好時先在此下載，或刪除以釋放磁碟空間。",
-        "settings_model_whisper": "語音模型 — {quality}",
+        "settings_model_whisper": "語音模型 — {quality}（{size}）",
         "settings_model_sensevoice": "SenseVoice 引擎（含語音活動模型）",
         "settings_model_llm": "AI 模型 — {quality}",
         "settings_model_downloaded": "已下載 — {size}",

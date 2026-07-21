@@ -2,6 +2,7 @@
 the machine) or plain .txt otherwise."""
 
 import os
+import shutil
 import sys
 
 from transcriber import unique_path
@@ -83,3 +84,70 @@ def save_transcript(text, dest_folder, stem):
     with open(path, "w", encoding="utf-8") as f:
         f.write(text)
     return path, "txt"
+
+
+def edited_copy_path(dest_folder, stem):
+    """Picks the path a live session's evolving '(edited)' copy will live
+    at — same unique-name rule save_transcript uses (so it never collides
+    with an unrelated existing file), computed once by the caller and then
+    reused for every subsequent save_transcript_at call, instead of a fresh
+    numbered name each time. Extension follows the same rule save_transcript
+    uses (docx if Word is available, else txt), fixed for the rest of the
+    session so a save never straddles two file kinds."""
+    os.makedirs(dest_folder, exist_ok=True)
+    ext = ".docx" if word_available() else ".txt"
+    return unique_path(os.path.join(dest_folder, stem + ext))
+
+
+def save_transcript_at(text, path):
+    """Overwrites `path` with `text` in place, keeping exactly one backup
+    of whatever was there before — `<name> (previous)<ext>`, itself
+    overwritten on the next call rather than accumulating. One step of
+    undo-safety for a live session's repeatedly-saved edited copy, without
+    the multiple-file clutter a fresh numbered file per save would produce.
+    Kind (docx vs txt) follows `path`'s own extension, not word_available()
+    — set once by edited_copy_path and never re-decided mid-session."""
+    if os.path.isfile(path):
+        base, ext = os.path.splitext(path)
+        try:
+            shutil.copy2(path, f"{base} (previous){ext}")
+        except Exception:
+            pass  # best-effort; must never block saving the new content
+
+    if path.lower().endswith(".docx"):
+        from docx import Document
+
+        doc = Document()
+        paras = _paragraphs(text)
+        if paras:
+            for p in paras:
+                doc.add_paragraph(p)
+        else:
+            doc.add_paragraph("")
+        doc.save(path)
+    else:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text)
+
+
+def append_transcript(path, paragraphs):
+    """Appends `paragraphs` (a list of strings) to an existing transcript
+    file written by save_transcript, preserving its one-block-per-paragraph
+    structure — used by the Live tab's draft saves, where a session's
+    transcript grows over multiple writes instead of being written once."""
+    paras = [p.strip() for p in paragraphs if p and p.strip()]
+    if not paras:
+        return
+    if path.lower().endswith(".docx"):
+        from docx import Document
+
+        doc = Document(path)
+        for p in paras:
+            doc.add_paragraph(p)
+        doc.save(path)
+        return
+    # save_transcript leaves .txt files ending in a single newline, so each
+    # appended block starts with one more to form the blank-line separator.
+    with open(path, "a", encoding="utf-8") as f:
+        for p in paras:
+            f.write("\n" + p + "\n")

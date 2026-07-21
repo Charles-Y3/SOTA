@@ -1,6 +1,6 @@
 # SOTA — Smart Offline Transcription Application
 
-**Version 1.2.1**
+**Version 1.2.2**
 
 Drop in audio files, click **Transcribe All**, and get a transcript for each
 file — saved as `.docx` if Microsoft Word is installed, otherwise `.txt`. Or
@@ -29,7 +29,9 @@ download(s), no internet is needed and no audio ever leaves your machine.
    - **SenseVoice**: a second, more accurate engine for English, Mandarin,
      Cantonese, Japanese, and Korean — check the box to use it whenever the
      picked (or auto-detected) language is one of those five. Everything
-     else still uses the Fast/Balanced/Accurate model above.
+     else still uses the Fast/Balanced/Accurate model above. The **ⓘ**
+     button next to it explains the Whisper/SenseVoice split in plain
+     language.
    - Transcripts always save into `output\Transcriptions` next to the app.
 3. Click **Transcribe All**. Each file shows its own progress and any file
    that fails won't stop the rest.
@@ -61,7 +63,14 @@ Dictate straight from your microphone instead of recording a file first:
    else. Next to the language picker, a **Microphone** dropdown lets you
    choose which input device to record from (refreshed every time you open
    the tab, so a newly plugged-in mic shows up right away); your choice is
-   remembered.
+   remembered. An optional **Name** field lets you give the session a
+   filename up front (e.g. "Team meeting") instead of the automatic
+   "Live *date time*" name — leave it blank for the automatic name, which
+   gets filled into the field once recording starts either way. The name
+   locks once you start (matching the language/microphone choice) and the
+   field clears for the next session; a name with characters Windows
+   doesn't allow in filenames is flagged immediately, before recording
+   starts.
 2. Click **Start Recording** and speak. Text appears as you talk — SOTA only
    re-processes the part of the recording since your last natural pause, so
    it stays responsive no matter how long the session runs. A small level
@@ -74,6 +83,25 @@ Dictate straight from your microphone instead of recording a file first:
    `output\Live Recordings`. The recording is also added to the **Edit &
    Export** tab's file list automatically, so you can play it back and
    correct the text right away.
+
+During a long session you don't have to wait for Stop: switching to another
+tab no longer stops the recording — it keeps dictating in the background
+(a colored dot on the **Live Transcription** tab shows a session is still
+running), so you can work in **Edit & Export** at the same time. Every
+finished paragraph is saved to the transcript file automatically as soon as
+it's ready, without interrupting the recording; a **Save draft** button is
+also there if you want to force a save right now. Each save appends only
+the new paragraphs to the same file — and if you have it open in the
+editor when that happens, an **Add new live text** button appears there;
+clicking it appends the new
+paragraphs to the end of what you're editing and refreshes the audio
+player to match, keeping your current playback position (saving also
+pulls them in automatically, so an edited copy is never missing text — or
+audio — the session already produced). If the room goes quiet for a long
+stretch, the session keeps
+going (a real pause is common and never cuts you off) — it only stops
+itself after roughly 50 minutes of continuous silence, which by then has
+already been auto-saved.
 
 The first time you use this tab, the SenseVoice model needs to load into
 memory — this takes real time (tens of seconds) even if it's already
