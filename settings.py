@@ -28,40 +28,43 @@ LOG_FILE = os.path.join(APP_DIR, "sota.log")
 
 def app_root():
     """Folder the app lives in: next to SOTA.exe when packaged, or the
-    source folder when run with `python app.py`.
-
-    On a packaged macOS build, sys.executable lives deep inside the bundle
-    (SOTA.app/Contents/MacOS/SOTA) — "next to the app" must mean next to
-    SOTA.app itself, not inside it: writing models/ and output/ into the
-    bundle breaks its code signature and fails outright when the app sits
-    somewhere read-only. Climb out to the folder that contains the .app."""
+    source folder when run with `python app.py`. Windows-only helper — see
+    the MODELS_DIR comment below for why macOS can't use this."""
     if getattr(sys, "frozen", False):
-        exe_dir = os.path.dirname(sys.executable)
-        if sys.platform == "darwin":
-            probe = exe_dir
-            while probe and probe != os.path.dirname(probe):
-                if probe.endswith(".app"):
-                    return os.path.dirname(probe)
-                probe = os.path.dirname(probe)
-        return exe_dir
+        return os.path.dirname(sys.executable)
     return os.path.dirname(os.path.abspath(__file__))
 
 
-# Every downloaded model — whisper, SenseVoice + its VAD front-end, and the
-# local LLM — lives in one folder next to the app, alongside output/, so the
-# whole thing stays a single self-contained, movable folder rather than
-# splitting bulky downloads off into %LOCALAPPDATA%.
-MODELS_DIR = os.path.join(app_root(), "models")
-# funasr's downloader (modelscope) doesn't take a per-call cache location
-# the way huggingface_hub does — it only reads this env var, which needs to
-# be set before funasr is ever imported. Pointing it at app_root() (not
-# MODELS_DIR itself) is deliberate: modelscope always nests its own
-# "models" subfolder under whatever this points to, so this makes that
-# land at exactly MODELS_DIR, next to whisper's and the LLM's own
-# models--... folders instead of a separate nested copy.
-os.environ.setdefault("MODELSCOPE_CACHE", app_root())
-
-DEFAULT_OUTPUT_FOLDER = os.path.join(app_root(), "output")
+if sys.platform == "darwin":
+    # Every downloaded model — whisper, SenseVoice + its VAD front-end, and
+    # the local LLM — plus output/ would ideally live in one folder next to
+    # the app, same as Windows below. But a freshly downloaded, not-yet-moved
+    # .app runs under Gatekeeper's "App Translocation" from a read-only
+    # synthetic path (/private/var/.../AppTranslocation/<uuid>/d/), and even
+    # after being dragged into /Applications — the conventional next step —
+    # writing a sibling folder there needs admin rights a normal user
+    # doesn't have. Either way "next to the app" isn't reliably writable on
+    # macOS, so use the standard per-user Application Support folder
+    # instead — writable regardless of where the .app itself is running
+    # from, and the platform-conventional place for this kind of data.
+    MODELS_DIR = os.path.join(APP_DIR, "models")
+    os.environ.setdefault("MODELSCOPE_CACHE", APP_DIR)
+    DEFAULT_OUTPUT_FOLDER = os.path.join(APP_DIR, "output")
+else:
+    # Every downloaded model — whisper, SenseVoice + its VAD front-end, and
+    # the local LLM — lives in one folder next to the app, alongside
+    # output/, so the whole thing stays a single self-contained, movable
+    # folder rather than splitting bulky downloads off into %LOCALAPPDATA%.
+    MODELS_DIR = os.path.join(app_root(), "models")
+    # funasr's downloader (modelscope) doesn't take a per-call cache location
+    # the way huggingface_hub does — it only reads this env var, which needs
+    # to be set before funasr is ever imported. Pointing it at app_root()
+    # (not MODELS_DIR itself) is deliberate: modelscope always nests its own
+    # "models" subfolder under whatever this points to, so this makes that
+    # land at exactly MODELS_DIR, next to whisper's and the LLM's own
+    # models--... folders instead of a separate nested copy.
+    os.environ.setdefault("MODELSCOPE_CACHE", app_root())
+    DEFAULT_OUTPUT_FOLDER = os.path.join(app_root(), "output")
 
 # The output base is configurable (Settings tab) but defaults to the
 # self-contained output/ folder next to the app. It's module-level mutable

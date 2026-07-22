@@ -201,12 +201,11 @@ Everything that isn't part of a day-to-day workflow lives here:
 
 ## Folder layout
 
-Everything SOTA reads or writes lives in two folders next to the app itself
-(`SOTA.exe` on Windows, next to `SOTA.app` on macOS, or the source folder
-when run with `python app.py`) — the whole thing is self-contained and can
-be moved or backed up as one unit. (The `output` half can be pointed
-somewhere else entirely in the Settings tab; `models` always stays next to
-the app.)
+**Windows:** everything SOTA reads or writes lives in two folders next to
+`SOTA.exe` (or the source folder when run with `python app.py`) — the whole
+thing is self-contained and can be moved or backed up as one unit. (The
+`output` half can be pointed somewhere else entirely in the Settings tab;
+`models` always stays next to the app.)
 
 ```
 SOTA\
@@ -218,6 +217,14 @@ SOTA\
     Live Recordings\   the raw audio (.wav) captured by the Live
                        Transcription tab
 ```
+
+**macOS:** the same two folders live under `~/Library/Application
+Support/SOTA` instead of next to `SOTA.app`. A freshly downloaded, not-yet-
+moved `.app` runs from a read-only, Gatekeeper-randomized path ("App
+Translocation"), and even after being moved to `/Applications`, writing a
+folder next to the app needs admin rights a normal user doesn't have — the
+per-user Application Support folder is the one place that's reliably
+writable no matter where the app itself sits.
 
 ## Building the app
 
@@ -296,20 +303,20 @@ python app.py
 
 ## Troubleshooting
 
-- Downloaded models live in `models\` next to the app; transcripts and live
-  recordings live in `output\` next to the app (see **Folder layout**
-  above).
+- Downloaded models, transcripts, and live recordings live where **Folder
+  layout** above says: next to the app on Windows, under `~/Library/
+  Application Support/SOTA` on macOS.
 - Settings and the log file live in `%LOCALAPPDATA%\SOTA` on Windows and
   `~/Library/Application Support/SOTA` on macOS. If something goes wrong,
   check `sota.log` there (or use **Settings → Open log file**).
 - Deleting that folder — or clicking **Settings → Reset all settings** —
   resets your preferences (quality, language, window sizing, etc.) without
   touching any downloaded models or saved transcripts.
-- Upgrading from a version older than 1.2.0: any models already downloaded
-  to the old `%LOCALAPPDATA%\SOTA\models` location are copied automatically
-  into the new `models\` folder next to the app the first time you launch —
-  nothing needs to be re-downloaded. The old copy is left in place; delete
-  it by hand once you've confirmed everything works.
+- Upgrading from a version older than 1.2.0 on Windows: any models already
+  downloaded to the old `%LOCALAPPDATA%\SOTA\models` location are copied
+  automatically into the new `models\` folder next to the app the first
+  time you launch — nothing needs to be re-downloaded. The old copy is left
+  in place; delete it by hand once you've confirmed everything works.
 
 ## License
 
