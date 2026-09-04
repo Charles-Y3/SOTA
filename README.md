@@ -1,21 +1,46 @@
-# SOTA — Smart Offline Transcription Application
+# SOTA — Smart Offline Transcription & Audio
 
-**Version 1.2.2**
+**Version 2.0.0**
 
 Drop in audio files, click **Transcribe All**, and get a transcript for each
 file — saved as `.docx` if Microsoft Word is installed, otherwise `.txt`. Or
-dictate straight from your microphone in the **Live Transcription** tab.
-Everything runs locally on your computer — after the one-time model
-download(s), no internet is needed and no audio ever leaves your machine.
+dictate straight from your microphone in the **Live Transcription** tab. New
+in this version, the **Audio Studio** group lets you record, edit, and clean
+up audio entirely on its own — no transcript required. Everything runs
+locally on your computer — after the one-time model download(s), no internet
+is needed and no audio ever leaves your machine.
 
-## The five tabs
+## Two studios
 
-1. **Transcribe** — drop audio files in, get a transcript for each.
-2. **Live Transcription** — dictate from the microphone; auto-saves when you stop.
-3. **Edit & Export** — replay a file, fix the transcript, save a copy;
+- **Audio Studio** — record from the microphone, or open any audio file, and
+  edit/enhance/clean it up: cut/copy/paste, trim, split, undo/redo,
+  waveform or spectrogram view, loudness/tone/noise-reduction effects, save
+  your own reusable effect sequences, find & remove repeated segments,
+  detect sections and no-speech gaps, add labeled markers, and export as
+  WAV or MP3.
+- **Transcription Studio** — Transcribe / Live / Edit / AI: drop audio files
+  in for a batch transcript, dictate live via SenseVoice, replay a file and
+  fix its transcript, or run a local LLM over a transcript to
+  summarize/translate it.
+
+## The tabs
+
+**Audio Studio**
+
+1. **Record** — capture audio straight from the microphone.
+2. **Edit** — open any audio file (or a fresh recording) to cut, trim,
+   split, enhance, clean, and export it. Enhance/Clean/Find aren't separate
+   subtabs — they're collapsible panels inside Edit, so they always act on
+   the waveform already on screen.
+
+**Transcription Studio**
+
+3. **Transcribe** — drop audio files in, get a transcript for each.
+4. **Live Transcription** — dictate from the microphone; auto-saves when you stop.
+5. **Edit & Export** — replay a file, fix the transcript, save a copy;
    click a paragraph's timestamp to jump the playback there.
-4. **AI Summary & Translate** — summarize and/or translate a transcript with a local AI model.
-5. **Settings** — manage downloaded models, pick the output folder, check for updates.
+6. **AI Summary & Translate** — summarize and/or translate a transcript with a local AI model.
+7. **Settings** — manage downloaded models, pick the output folder, check for updates.
 
 ## Transcribe tab
 
@@ -114,6 +139,71 @@ The recording is written to its `.wav` file continuously while you speak
 (not held in memory until you press Stop), so sessions can run for hours
 without eating RAM — and even if the app or the PC dies mid-session,
 everything captured up to that moment is already on disk and playable.
+
+## Audio Studio
+
+A pair of tabs for working with audio on its own, independent of
+transcription.
+
+### Record tab
+
+Capture audio straight from the microphone, same device picker as Live
+Transcription. Stop and the recording opens directly in the Edit tab, ready
+to trim and clean up.
+
+### Edit tab
+
+1. Pick a file from the dropdown or **Open a file…** to load any audio.
+2. **Play / Pause / Stop**, scrub the timeline, zoom in/out (scroll on the
+   timeline to zoom in time; scroll on the vertical axis to zoom the
+   waveform's amplitude). Switch between **Waveform** and **Spectrogram**
+   view — the spectrogram shows frequency content over time instead of
+   amplitude, useful for spotting hum, hiss, or where speech actually sits
+   in the frequency range.
+3. Click and drag on the waveform to select a region, then:
+   - **Clipboard** — Cut / Copy / Paste, same shortcuts as any editor.
+   - **Structure** — Trim (keep only the selection), Split (cut the clip in
+     two at the playhead), Insert silence.
+   - **History & Search** — Undo / Redo, **Find similar…** (finds other
+     places in the recording that sound like your selection — filler
+     words, repeated phrases — so you can review and remove every
+     occurrence at once), **Add marker** (drops a labeled marker at the
+     current playhead; markers stay correctly positioned through cuts,
+     trims, and pastes, and are restored by undo/redo too).
+4. **Enhance** panel — loudness, tone, and noise controls, each with a live
+   preview before you commit:
+   - **✨ Auto Enhance** — a fixed one-click pass (high-pass filter →
+     compressor → peak normalize) that cleans up typical mic recordings in
+     one step. Always acts on your current selection, or the whole clip if
+     nothing's selected.
+   - **⚙ Configurations…** — save your own sequence of effects (any
+     combination of the individual controls below, in whatever order you
+     rank them, with "Shorten pauses" always running last since it's the
+     one step that changes the clip's length) and re-run it on any file
+     with one click. Manage saved sequences — run, rename, edit, delete —
+     from the same dialog.
+   - Individual controls: **Amplify**, **Normalize** (peak), **Loudness
+     (LUFS)** (targets a real perceived-loudness standard, like podcast/
+     streaming targets, rather than just peak level — capped so it can
+     never push the result into clipping), **High-pass** / **Low-pass**
+     filter, **EQ (1 kHz band)**, **Compressor**, and **Noise reduction**
+     (optionally tuned to a specific recording's own background noise via
+     **Get noise profile** — select a stretch of just the background noise
+     first, then it's used automatically).
+5. **Clean** panel — **Shorten pauses** longer than a chosen length, **Noise
+   gate** (mutes stretches below a volume threshold), **Remove clicks/pops**,
+   and **Detect sections** (adds a marker after every real break in the
+   audio) / **Detect no-speech** (finds stretches at least 1.5s long that
+   don't sound like speech — a cough or clap counts too, not just silence).
+6. **Export WAV** or **Export MP3** when you're done, or **Revert to
+   original** to discard every edit and start over. Any operation that
+   takes real time (loading a file, Auto Enhance, denoising, Find similar,
+   exporting) shows a progress dialog and blocks other buttons until it's
+   done, so it's never unclear whether the app is still working.
+
+Recordings, exports, and protected original copies (used by **Revert to
+original**) are saved under `output\Audio Studio` — see **Folder layout**
+below.
 
 ## Edit & Export tab
 
@@ -216,6 +306,11 @@ SOTA\
                        edited copies, and AI summaries/translations
     Live Recordings\   the raw audio (.wav) captured by the Live
                        Transcription tab
+    Audio Studio\      Audio Studio's own files
+      Recordings\      audio captured by the Record tab
+      Originals\       protected original copies, so "Revert to original"
+                       always works no matter how much editing has happened
+      Exports\         WAV/MP3 files exported from the Edit tab
 ```
 
 **macOS:** the same two folders live under `~/Library/Application
@@ -233,9 +328,11 @@ the app (in the same folder as `SOTA.exe` on Windows, next to `SOTA.app` on
 macOS), so it always ships with the release.
 
 Note: since v1.2.0 the build bundles PyTorch and FunASR (for the SenseVoice
-engine) alongside the existing dependencies, so both the build itself and
-the resulting `dist\SOTA` folder are noticeably larger and slower to
-produce than earlier versions.
+engine) alongside the existing dependencies, and since v2.0.0 it also
+bundles Audio Studio's DSP dependencies (scipy, noisereduce, DeepFilterNet,
+pyloudnorm, Pillow, lameenc) — so both the build itself and the resulting
+`dist\SOTA` folder are noticeably larger and slower to produce than earlier
+versions.
 
 ### Locally
 
@@ -259,11 +356,11 @@ macOS `.app`.
   **Run workflow**. When it finishes, download `SOTA-windows` and
   `SOTA-macOS` from the run's **Artifacts** section.
 - **Automatically**: every push to `main` builds both platforms.
-- **Releases**: pushing a tag like `v1.2.0` also publishes a GitHub Release
+- **Releases**: pushing a tag like `v2.0.0` also publishes a GitHub Release
   with both zips attached:
   ```
-  git tag v1.2.0
-  git push origin v1.2.0
+  git tag v2.0.0
+  git push origin v2.0.0
   ```
 
 ### Running the unsigned macOS build
@@ -357,8 +454,19 @@ work, run locally instead of through a cloud API:
   models directly from their original publishers.
 - **[PyTorch](https://github.com/pytorch/pytorch)** — runs the SenseVoice
   and voice-activity models (CPU only).
-- **[NumPy](https://numpy.org/)** — the WSOLA time-stretching used by the
-  variable-speed player.
+- **[NumPy](https://numpy.org/)** / **[SciPy](https://scipy.org/)** — the
+  WSOLA time-stretching used by the variable-speed player, and Audio
+  Studio's filters, resampling, and spectrogram computation.
+- **[DeepFilterNet](https://github.com/Rikorose/DeepFilterNet)** /
+  **[noisereduce](https://github.com/timsainb/noisereduce)** — Audio
+  Studio's noise reduction (DeepFilterNet when available, noisereduce's
+  spectral gating as a fallback).
+- **[pyloudnorm](https://github.com/csteinmetz1/pyloudnorm)** — Audio
+  Studio's LUFS loudness normalization.
+- **[lameenc](https://github.com/chrisstaite/lameenc)** — Audio Studio's
+  MP3 export.
+- **[Pillow](https://python-pillow.org/)** — Audio Studio's spectrogram
+  rendering.
 - **[PyInstaller](https://github.com/pyinstaller/pyinstaller)** — packaging
   the Windows and macOS builds.
 
