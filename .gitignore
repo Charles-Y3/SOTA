@@ -11,3 +11,6 @@ models/
 *.zip
 build_log.txt
 .claude/
+# huggingface_hub's file-locking artifacts (empty .lock files created
+# next to whatever it downloads) — runtime-only, not project content.
+.lock/

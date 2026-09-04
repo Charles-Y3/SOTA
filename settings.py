@@ -5,7 +5,7 @@ import os
 import sys
 import traceback
 
-APP_VERSION = "1.2.2"
+APP_VERSION = "2.0.0"
 
 
 def _default_app_dir():
@@ -94,6 +94,29 @@ def transcriptions_folder():
 
 def live_recordings_folder():
     return os.path.join(_output_base, "Live Recordings")
+
+
+# Audio Studio's own recordings/originals live under one "Audio Studio"
+# subfolder, parallel to Transcriptions/Live Recordings above — a
+# different kind of output again (raw/edited audio, not transcripts).
+def audio_studio_folder():
+    return os.path.join(_output_base, "Audio Studio")
+
+
+def audio_recordings_folder():
+    return os.path.join(audio_studio_folder(), "Recordings")
+
+
+def audio_originals_folder():
+    """Protected copies of whatever's opened into Audio Studio's Edit
+    subtab — never overwritten once written, so "Revert to Original"
+    always works no matter how much editing has happened since. See
+    audio_clip.AudioClip.load."""
+    return os.path.join(audio_studio_folder(), "Originals")
+
+
+def audio_exports_folder():
+    return os.path.join(audio_studio_folder(), "Exports")
 
 
 DEFAULTS = {

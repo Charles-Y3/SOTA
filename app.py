@@ -1,16 +1,18 @@
-"""SOTA — Smart Offline Transcription Application.
+"""Smart Offline Transcription & Audio (internal codename: SOTA).
 
-Four tabs:
-  • Transcribe — drop audio files in, click Transcribe All, get a transcript
-    each (.docx when Word is installed, .txt otherwise).
-  • Live Transcription — dictate from the microphone via SenseVoice
-    (English/Mandarin/Cantonese/Japanese/Korean only); auto-saves on Stop.
-  • Edit & Export — replay a file (adjustable speed), fix the transcript,
-    save a copy.
-  • AI Summary & Translate — run a local LLM over a transcript to summarize
-    and/or translate it, streaming into an editable panel.
+Three top-level tab groups:
+  • Audio Studio — Record / Edit / Clean: capture and edit audio on its
+    own, independent of transcription. Enhance (amplify/EQ/compressor/
+    noise reduction) isn't a separate subtab — it's a collapsible panel
+    inside Edit, so it always acts on the waveform already on screen.
+  • Transcription Studio — Transcribe / Live / Edit / AI: drop audio
+    files in for a batch transcript, dictate live via SenseVoice, replay
+    a file and fix its transcript, or run a local LLM over a transcript
+    to summarize/translate it.
+  • Settings — models, output folder, updates.
 """
 
+import math
 import os
 import queue
 import shutil
@@ -19,11 +21,22 @@ import sys
 import threading
 import webbrowser
 import tkinter as tk
-from tkinter import filedialog, messagebox
+from tkinter import filedialog, messagebox, simpledialog
 
 import customtkinter as ctk
+from PIL import ImageTk
+import numpy as np
 from tkinterdnd2 import DND_FILES, TkinterDnD
 
+import audio_clean
+import audio_clip
+import audio_denoise
+import audio_dsp
+import audio_export
+import audio_find
+import audio_profiles
+import audio_spectrogram
+import audio_record
 import docx_export
 import i18n
 import live_transcription
@@ -128,6 +141,58 @@ def _speed_label(speed):
     return (f"{speed:g}×")
 
 
+class _Tooltip:
+    """Minimal hover tooltip: a borderless Toplevel with one label, shown
+    near the cursor on <Enter> and destroyed on <Leave>. CustomTkinter has
+    no built-in tooltip widget, so this is deliberately tiny rather than
+    pulling in a dependency for it. `text_getter` is called fresh on every
+    show — pass a callable (not a plain string) so the tooltip always
+    reflects the current UI language/values instead of whatever they were
+    when the widget was built."""
+
+    def __init__(self, widget, text_getter):
+        self.widget = widget
+        self.text_getter = text_getter
+        self.tip = None
+        # A CTkButton's outer frame is fully covered by its own internal
+        # canvas (where the rounded rect + text are actually drawn), so
+        # <Enter>/<Leave> for a real mouse never reach the frame itself —
+        # Tk delivers them to whichever widget the pointer is actually
+        # over, which is that inner canvas. Binding there instead (same
+        # "reach into the real widget" approach already used elsewhere in
+        # this app, e.g. the Edit tab's `editor._textbox`) is what makes
+        # this actually fire; binding on `widget` alone silently never
+        # does for a CTkButton, only for a plain Tk widget like a Canvas.
+        target = getattr(widget, "_canvas", widget)
+        target.bind("<Enter>", self._show, add="+")
+        target.bind("<Leave>", self._hide, add="+")
+        target.bind("<ButtonPress>", self._hide, add="+")
+
+    def _show(self, _event=None):
+        text = self.text_getter() if callable(self.text_getter) else self.text_getter
+        if not text:
+            return
+        self._hide()
+        self.tip = tk.Toplevel(self.widget)
+        self.tip.wm_overrideredirect(True)
+        try:
+            self.tip.wm_attributes("-topmost", True)
+        except Exception:
+            pass
+        x = self.widget.winfo_rootx() + 8
+        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 6
+        self.tip.wm_geometry(f"+{x}+{y}")
+        tk.Label(
+            self.tip, text=text, justify="left", background="#333333", foreground="white",
+            relief="solid", borderwidth=1, wraplength=320, padx=6, pady=3,
+        ).pack()
+
+    def _hide(self, _event=None):
+        if self.tip is not None:
+            self.tip.destroy()
+            self.tip = None
+
+
 class App(ctk.CTk, TkinterDnD.DnDWrapper):
     def __init__(self):
         super().__init__()
@@ -157,6 +222,52 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         self.status_key = None
         self.status_detail = None
         self.current_tab = 0
+        self.current_group = 0
+        self._group_last_leaf = {}   # group index -> last leaf shown there
+
+        # Audio Studio state — Record/Edit/Enhance/Clean all operate on
+        # one clip at a time, so this lives at the App level rather than
+        # per-subtab. A dedicated Player instance (not the Transcription
+        # Studio Edit tab's self.player below) so the two can never
+        # interfere with each other's playback.
+        self.audio_recorder = None
+        self.audio_recording = False
+        self.audio_record_status_key = None
+        self.audio_record_status_detail = None
+        self._last_recording_path = None
+        self.audio_player = Player(
+            ready_callback=lambda: self.events.put(("audio_speed_ready",)),
+            progress_callback=lambda speed, frac: None,
+        )
+        self.audio_clip = None            # audio_clip.AudioClip currently open, or None
+        self.audio_clip_path = None       # source path it was opened from
+        self.audio_selection = None       # (start_s, end_s) or None
+        self._find_cancel_event = None    # threading.Event for the in-progress Find Similar search, or None
+        self._find_progress_dialog = None
+        self._find_min_score = 0.80        # Matches panel's display filter — persists across searches, not reset per-search
+        self._busy_dialog = None          # generic "please wait" modal (see _show_busy_dialog) — None when not showing
+        self._busy_bar = None
+        self.aenh_configs = audio_profiles.load_profiles()  # user-saved Enhance configurations (see audio_profiles.py)
+        self.audio_clipboard = None       # numpy buffer from the last Copy/Cut
+        self.audio_zoom = (0.0, 0.0)      # visible (start_s, end_s) window on the waveform
+        self.audio_vzoom = 1.0            # amplitude scale for the waveform display — 1.0 is unscaled
+        self.audio_status_key = None
+        self.audio_status_detail = None
+        # Set only while an Enhance/Clean Preview is playing: the full
+        # clip buffer with the previewed effect spliced into the selected
+        # (or whole-clip) region, purely for waveform display — never
+        # written back to audio_clip until Apply is clicked.
+        self.audio_preview = None
+        self.audio_noise_profile = None  # captured noise-only snippet for Enhance's noise-profile denoise
+        self.wave_view_mode = "waveform"  # or "spectrogram" — see _on_wave_view_change
+        self._spectrogram_photo = None    # keeps the PhotoImage alive; Tk drops it otherwise
+        self._wave_content_cache_key = None  # see _redraw_waveform's caching
+        self._preview_range_samples = (0, 0)  # composite-space sample range the amber tint covers
+        self._preview_offset_s = 0.0  # clip-time offset of an isolated selection preview's own t=0
+        self._play_until = None       # clip-time stop point for a selection-limited Play
+        self._playhead_item = None    # canvas line item id — moved, not recreated, on every tick
+        self.active_effects_panel = None  # "enhance" | "clean" | None — mutually exclusive
+        self._tooltips = []  # keeps _Tooltip instances alive (see _add_tooltip)
 
         # Live Transcription tab state
         self.live_worker = None
@@ -216,6 +327,30 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         self.drop_target_register(DND_FILES)
         self.dnd_bind("<<Drop>>", self._on_drop)
 
+        # Audio Studio Edit-subtab keyboard shortcuts — all gated the same
+        # way by _guarded_shortcut (only act on that tab, never while a
+        # text field elsewhere has focus). Ctrl+Z/X/C/V etc. still work
+        # normally in a CTkEntry (the Record tab's filename field, say)
+        # since the guard returns None instead of "break" there, leaving
+        # Tk's own default binding for that widget untouched.
+        for _seq, _handler in [
+            ("<space>", self._toggle_audio_edit_play),
+            ("<Control-z>", self._audio_edit_undo),
+            ("<Control-y>", self._audio_edit_redo),
+            ("<Control-x>", self._audio_edit_cut),
+            ("<Control-c>", self._audio_edit_copy),
+            ("<Control-v>", self._audio_edit_paste),
+            ("<Delete>", self._audio_edit_delete),
+            ("<BackSpace>", self._audio_edit_delete),
+            ("<bracketleft>", lambda: self._zoom_audio_edit(2.0)),
+            ("<bracketright>", lambda: self._zoom_audio_edit(0.5)),
+            ("<Control-f>", self._run_find_similar),
+            ("<Home>", lambda: self._seek_audio_edit_to(0.0)),
+            ("<End>", lambda: self._seek_audio_edit_to(
+                self.audio_clip.duration if self.audio_clip else 0.0)),
+            ("<Control-s>", lambda: self._export_audio_clip("wav")),
+        ]:
+            self.bind_all(_seq, self._guarded_shortcut(_handler))
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(POLL_MS, self._poll_events)
         self.after(TICK_MS, self._tick_player)
@@ -249,7 +384,7 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
 
     def _build_ui(self):
         self.grid_columnconfigure(0, weight=1)
-        self.grid_rowconfigure(1, weight=1)
+        self.grid_rowconfigure(2, weight=1)  # row 1 is the subtab strip, fixed height
 
         # --- top bar: tabs (left, scrollable) + UI language toggle (right)
         topbar = ctk.CTkFrame(self, fg_color="transparent")
@@ -290,10 +425,10 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         self._tab_bar_window = self.tab_canvas.create_window(
             (0, 0), window=self.tab_bar, anchor="nw")
         self.tab_buttons = []
-        for i in range(len(self.TAB_KEYS)):
+        for i in range(len(self.GROUP_KEYS)):
             btn = ctk.CTkButton(
                 self.tab_bar, text="", height=32, corner_radius=6,
-                border_spacing=0, command=lambda idx=i: self._show_tab(idx),
+                border_spacing=0, command=lambda idx=i: self._show_group(idx),
             )
             # No uniform width group: each tab is sized to its own label in
             # _retranslate() instead — narrower in aggregate than forcing
@@ -327,33 +462,3015 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         self.tab_canvas.bind("<Configure>", self._on_tab_canvas_resize)
         self.tab_bar.bind("<Configure>", self._on_tab_bar_resize)
 
-        # --- content area holds both tab frames in the same cell
+        # --- second row: the active group's own subtab strip (Audio
+        # Studio and Transcription Studio each have one; AI and Settings
+        # don't, so nothing shows for those). Reuses the generic
+        # scrollable-strip helper built for the AI tab's own overflowing
+        # action row rather than a second bespoke Canvas — one wrapper
+        # frame per group-with-subtabs, stacked in the same grid cell and
+        # shown/hidden by _show_tab, the same "only the active one is
+        # gridded" pattern self.content uses below for the leaf frames.
+        self.subtab_bar_row = ctk.CTkFrame(self, fg_color="transparent")
+        self.subtab_bar_row.grid(row=1, column=0, sticky="ew", padx=12, pady=(6, 0))
+        self.subtab_bar_row.grid_columnconfigure(0, weight=1)
+        self.subtab_strips = {}  # group index -> (content, canvas, left_btn, right_btn, [buttons])
+        for group_index, leaves in enumerate(self.GROUP_LEAVES):
+            if len(leaves) < 2:
+                continue  # no subtabs for this group — it has one leaf
+            content, canvas, left_btn, right_btn = self._make_scroll_strip(
+                self.subtab_bar_row, row=0, column=0, fg_color="transparent")
+            buttons = []
+            for slot, leaf in enumerate(leaves):
+                btn = ctk.CTkButton(
+                    content, text="", height=28, corner_radius=6,
+                    border_spacing=0, fg_color="transparent",
+                    command=lambda lf=leaf: self._show_tab(lf))
+                btn.grid(row=0, column=slot, sticky="ew", padx=(0 if slot == 0 else 6, 0))
+                buttons.append(btn)
+            self._finalize_scroll_strip(canvas, content, left_btn, right_btn)
+            self.subtab_strips[group_index] = (content, canvas, left_btn, right_btn, buttons)
+
+        # --- content area holds every leaf tab's frame in the same cell
         self.content = ctk.CTkFrame(self, fg_color="transparent")
-        self.content.grid(row=1, column=0, sticky="nsew")
+        self.content.grid(row=2, column=0, sticky="nsew")
         self.content.grid_columnconfigure(0, weight=1)
         self.content.grid_rowconfigure(0, weight=1)
 
+        self.audio_record_frame = ctk.CTkFrame(self.content, fg_color="transparent")
+        self.audio_edit_frame = ctk.CTkFrame(self.content, fg_color="transparent")
         self.transcribe_frame = ctk.CTkFrame(self.content, fg_color="transparent")
         self.live_frame = ctk.CTkFrame(self.content, fg_color="transparent")
         self.edit_frame = ctk.CTkFrame(self.content, fg_color="transparent")
         self.llm_frame = ctk.CTkFrame(self.content, fg_color="transparent")
         self.settings_frame = ctk.CTkFrame(self.content, fg_color="transparent")
-        # Only the Transcribe tab is gridded up front. All four occupy the
+        # Only the first leaf is gridded up front. Every leaf occupies the
         # same cell, and Tk stacks later-gridded widgets on top — gridding
-        # all four here (as before) put the AI tab (gridded last) on top
-        # of the stack from the very first paint, until _show_tab(0) later
-        # sorted it out. That's a no-op on a fast dev machine, but left a
-        # real window on a slower one (e.g. a packaged .exe) where the
-        # wrong tab could actually be what gets painted first. _show_tab()
-        # grids whichever tab is active, so the other three never need to be
-        # gridded here at all.
-        self.transcribe_frame.grid(row=0, column=0, sticky="nsew")
+        # them all here would put the last one built on top of the stack
+        # from the very first paint, until _show_tab(0) later sorted it
+        # out. That's a no-op on a fast dev machine, but left a real
+        # window on a slower one (e.g. a packaged .exe) where the wrong
+        # tab could actually be what gets painted first. _show_tab() grids
+        # whichever leaf is active, so the rest never need to be gridded
+        # here at all.
+        self.audio_record_frame.grid(row=0, column=0, sticky="nsew")
 
+        self._build_audio_record_tab(self.audio_record_frame)
+        self._build_audio_edit_tab(self.audio_edit_frame)
         self._build_transcribe_tab(self.transcribe_frame)
         self._build_live_tab(self.live_frame)
         self._build_edit_tab(self.edit_frame)
         self._build_llm_tab(self.llm_frame)
         self._build_settings_tab(self.settings_frame)
+
+    def _add_tooltip(self, widget, text_getter):
+        self._tooltips.append(_Tooltip(widget, text_getter))
+
+    def _add_tooltip_to_segmented(self, segmented_button, text_getter):
+        """A CTkSegmentedButton's individual segments are their own
+        button widgets sitting on top of the container's own canvas
+        (same _buttons_dict this app already reaches into for
+        _equalize_segments) — a tooltip on the container alone would
+        never fire since the segments cover it completely."""
+        self._add_tooltip(segmented_button, text_getter)
+        for btn in segmented_button._buttons_dict.values():
+            self._add_tooltip(btn, text_getter)
+
+    # ================================================== audio studio: record
+
+    def _build_audio_record_tab(self, parent):
+        parent.grid_columnconfigure(0, weight=1)
+        parent.grid_rowconfigure(3, weight=1)  # the live waveform canvas
+
+        options = ctk.CTkFrame(parent)
+        options.grid(row=0, column=0, sticky="ew", padx=12, pady=(8, 6))
+        options.grid_columnconfigure(7, weight=1)
+
+        self.arec_mic_label = ctk.CTkLabel(options, text="")
+        self.arec_mic_label.grid(row=0, column=0, padx=(12, 6), pady=(10, 4))
+        self.arec_mic_menu = ctk.CTkOptionMenu(
+            options, width=220, dynamic_resizing=False, command=self._on_arec_pref_change)
+        self.arec_mic_menu.grid(row=0, column=1, sticky="w", padx=(0, 16), pady=(10, 4))
+
+        self.arec_rate_label = ctk.CTkLabel(options, text="")
+        self.arec_rate_label.grid(row=0, column=2, padx=(0, 6), pady=(10, 4))
+        self.arec_rate_menu = ctk.CTkOptionMenu(
+            options, width=90, values=[str(r) for r in audio_record.SAMPLE_RATE_OPTIONS])
+        self.arec_rate_menu.set(str(audio_record.DEFAULT_SAMPLE_RATE))
+        self.arec_rate_menu.grid(row=0, column=3, padx=(0, 16), pady=(10, 4))
+
+        self.arec_channels_label = ctk.CTkLabel(options, text="")
+        self.arec_channels_label.grid(row=0, column=4, padx=(0, 6), pady=(10, 4))
+        self.arec_channels_menu = ctk.CTkOptionMenu(options, width=64, values=["1", "2"])
+        self.arec_channels_menu.set("1")
+        self.arec_channels_menu.grid(row=0, column=5, padx=(0, 16), pady=(10, 4))
+
+        self.arec_level_label = ctk.CTkLabel(options, text="")
+        self.arec_level_label.grid(row=0, column=6, padx=(0, 6), pady=(10, 4))
+        self.arec_level_bar = ctk.CTkProgressBar(options, width=90)
+        self.arec_level_bar.set(0)
+        self.arec_level_bar.grid(row=0, column=7, sticky="w", padx=(0, 12), pady=(10, 4))
+
+        self.arec_filename_label = ctk.CTkLabel(options, text="")
+        self.arec_filename_label.grid(row=1, column=0, padx=(12, 6), pady=(4, 10))
+        self.arec_filename_entry = ctk.CTkEntry(options, width=440)
+        self.arec_filename_entry.grid(row=1, column=1, columnspan=5, sticky="w",
+                                      padx=(0, 16), pady=(4, 10))
+
+        self.arec_timer_label = ctk.CTkLabel(
+            parent, text="00:00", font=ctk.CTkFont(size=32, weight="bold"))
+        self.arec_timer_label.grid(row=1, column=0, pady=(24, 8))
+
+        controls = ctk.CTkFrame(parent, fg_color="transparent")
+        controls.grid(row=2, column=0, pady=(0, 12))
+        self.arec_start_button = ctk.CTkButton(
+            controls, text="", height=40, width=150,
+            font=ctk.CTkFont(size=14, weight="bold"), command=self._toggle_audio_record)
+        self.arec_start_button.grid(row=0, column=0, padx=(0, 8))
+        self.arec_pause_button = ctk.CTkButton(
+            controls, text="", height=40, width=110, fg_color="transparent",
+            text_color=self.OUTLINE_BUTTON_TEXT, border_width=1,
+            state="disabled", command=self._toggle_audio_record_pause)
+        self.arec_pause_button.grid(row=0, column=1, padx=(0, 8))
+        self.arec_stop_button = ctk.CTkButton(
+            controls, text="", height=40, width=110, fg_color="#8a3535",
+            hover_color="#a04040", state="disabled", command=self._stop_audio_record)
+        self.arec_stop_button.grid(row=0, column=2)
+
+        # Live waveform — grows as the recording proceeds, drawn from
+        # AudioRecorder.peaks_snapshot() (updated by _tick_player while
+        # this subtab is on screen and a recording is in progress).
+        self.arec_wave_canvas = tk.Canvas(parent, height=140, highlightthickness=0, bd=0)
+        self.arec_wave_canvas.grid(row=3, column=0, sticky="nsew", padx=12, pady=(0, 6))
+        self.arec_wave_canvas.bind("<Configure>", lambda _e: self._redraw_record_waveform())
+
+        bottom = ctk.CTkFrame(parent, fg_color="transparent")
+        bottom.grid(row=4, column=0, sticky="sew", padx=12, pady=(0, 8))
+        bottom.grid_columnconfigure(2, weight=1)
+        self.arec_edit_button = ctk.CTkButton(
+            bottom, text="", height=32, state="disabled",
+            command=self._send_last_recording_to_edit)
+        self.arec_edit_button.grid(row=0, column=0, padx=(0, 10))
+        self.arec_open_folder_button = ctk.CTkButton(
+            bottom, text="", height=32, width=150, fg_color="transparent",
+            text_color=self.OUTLINE_BUTTON_TEXT, border_width=1,
+            command=lambda: self._open_output_folder(settings.audio_recordings_folder()))
+        self.arec_open_folder_button.grid(row=0, column=1, padx=(0, 10))
+        self.arec_status_line = ctk.CTkLabel(bottom, text="", anchor="w", text_color=self.MUTED_TEXT)
+        self.arec_status_line.grid(row=0, column=2, sticky="ew")
+
+    def _refresh_audio_record_mic_menu(self):
+        names = audio_record.list_input_devices()
+        default_label = i18n.t(self.ui_lang, "mic_default")
+        current = getattr(self, "_arec_selected_mic", "")
+        self.arec_mic_menu.configure(values=[default_label] + names)
+        self.arec_mic_menu.set(current if current in names else default_label)
+
+    def _on_arec_pref_change(self, _value=None):
+        default_label = i18n.t(self.ui_lang, "mic_default")
+        mic_value = self.arec_mic_menu.get()
+        self._arec_selected_mic = "" if mic_value == default_label else mic_value
+
+    def _toggle_audio_record(self):
+        if not self.audio_recording:
+            self._start_audio_record()
+
+    def _start_audio_record(self):
+        self._on_arec_pref_change()
+        custom = self.arec_filename_entry.get().strip()
+        error_key = _validate_live_filename(custom)
+        if error_key:
+            self._set_audio_record_status(error_key, {})
+            return
+        self.audio_recorder = audio_record.AudioRecorder(
+            self.events, device_name=self._arec_selected_mic,
+            sample_rate=int(self.arec_rate_menu.get()),
+            channels=int(self.arec_channels_menu.get()),
+            custom_stem=custom or None)
+        self.audio_recording = True
+        self.arec_start_button.configure(state="disabled")
+        self.arec_pause_button.configure(state="normal", text=i18n.t(self.ui_lang, "arec_pause"))
+        self.arec_stop_button.configure(state="normal")
+        for w in (self.arec_mic_menu, self.arec_rate_menu, self.arec_channels_menu,
+                  self.arec_filename_entry):
+            w.configure(state="disabled")
+        self._set_audio_record_status("arec_status_recording", {})
+        self.audio_recorder.start()
+
+    def _toggle_audio_record_pause(self):
+        if not self.audio_recorder:
+            return
+        if self.audio_recorder.is_paused:
+            self.audio_recorder.resume()
+            self.arec_pause_button.configure(text=i18n.t(self.ui_lang, "arec_pause"))
+            self._set_audio_record_status("arec_status_recording", {})
+        else:
+            self.audio_recorder.pause()
+            self.arec_pause_button.configure(text=i18n.t(self.ui_lang, "arec_resume"))
+            self._set_audio_record_status("arec_status_paused", {})
+
+    def _stop_audio_record(self):
+        if self.audio_recorder:
+            self.audio_recorder.stop()
+        self.arec_stop_button.configure(state="disabled")
+        self.arec_pause_button.configure(state="disabled")
+
+    def _on_audio_record_event(self, kind, *rest):
+        if kind == "record_stopped":
+            path, _seconds = rest
+            self.audio_recording = False
+            self.audio_recorder = None
+            self.arec_start_button.configure(state="normal")
+            for w in (self.arec_mic_menu, self.arec_rate_menu, self.arec_channels_menu,
+                      self.arec_filename_entry):
+                w.configure(state="normal")
+            self.arec_filename_entry.delete(0, "end")
+            if path:
+                self._last_recording_path = path
+                self.arec_edit_button.configure(state="normal")
+                self._set_audio_record_status("arec_status_saved", {"path": os.path.basename(path)})
+            else:
+                self._set_audio_record_status("arec_status_failed", {})
+        # "record_started" needs no UI update beyond what _start_audio_record
+        # already did — it exists so the worker thread has an event to
+        # confirm the file was actually created before anything else reads
+        # self._last_recording_path.
+
+    def _set_audio_record_status(self, key, detail):
+        self.audio_record_status_key, self.audio_record_status_detail = key, detail
+        self.arec_status_line.configure(text=i18n.t(self.ui_lang, key, **detail))
+
+    def _send_last_recording_to_edit(self):
+        path = self._last_recording_path
+        if not path or not os.path.isfile(path):
+            return
+        self._open_audio_clip(path)
+        self._show_tab(self.LEAF_AUDIO_EDIT)
+
+    def _redraw_record_waveform(self):
+        """Draws the whole recording so far, scaled to fit the canvas
+        width — unlike the Edit subtab's waveform, there's no zoom/scroll
+        here, just "the shape of everything captured up to now"."""
+        canvas = self.arec_wave_canvas
+        canvas.delete("all")
+        canvas.configure(bg=self._resolve_root_bg())
+        if self.audio_recorder is None:
+            return
+        mins, maxes = self.audio_recorder.peaks_snapshot()
+        if not mins:
+            return
+        width = max(1, canvas.winfo_width())
+        height = max(1, canvas.winfo_height())
+        mid = height / 2
+        n = len(mins)
+        color = "#e05a5a" if not self.audio_recorder.is_paused else "#d99a30"
+        for x in range(width):
+            # Right-aligned: the most recent audio always sits at the
+            # right edge, same as a live level meter or scrolling EKG —
+            # so the canvas doesn't need its own zoom/scroll controls for
+            # the one thing anyone actually wants from it (is it hearing
+            # something right now).
+            src_i = n - width + x
+            if src_i < 0:
+                continue
+            y0 = mid - maxes[src_i] * mid
+            y1 = mid - mins[src_i] * mid
+            canvas.create_line(x, y0, x, y1 + 1, fill=color)
+
+    # ==================================================== audio studio: edit
+
+    def _build_button_group(self, parent, col, caption_key, buttons):
+        """One card of edit-action buttons (e.g. Clipboard: Cut/Copy/
+        Paste) — grouped visually via the card border, named via a
+        hover tooltip on the card itself rather than a permanent caption
+        label underneath (which cost a whole extra row of height for
+        text that's rarely the first thing anyone needs)."""
+        card = ctk.CTkFrame(parent)
+        card.grid(row=0, column=col, sticky="w", padx=(0, 8))
+        self._add_tooltip(card, lambda k=caption_key: i18n.t(self.ui_lang, k))
+        row = ctk.CTkFrame(card, fg_color="transparent")
+        row.grid(row=0, column=0, padx=8, pady=6)
+        for i, (attr, cmd, tip_key) in enumerate(buttons):
+            btn = ctk.CTkButton(
+                row, text="", width=100, height=30, fg_color="transparent",
+                text_color=self.OUTLINE_BUTTON_TEXT, border_width=1, command=cmd)
+            btn.grid(row=0, column=i, padx=(0 if i == 0 else 6, 0))
+            setattr(self, attr, btn)
+            if tip_key == "aedit_tip_silence":
+                self._add_tooltip(btn, lambda k=tip_key: i18n.t(
+                    self.ui_lang, k, seconds=self.INSERT_SILENCE_S))
+            elif tip_key == "aedit_tip_detect_silence":
+                self._add_tooltip(btn, lambda k=tip_key: i18n.t(
+                    self.ui_lang, k, min_gap=audio_clean.DEFAULT_MIN_SILENCE_S))
+            elif tip_key:
+                self._add_tooltip(btn, lambda k=tip_key: i18n.t(self.ui_lang, k))
+        return card
+
+    def _build_audio_edit_tab(self, parent):
+        parent.grid_columnconfigure(0, weight=1)
+        parent.grid_rowconfigure(3, weight=1)  # the wave area (contains the waveform canvas)
+
+        picker = ctk.CTkFrame(parent)
+        picker.grid(row=0, column=0, sticky="ew", padx=12, pady=(8, 6))
+        picker.grid_columnconfigure(2, weight=1)
+        self.aedit_open_button = ctk.CTkButton(
+            picker, text="", width=130, command=self._open_audio_clip_dialog)
+        self.aedit_open_button.grid(row=0, column=0, padx=(10, 8), pady=10)
+        self.aedit_file_label = ctk.CTkLabel(picker, text="", anchor="w", text_color=self.MUTED_TEXT)
+        self.aedit_file_label.grid(row=0, column=1, sticky="w", padx=(0, 10), pady=10)
+        # Separate from aedit_file_label (rather than one colored string)
+        # so "unsaved changes" can actually be red — a CTkLabel can't mix
+        # two text colors in one string — while still sharing the same
+        # row instead of costing its own strip of height.
+        self.aedit_dirty_label = ctk.CTkLabel(picker, text="", anchor="w", text_color="#e05a5a")
+        self.aedit_dirty_label.grid(row=0, column=2, sticky="w", pady=10)
+
+        transport = ctk.CTkFrame(parent)
+        transport.grid(row=1, column=0, sticky="ew", padx=12, pady=6)
+        self.aedit_play_button = ctk.CTkButton(
+            transport, text="", width=90, command=self._toggle_audio_edit_play)
+        self.aedit_play_button.grid(row=0, column=0, padx=(10, 6), pady=8)
+        self.aedit_stop_button = ctk.CTkButton(
+            transport, text="", width=90, fg_color="transparent", border_width=1,
+            text_color=self.OUTLINE_BUTTON_TEXT, command=self._stop_audio_edit_play)
+        self.aedit_stop_button.grid(row=0, column=1, padx=(0, 12), pady=8)
+        self.aedit_time_label = ctk.CTkLabel(transport, text="00:00 / 00:00", width=110)
+        self.aedit_time_label.grid(row=0, column=2, padx=(0, 8), pady=8)
+        self.aedit_speed_menu = ctk.CTkOptionMenu(
+            transport, width=80, values=[_speed_label(s) for s in SPEED_OPTIONS],
+            command=self._on_audio_edit_speed_change)
+        self.aedit_speed_menu.set(_speed_label(1.0))
+        self.aedit_speed_menu.grid(row=0, column=3, padx=(0, 16), pady=8)
+        self.aedit_zoom_out_button = ctk.CTkButton(
+            transport, text="−", width=30, command=lambda: self._zoom_audio_edit(2.0))
+        self.aedit_zoom_out_button.grid(row=0, column=4, padx=(0, 2), pady=8)
+        self.aedit_zoom_fit_button = ctk.CTkButton(
+            transport, text="", width=60, command=self._zoom_audio_edit_fit)
+        self.aedit_zoom_fit_button.grid(row=0, column=5, padx=2, pady=8)
+        self.aedit_zoom_in_button = ctk.CTkButton(
+            transport, text="+", width=30, command=lambda: self._zoom_audio_edit(0.5))
+        self.aedit_zoom_in_button.grid(row=0, column=6, padx=(2, 10), pady=8)
+        self.aedit_view_toggle = ctk.CTkSegmentedButton(
+            transport, values=["Waveform", "Spectrogram"], command=self._on_wave_view_change)
+        self.aedit_view_toggle.grid(row=0, column=7, padx=(0, 10), pady=8)
+        # Not tooltip-bound here — configure(values=...) in retranslate
+        # (called once right after this, during __init__) destroys and
+        # recreates these segments regardless, which would silently
+        # orphan a binding made now. See the retranslate call site.
+        transport.grid_columnconfigure(8, weight=1)
+        self.aedit_selection_label = ctk.CTkLabel(
+            transport, text="", anchor="e", text_color=self.MUTED_TEXT)
+        self.aedit_selection_label.grid(row=0, column=8, sticky="e", padx=(0, 12), pady=8)
+        # Only shown in Spectrogram mode (see _update_spectrogram_caption)
+        # — the toggle's own hover tooltip explains the two view modes,
+        # but a tooltip is easy to miss entirely; someone who's never used
+        # a spectrogram before needs the color/axis meaning spelled out
+        # somewhere they'll actually see it without hovering anything.
+        self.aedit_spectrogram_caption = ctk.CTkLabel(
+            transport, text="", anchor="w", text_color=self.MUTED_TEXT, font=ctk.CTkFont(size=11))
+        self.aedit_spectrogram_caption.grid(
+            row=1, column=0, columnspan=9, sticky="w", padx=12, pady=(0, 6))
+        self.aedit_spectrogram_caption.grid_remove()
+
+        # Edit actions sit directly above the waveform they act on, right
+        # after the transport/zoom controls — grouped with the thing
+        # they're about to change, not tucked away below the scrollbar.
+        # Split into three labeled clusters (Clipboard / Structure /
+        # History & Search) each in their own card, rather than one flat
+        # unbroken row of nine near-identical buttons — same idea as
+        # Audacity keeping its Edit and Selection toolbars visually
+        # distinct instead of merging them into one long strip.
+        editrow = ctk.CTkFrame(parent, fg_color="transparent")
+        editrow.grid(row=2, column=0, sticky="ew", padx=12, pady=(0, 6))
+        self._build_button_group(editrow, 0, "aedit_group_clipboard", [
+            ("aedit_cut_button", self._audio_edit_cut, None),
+            ("aedit_copy_button", self._audio_edit_copy, None),
+            ("aedit_paste_button", self._audio_edit_paste, None),
+        ])
+        self._build_button_group(editrow, 1, "aedit_group_structure", [
+            ("aedit_trim_button", self._audio_edit_trim, "aedit_tip_trim"),
+            ("aedit_split_button", self._audio_edit_split, "aedit_tip_split"),
+            ("aedit_silence_button", self._audio_edit_insert_silence, "aedit_tip_silence"),
+        ])
+        self._build_button_group(editrow, 2, "aedit_group_history", [
+            ("aedit_undo_button", self._audio_edit_undo, None),
+            ("aedit_redo_button", self._audio_edit_redo, None),
+            ("aedit_find_button", self._run_find_similar, "aedit_tip_find"),
+            ("aedit_detect_silence_button", self._detect_silences, "aedit_tip_detect_silence"),
+            ("aedit_marker_button", self._add_marker_at_playhead, "aedit_tip_marker"),
+        ])
+
+        # Wave area: a dB axis to the left, timeline ruler + waveform +
+        # horizontal scrollbar to the right — bundled in their own 2-
+        # column grid so the axis lines up with the waveform's amplitude
+        # regardless of window size.
+        wave_area = ctk.CTkFrame(parent, fg_color="transparent")
+        wave_area.grid(row=3, column=0, sticky="nsew", padx=12, pady=(6, 0))
+        wave_area.grid_columnconfigure(1, weight=1)
+        wave_area.grid_rowconfigure(2, weight=1)
+
+        # No separate track-header strip — the picker row's file label
+        # above already names the open file (and Audio Studio only ever
+        # has one open at a time), so a second label naming the same
+        # thing here would just be a repeated row of height for nothing.
+        DB_AXIS_WIDTH = 34
+        ctk.CTkFrame(wave_area, width=DB_AXIS_WIDTH, height=20, fg_color="transparent").grid(
+            row=0, column=0)  # spacer so column 0 lines up under the timeline row too
+        self.atimeline_canvas = tk.Canvas(wave_area, height=20, highlightthickness=0, bd=0,
+                                          bg=self._resolve_root_bg())
+        self.atimeline_canvas.grid(row=0, column=1, sticky="ew")
+        # Same cursor-anchored time-zoom as scrolling the waveform itself
+        # — reuses that handler directly (it only reads event.x/.delta and
+        # self.awave_canvas's width, which this canvas always matches).
+        self.atimeline_canvas.bind("<MouseWheel>", self._on_wave_scroll)
+        self._add_tooltip(self.atimeline_canvas, lambda: i18n.t(self.ui_lang, "aedit_tip_timeline_scroll"))
+
+        # Marker lane — small flag glyphs at each marker's time, its own
+        # thin canvas between the ruler and the waveform so markers stay
+        # visible without competing for space inside the waveform canvas
+        # itself. Left-click seeks there; double-click renames; right-
+        # click opens a Rename/Delete menu (both actions were previously
+        # only reachable one way each, and not discoverable at all).
+        ctk.CTkFrame(wave_area, width=DB_AXIS_WIDTH, height=18, fg_color="transparent").grid(row=1, column=0)
+        self.amarker_canvas = tk.Canvas(wave_area, height=18, highlightthickness=0, bd=0,
+                                        bg=self._resolve_root_bg())
+        self.amarker_canvas.grid(row=1, column=1, sticky="ew")
+        self.amarker_canvas.bind("<Configure>", lambda _e: self._redraw_waveform())
+        self.amarker_canvas.bind("<Button-1>", self._on_marker_lane_click)
+        self.amarker_canvas.bind("<Double-Button-1>", self._on_marker_lane_double_click)
+        self.amarker_canvas.bind("<Button-3>", self._on_marker_lane_right_click)
+        # Trackpad "secondary click" without a configured two-finger tap
+        # sends Control+left-click instead of a real Button-3 on macOS —
+        # a second binding, not a replacement, since a real right-click
+        # (or a trackpad with two-finger-tap enabled) already sends
+        # Button-3 correctly and should keep working as-is.
+        self.amarker_canvas.bind("<Control-Button-1>", self._on_marker_lane_right_click)
+
+        self.adb_axis_canvas = tk.Canvas(
+            wave_area, width=DB_AXIS_WIDTH, height=220, highlightthickness=0, bd=0,
+            bg=self._resolve_root_bg())
+        self.adb_axis_canvas.grid(row=2, column=0, sticky="ns")
+        # Scrolling the amplitude axis zooms vertically instead of in
+        # time — stretches quiet audio taller to see its shape more
+        # clearly (waveform mode only; there's no equivalent frequency-
+        # range zoom for the spectrogram's axis yet).
+        self.adb_axis_canvas.bind("<MouseWheel>", self._on_db_axis_scroll)
+        self.adb_axis_canvas.bind("<Double-Button-1>", lambda _e: self._reset_vertical_zoom())
+        self._add_tooltip(self.adb_axis_canvas, lambda: i18n.t(self.ui_lang, "aedit_tip_vaxis_scroll"))
+
+        self.awave_canvas = tk.Canvas(wave_area, height=220, highlightthickness=0, bd=0,
+                                      bg=self._resolve_root_bg())
+        self.awave_canvas.grid(row=2, column=1, sticky="nsew")
+        self.awave_canvas.bind("<Configure>", lambda _e: self._redraw_waveform())
+        self.awave_canvas.bind("<ButtonPress-1>", self._on_wave_press)
+        self.awave_canvas.bind("<B1-Motion>", self._on_wave_drag)
+        self.awave_canvas.bind("<ButtonRelease-1>", self._on_wave_release)
+        self.awave_canvas.bind("<MouseWheel>", self._on_wave_scroll)
+        self.awave_canvas.bind("<Button-3>", self._on_wave_right_click)
+        self.awave_canvas.bind("<Control-Button-1>", self._on_wave_right_click)  # see the marker-lane comment above
+
+        # Horizontal scrollbar for panning a zoomed-in waveform — standard
+        # Tk scrollbar protocol: its thumb position/size is set from
+        # _redraw_waveform (via _update_wave_scrollbar) to always reflect
+        # the current zoom window, and dragging/clicking it calls back
+        # into _on_wave_hscroll to move that window.
+        self.awave_scrollbar = ctk.CTkScrollbar(
+            wave_area, orientation="horizontal", command=self._on_wave_hscroll)
+        self.awave_scrollbar.grid(row=3, column=1, sticky="ew", pady=(2, 0))
+        self.awave_scrollbar.set(0, 1)
+
+        # Enhance, Clean, and Find (similar-segment search) — collapsed by
+        # default, mutually exclusive (opening one closes the others),
+        # same show/hide-a-panel pattern as the Edit & Export tab's
+        # punctuation pad, sitting side by side rather than each being
+        # its own tab: these all act on THIS waveform, so seeing them
+        # stay right next to it beats a separate tab that hides what's
+        # actually changing.
+        panel_toggle_row = ctk.CTkFrame(parent, fg_color="transparent")
+        panel_toggle_row.grid(row=4, column=0, sticky="ew", padx=12, pady=(0, 2))
+        for col, which, attr in ((0, "enhance", "aenh"), (1, "find", "afind"),
+                                 (2, "silence", "asilence"), (3, "markers", "amark")):
+            btn = ctk.CTkButton(
+                panel_toggle_row, text="", width=140, height=26, font=ctk.CTkFont(size=12),
+                fg_color="transparent", text_color=self.OUTLINE_BUTTON_TEXT,
+                border_width=1, command=lambda w=which: self._toggle_effects_panel(w))
+            btn.grid(row=0, column=col, sticky="ew", padx=(0 if col == 0 else 6, 0))
+            # A thin accent strip under the active tab — the fg_color-only
+            # difference between selected/unselected wasn't distinctive
+            # enough to tell at a glance which panel (if any) is open.
+            accent = ctk.CTkFrame(panel_toggle_row, height=3, fg_color="transparent")
+            accent.grid(row=1, column=col, sticky="ew", padx=(0 if col == 0 else 6, 0), pady=(2, 0))
+            setattr(self, f"{attr}_toggle_button", btn)
+            setattr(self, f"{attr}_toggle_accent", accent)
+
+        # Enhance is the only sliders-panel now — Clean was merged into it
+        # (see _build_enhance_panel's "Repairs & timing" group) once it
+        # became clear no problem/tool actually sorted cleanly into two
+        # tabs: "too quiet to hear" is as much a "problem" as a click or a
+        # long pause, so the old Enhance/Clean boundary never had a real
+        # rule behind it, just historical grouping-by-vibe. One tab, one
+        # Auto Fix button, three grouped-by-mechanism sections below it.
+        self.aenh_panel = ctk.CTkScrollableFrame(parent, fg_color=("gray90", "gray17"), height=220)
+        self.aenh_panel.grid(row=5, column=0, sticky="ew", padx=12, pady=(0, 6))
+        self.aenh_panel.grid_columnconfigure(0, weight=1)
+        self._build_enhance_panel(self.aenh_panel)
+        self.aenh_panel.grid_remove()
+
+        # Matches/No speech/Markers are plain fixed-height frames, not
+        # scrollable ones (unlike Enhance/Clean above, whose sliders
+        # reliably fill or exceed 220px) — a CTkScrollableFrame's inner
+        # frame only ever sizes itself to its actual content, so with few
+        # or no rows the leftover space below was just empty canvas that
+        # row weights couldn't reach, leaving the bottom Select all/none/
+        # Delete row floating at an inconsistent height in each of the
+        # three instead of anchored to the panel's bottom edge (found via
+        # a real side-by-side comparison of all three when empty). Row 1
+        # (each build method's rows_frame) is given the vertical weight
+        # so it — not the button row — absorbs any leftover space.
+        self.afind_panel = ctk.CTkFrame(parent, fg_color=("gray90", "gray17"), height=220)
+        self.afind_panel.grid(row=5, column=0, sticky="ew", padx=12, pady=(0, 6))
+        self.afind_panel.grid_columnconfigure(0, weight=1)
+        self.afind_panel.grid_rowconfigure(1, weight=1)
+        self.afind_panel.grid_propagate(False)
+        self._build_find_panel(self.afind_panel)
+        self.afind_panel.grid_remove()
+
+        self.asilence_panel = ctk.CTkFrame(parent, fg_color=("gray90", "gray17"), height=220)
+        self.asilence_panel.grid(row=5, column=0, sticky="ew", padx=12, pady=(0, 6))
+        self.asilence_panel.grid_columnconfigure(0, weight=1)
+        self.asilence_panel.grid_rowconfigure(1, weight=1)
+        self.asilence_panel.grid_propagate(False)
+        self._build_silence_panel(self.asilence_panel)
+        self.asilence_panel.grid_remove()
+
+        self.amark_panel = ctk.CTkFrame(parent, fg_color=("gray90", "gray17"), height=220)
+        self.amark_panel.grid(row=5, column=0, sticky="ew", padx=12, pady=(0, 6))
+        self.amark_panel.grid_columnconfigure(0, weight=1)
+        self.amark_panel.grid_rowconfigure(1, weight=1)
+        self.amark_panel.grid_propagate(False)
+        self._build_markers_panel(self.amark_panel)
+        self.amark_panel.grid_remove()
+
+        self._render_effects_toggle_buttons()
+
+        saverow = ctk.CTkFrame(parent, fg_color="transparent")
+        saverow.grid(row=6, column=0, sticky="ew", padx=12, pady=(2, 8))
+        saverow.grid_columnconfigure(4, weight=1)
+        self.aedit_save_wav_button = ctk.CTkButton(
+            saverow, text="", height=34, command=lambda: self._export_audio_clip("wav"))
+        self.aedit_save_wav_button.grid(row=0, column=0, padx=(0, 8))
+        self.aedit_save_mp3_button = ctk.CTkButton(
+            saverow, text="", height=34, command=lambda: self._export_audio_clip("mp3"))
+        self.aedit_save_mp3_button.grid(row=0, column=1, padx=(0, 8))
+        self.aedit_revert_button = ctk.CTkButton(
+            saverow, text="", height=34, fg_color="transparent",
+            text_color=self.OUTLINE_BUTTON_TEXT, border_width=1, command=self._audio_edit_revert)
+        self.aedit_revert_button.grid(row=0, column=2, padx=(0, 10))
+        self.aedit_open_folder_button = ctk.CTkButton(
+            saverow, text="", height=34, fg_color="transparent",
+            text_color=self.OUTLINE_BUTTON_TEXT, border_width=1,
+            command=lambda: self._open_output_folder(settings.audio_exports_folder()))
+        self.aedit_open_folder_button.grid(row=0, column=3, padx=(0, 10))
+        self.aedit_status_line = ctk.CTkLabel(saverow, text="", anchor="w", text_color=self.MUTED_TEXT)
+        self.aedit_status_line.grid(row=0, column=4, sticky="ew")
+
+    # which -> (panel widget, toggle button, i18n key) — Enhance/Matches/
+    # No speech/Markers are mutually exclusive collapsible panels inside
+    # the Edit subtab; opening one closes whichever other was open.
+    EFFECT_PANEL_ACCENT = "#3B8ED0"  # same blue as the waveform/selection — ties the tab to what it edits
+
+    def _effect_panel_registry(self):
+        return {
+            "enhance": (self.aenh_panel, self.aenh_toggle_button, self.aenh_toggle_accent, "aenh_toggle"),
+            "find": (self.afind_panel, self.afind_toggle_button, self.afind_toggle_accent, "afind_toggle"),
+            "silence": (self.asilence_panel, self.asilence_toggle_button, self.asilence_toggle_accent,
+                       "asilence_toggle"),
+            "markers": (self.amark_panel, self.amark_toggle_button, self.amark_toggle_accent, "amark_toggle"),
+        }
+
+    def _toggle_effects_panel(self, which):
+        self.active_effects_panel = None if self.active_effects_panel == which else which
+        self._show_active_effects_panel()
+
+    # which -> the rows-list frame whose scrollbar needs re-checking once
+    # its panel actually gets real screen geometry (see
+    # _update_rows_scrollbar) — Enhance/Clean have no such list.
+    _ROWS_FRAME_ATTR = {"find": "afind_rows_frame", "silence": "asilence_rows_frame",
+                        "markers": "amark_rows_frame"}
+
+    def _show_active_effects_panel(self):
+        for name, (panel, _button, _accent, _key) in self._effect_panel_registry().items():
+            if name == self.active_effects_panel:
+                panel.grid()
+            else:
+                panel.grid_remove()
+        self._render_effects_toggle_buttons()
+        # A render that happened while this panel was still hidden
+        # (grid_remove'd) had no real height to measure yet, so the
+        # scrollbar decision made then could be stale — redo it now that
+        # the panel is actually visible and sized.
+        rows_attr = self._ROWS_FRAME_ATTR.get(self.active_effects_panel)
+        if rows_attr is not None:
+            self._update_rows_scrollbar(getattr(self, rows_attr))
+
+    def _render_effects_toggle_buttons(self):
+        for which, (_panel, button, accent, key) in self._effect_panel_registry().items():
+            active = self.active_effects_panel == which
+            arrow = "▾" if active else "▸"
+            button.configure(
+                text=f"{arrow} {i18n.t(self.ui_lang, key)}",
+                fg_color=("gray75", "gray30") if active else "transparent")
+            accent.configure(fg_color=self.EFFECT_PANEL_ACCENT if active else "transparent")
+
+    # -- clip loading -------------------------------------------------------
+
+    def _open_audio_clip_dialog(self):
+        path = filedialog.askopenfilename(
+            title=i18n.t(self.ui_lang, "aedit_open_dialog"),
+            filetypes=[(i18n.t(self.ui_lang, "audio_filetypes"),
+                       "*.wav *.mp3 *.m4a *.flac *.ogg *.aac")])
+        if path:
+            self._open_audio_clip(path)
+
+    def _open_audio_clip(self, path):
+        """Decoding runs on a background thread behind the modal "please
+        wait" dialog — a several-minute MP3 can take a noticeable moment
+        to decode/resample, which used to just freeze the window (or, in
+        an earlier version, disable one button and change a status label
+        that was easy to miss) with no clear feedback that it was still
+        working."""
+        def work():
+            return audio_clip.AudioClip.load(path, settings.audio_originals_folder())
+
+        def done(clip, error):
+            if error is not None or clip is None:
+                self._set_audio_edit_status("aedit_status_load_failed", {})
+                return
+            self.audio_clip = clip
+            self.audio_clip_path = path
+            self.audio_selection = None
+            self.audio_clipboard = None
+            self.audio_preview = None
+            self.audio_noise_profile = None  # a profile from a previous file means nothing for this one
+            self._update_noise_profile_label()
+            self._clear_find_results()  # matches/silence spans were sample positions in the OLD clip
+            self._clear_silence_results()
+            self.audio_player.load_buffer(clip.buffer, clip.sample_rate)
+            self._zoom_audio_edit_fit()
+            self._refresh_audio_studio_ui()
+            self._set_audio_edit_status("aedit_status_loaded", {})
+
+        self._run_busy("aedit_status_loading", work, done)
+
+    def _refresh_audio_studio_ui(self):
+        has_clip = self.audio_clip is not None
+        self._set_audio_edit_controls_enabled(has_clip)
+        self._set_audio_enhance_controls_enabled(has_clip)
+        self._render_markers_panel()
+        self._redraw_waveform()
+
+    def _set_audio_edit_controls_enabled(self, enabled):
+        state = "normal" if enabled else "disabled"
+        for attr in ("aedit_play_button", "aedit_stop_button", "aedit_speed_menu",
+                     "aedit_zoom_out_button", "aedit_zoom_fit_button", "aedit_zoom_in_button",
+                     "aedit_cut_button", "aedit_copy_button", "aedit_trim_button",
+                     "aedit_split_button", "aedit_silence_button", "aedit_find_button",
+                     "aedit_detect_silence_button",
+                     "aedit_marker_button", "amark_sections_button",
+                     "aedit_save_wav_button", "aedit_save_mp3_button", "aedit_revert_button"):
+            getattr(self, attr).configure(state=state)
+        can_paste = enabled and self.audio_clipboard is not None
+        self.aedit_paste_button.configure(state="normal" if can_paste else "disabled")
+        can_undo = enabled and self.audio_clip is not None and self.audio_clip.can_undo
+        can_redo = enabled and self.audio_clip is not None and self.audio_clip.can_redo
+        self.aedit_undo_button.configure(state="normal" if can_undo else "disabled")
+        self.aedit_redo_button.configure(state="normal" if can_redo else "disabled")
+
+    def _set_audio_edit_status(self, key, detail=None):
+        self.audio_status_key, self.audio_status_detail = key, detail or {}
+        self.aedit_status_line.configure(text=i18n.t(self.ui_lang, key, **(detail or {})))
+
+    # -- transport ------------------------------------------------------
+
+    def _guarded_shortcut(self, handler):
+        """Wraps a no-arg `handler` so it only fires while Audio Studio's
+        Edit subtab is showing, and never while focus is actually inside
+        a text field elsewhere in the app (so e.g. Ctrl+C in the Record
+        tab's filename field still copies text, not audio) — every
+        binding in AUDIO_EDIT_SHORTCUTS shares this one gate, bound
+        globally via bind_all since Tk has no per-tab keyboard scope of
+        its own."""
+        def wrapped(event):
+            if self.current_tab != self.LEAF_AUDIO_EDIT:
+                return None
+            if isinstance(event.widget, (tk.Entry, tk.Text)):
+                return None
+            handler()
+            return "break"
+        return wrapped
+
+    def _audio_edit_delete(self):
+        """Delete/Backspace: removes the selection without touching the
+        clipboard — distinct from Cut, which is the same removal but also
+        overwrites whatever was last copied."""
+        if not self.audio_clip or not self.audio_selection:
+            self._set_audio_edit_status("aedit_status_need_selection")
+            return
+        start, end = self.audio_selection
+        self.audio_clip.cut(start, end)
+        self.audio_selection = None
+        self._after_audio_edit()
+
+    def _toggle_audio_edit_play(self):
+        if self.audio_clip is None:
+            return
+        if self.audio_player.is_playing:
+            self.audio_player.pause()
+            self._play_until = None
+        else:
+            if self.audio_selection and self.audio_preview is None:
+                # A selection is active (and this isn't already an
+                # isolated Preview, which sets its own range) — play only
+                # that region, same "only play the selected part" idea as
+                # Enhance/Clean Preview.
+                start, end = self.audio_selection
+                self._seek_audio_edit_to(start)
+                self._play_until = end
+            else:
+                self._play_until = None
+            self.audio_player.play()
+        self._render_audio_edit_play_button()
+
+    def _stop_audio_edit_play(self):
+        self.audio_player.stop()
+        self._play_until = None
+        self._clear_audio_preview()
+        self._render_audio_edit_play_button()
+        self._redraw_waveform()
+
+    def _clear_audio_preview(self):
+        """Drops a pending (unapplied) Enhance/Clean preview and restores
+        the real clip to the player — called whenever the preview stops
+        being the relevant thing on screen (playback ends, a new
+        selection starts, an edit commits, a new clip loads)."""
+        if self.audio_preview is None:
+            return
+        self.audio_preview = None
+        self._preview_offset_s = 0.0
+        if self.audio_clip is not None:
+            self.audio_player.load_buffer(self.audio_clip.buffer, self.audio_clip.sample_rate)
+
+    def _render_audio_edit_play_button(self):
+        self.aedit_play_button.configure(
+            text=i18n.t(self.ui_lang, "player_pause" if self.audio_player.is_playing else "player_play"))
+
+    def _on_audio_edit_speed_change(self, label):
+        self.audio_player.set_speed(float(label.rstrip("×")))
+
+    # -- zoom / waveform / selection --------------------------------------
+
+    def _zoom_audio_edit_fit(self):
+        self.audio_zoom = (0.0, self.audio_clip.duration if self.audio_clip else 0.0)
+        self._redraw_waveform()
+
+    def _zoom_audio_edit(self, factor):
+        """The +/- zoom buttons center on whatever point the user last
+        clicked/selected on the waveform (same idea as the scroll-wheel
+        zoom in _on_wave_scroll, just centered on that point instead of
+        keeping it at its current on-screen position, since a button
+        click has no cursor position of its own to anchor to). A plain
+        click (no drag) doesn't leave a real selection behind — it just
+        moves the playhead there — so the playhead position is the
+        anchor in that case; falls back to the current view's center
+        only when nothing has ever been clicked/sought."""
+        if self.audio_clip is None:
+            return
+        start, end = self.audio_zoom
+        if self.audio_selection is not None:
+            sel_start, sel_end = self.audio_selection
+            center = (sel_start + sel_end) / 2
+        else:
+            center = self.audio_player.get_time() or (start + end) / 2
+        span = max(0.05, (end - start) * factor)
+        full = self.audio_clip.duration
+        span = min(span, full) if full else span
+        new_start = max(0.0, min(full - span, center - span / 2)) if full else 0.0
+        self.audio_zoom = (new_start, new_start + span)
+        self._redraw_waveform()
+
+    def _update_wave_scrollbar(self):
+        """Sets the horizontal scrollbar's thumb to match the current
+        zoom window — a full-width thumb (0..1) when zoomed all the way
+        out, matching the standard Tk scrollbar protocol."""
+        full = self.audio_clip.duration if self.audio_clip else 0.0
+        if full <= 0:
+            self.awave_scrollbar.set(0, 1)
+            return
+        start, end = self.audio_zoom
+        self.awave_scrollbar.set(start / full, min(1.0, end / full))
+
+    def _on_wave_hscroll(self, *args):
+        """Scrollbar drag/click callback (standard Tk protocol: either
+        ("moveto", fraction) or ("scroll", amount, "units"/"pages"))."""
+        if self.audio_clip is None or self.audio_clip.duration <= 0:
+            return
+        full = self.audio_clip.duration
+        start, end = self.audio_zoom
+        span = end - start
+        if args[0] == "moveto":
+            new_start = float(args[1]) * full
+        elif args[0] == "scroll":
+            amount = float(args[1])
+            step = span * (0.9 if args[2] == "pages" else 0.1)
+            new_start = start + amount * step
+        else:
+            return
+        new_start = max(0.0, min(full - span, new_start)) if full > span else 0.0
+        self.audio_zoom = (new_start, new_start + span)
+        self._redraw_waveform()
+
+    # "Nice" timeline tick intervals (seconds) — the ruler picks the
+    # smallest one that still keeps labels roughly TIMELINE_TARGET_PX
+    # apart, so they never overlap regardless of zoom level.
+    TIMELINE_TARGET_PX = 80
+    TIMELINE_STEPS = [0.1, 0.2, 0.5, 1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 900, 1800, 3600]
+
+    def _update_selection_label(self):
+        if self.audio_clip is not None and self.audio_selection:
+            s, e = self.audio_selection
+            self.aedit_selection_label.configure(text=i18n.t(
+                self.ui_lang, "aedit_selection_info",
+                start=_fmt_time(s), end=_fmt_time(e), dur=f"{e - s:.1f}"))
+        else:
+            self.aedit_selection_label.configure(
+                text=i18n.t(self.ui_lang, "aedit_no_selection") if self.audio_clip is not None else "")
+
+    def _update_dirty_indicator(self):
+        """Sets the picker row's file label to name+duration, and the
+        adjacent (red) label to "unsaved changes" when dirty — sharing
+        that row rather than each costing its own strip of height."""
+        if self.audio_clip is None:
+            self.aedit_file_label.configure(text=i18n.t(self.ui_lang, "aedit_no_file"))
+            self.aedit_dirty_label.configure(text="")
+            return
+        name = os.path.basename(self.audio_clip_path or "")
+        self.aedit_file_label.configure(text=i18n.t(
+            self.ui_lang, "aedit_file_status", name=name,
+            duration=_fmt_time(self.audio_clip.duration)))
+        self.aedit_dirty_label.configure(
+            text=i18n.t(self.ui_lang, "aedit_dirty") if self.audio_clip.dirty else "")
+
+    def _redraw_waveform(self):
+        """Redraws the waveform/spectrogram canvas. The expensive part —
+        the actual waveform lines, or the spectrogram image — is cached
+        (self._wave_content_cache_key) and only rebuilt when what it
+        depends on (zoom window, canvas size, preview state, or the
+        buffer itself) actually changed. A plain selection drag — by far
+        the most frequent caller, firing on every mouse-move — just moves
+        the lightweight selection/match overlay instead. Without this,
+        every drag event recomputed the full spectrogram (multiple
+        seconds for a zoomed-out clip) or rebuilt hundreds of waveform
+        line items, which is what made clicking the canvas visibly blank
+        out. Tick updates during playback go through _update_playhead_line
+        instead, which only moves one line item — untouched by either
+        path here."""
+        self._update_selection_label()
+        self._update_dirty_indicator()
+        self._update_spectrogram_caption()
+
+        canvas = self.awave_canvas
+        if self.audio_clip is None or self.audio_clip.buffer.size == 0:
+            root_bg = self._resolve_root_bg()
+            canvas.delete("all")
+            canvas.configure(bg=root_bg)
+            self._playhead_item = None
+            self._wave_content_cache_key = None
+            self.awave_scrollbar.set(0, 1)
+            self.atimeline_canvas.delete("all")
+            self.atimeline_canvas.configure(bg=root_bg)
+            self.adb_axis_canvas.delete("all")
+            self.adb_axis_canvas.configure(bg=root_bg)
+            self.amarker_canvas.delete("all")
+            self.amarker_canvas.configure(bg=root_bg)
+            return
+        width = max(1, canvas.winfo_width())
+        height = max(1, canvas.winfo_height())
+        start, end = self.audio_zoom
+        self._update_wave_scrollbar()
+        self._redraw_timeline()
+        self._redraw_db_axis(height)
+        self._redraw_marker_lane()
+        if end <= start:
+            canvas.delete("all")
+            self._wave_content_cache_key = None
+            return
+
+        previewing = self.audio_preview is not None
+        display_buffer = self.audio_preview if previewing else self.audio_clip.buffer
+        cache_key = (self.wave_view_mode, start, end, width, height, id(display_buffer),
+                    self._preview_range_samples if previewing else None, self.audio_vzoom)
+        if cache_key != self._wave_content_cache_key:
+            canvas.delete("all")
+            self._playhead_item = None
+            canvas.configure(bg=self._resolve_root_bg())
+            if self.wave_view_mode == "spectrogram":
+                self._draw_spectrogram_content(canvas, width, height, start, end)
+            else:
+                self._draw_waveform_content(canvas, width, height, start, end, display_buffer, previewing)
+            self._wave_content_cache_key = cache_key
+        else:
+            canvas.delete("overlay")
+
+        self._draw_selection_overlay(canvas, width, height, start, end)
+        self._update_playhead_line()
+
+    def _draw_waveform_content(self, canvas, width, height, start, end, display_buffer, previewing):
+        # While an Enhance/Clean effect is being previewed (live, as a
+        # slider moves — see _update_effect_preview), only the region it
+        # actually changed renders from the not-yet-applied composite,
+        # tinted amber; everything outside that keeps showing the real
+        # clip in blue — so the tint always matches exactly what Apply
+        # would change, not the whole recording.
+        mid = height / 2
+        vscale = mid * self.audio_vzoom  # scrolling the dB axis (see _on_db_axis_scroll) adjusts this
+        sr = self.audio_clip.sample_rate
+        mins, maxes = audio_clip.peaks_from_buffer(display_buffer, sr, start, end, width)
+        if previewing:
+            p0, p1 = self._preview_range_samples
+            i0_view = max(0, int(round(start * sr)))
+            span_samples = max(1, int(round((end - start) * sr)))
+            for x in range(width):
+                col_sample = i0_view + int((x + 0.5) / width * span_samples)
+                color = "#d99a30" if p0 <= col_sample < p1 else "#3B8ED0"
+                y0 = mid - float(maxes[x]) * vscale
+                y1 = mid - float(mins[x]) * vscale
+                canvas.create_line(x, y0, x, y1 + 1, fill=color, tags="content")
+            canvas.create_text(8, 8, anchor="nw", fill="#d99a30",
+                               text=i18n.t(self.ui_lang, "aedit_previewing"), tags="content")
+        else:
+            for x in range(width):
+                y0 = mid - float(maxes[x]) * vscale
+                y1 = mid - float(mins[x]) * vscale
+                canvas.create_line(x, y0, x, y1 + 1, fill="#3B8ED0", tags="content")
+
+    def _draw_spectrogram_content(self, canvas, width, height, start, end):
+        image = audio_spectrogram.compute_image(
+            self.audio_clip.buffer, self.audio_clip.sample_rate, start, end, width, height)
+        self._spectrogram_photo = ImageTk.PhotoImage(image)  # keep a reference — Tk drops an unreferenced one
+        canvas.create_image(0, 0, anchor="nw", image=self._spectrogram_photo, tags="content")
+
+    def _draw_selection_overlay(self, canvas, width, height, start, end):
+        # The selection itself stays visibly highlighted regardless of
+        # whether a preview is active — adjusting a slider shouldn't make
+        # the region you're working on harder to see.
+        if self.audio_selection:
+            sel_start, sel_end = self.audio_selection
+            x0 = (max(start, sel_start) - start) / (end - start) * width
+            x1 = (min(end, sel_end) - start) / (end - start) * width
+            if x1 > x0:
+                canvas.create_rectangle(x0, 0, x1, height, fill="#3B8ED0",
+                                        stipple="gray25", outline="", tags="overlay")
+
+        # Every currently-checked Find Similar match, in green — visible
+        # regardless of which panel is open, so you can see at a glance
+        # what's about to be removed while scrolling/zooming around.
+        for (m_start, m_end, _score), var in zip(self._find_visible_matches, self._find_vars):
+            if not var.get():
+                continue
+            x0 = (max(start, m_start) - start) / (end - start) * width
+            x1 = (min(end, m_end) - start) / (end - start) * width
+            if x1 > x0:
+                canvas.create_rectangle(x0, 0, x1, height, fill="#4caf50",
+                                        stipple="gray25", outline="", tags="overlay")
+
+        # Every currently-checked detected-silence span, in purple — same
+        # always-visible treatment as matches above, in a different color
+        # so the two review lists stay visually distinct on the waveform.
+        for (s_start, s_end), var in zip(self._silence_spans, self._silence_vars):
+            if not var.get():
+                continue
+            x0 = (max(start, s_start) - start) / (end - start) * width
+            x1 = (min(end, s_end) - start) / (end - start) * width
+            if x1 > x0:
+                canvas.create_rectangle(x0, 0, x1, height, fill="#9575CD",
+                                        stipple="gray25", outline="", tags="overlay")
+
+    def _redraw_timeline(self):
+        """Ruler above the waveform showing mm:ss tick marks — spaced by
+        a 'nice' interval (1/2/5 x 10^n seconds) chosen so labels stay
+        legible at any zoom level instead of overlapping."""
+        canvas = self.atimeline_canvas
+        canvas.delete("all")
+        canvas.configure(bg=self._resolve_root_bg())
+        start, end = self.audio_zoom
+        span = end - start
+        if span <= 0:
+            return
+        width = max(1, canvas.winfo_width())
+        height = max(1, canvas.winfo_height())
+        text_color = self._apply_appearance_mode(self.MUTED_TEXT)
+        target_interval = span * self.TIMELINE_TARGET_PX / width
+        interval = self.TIMELINE_STEPS[-1]
+        for step in self.TIMELINE_STEPS:
+            if step >= target_interval:
+                interval = step
+                break
+        t = math.ceil(start / interval) * interval
+        while t <= end + 1e-9:
+            x = (t - start) / span * width
+            canvas.create_line(x, height - 6, x, height, fill=text_color)
+            canvas.create_text(x + 3, 1, anchor="nw", text=_fmt_time(t),
+                               fill=text_color, font=("Segoe UI", 9))
+            t += interval
+
+    # dBFS levels the vertical axis marks, mirrored above/below the
+    # silence (center) line — 0dB is full scale (±1.0 in the raw buffer).
+    # Extends well past what's ever visible at vzoom=1 (only 0..-24 fits)
+    # since vertically zooming in (see _on_db_axis_scroll) is specifically
+    # for seeing quiet detail more clearly, which means deeper negative
+    # levels come into view — _redraw_db_axis skips whichever of these
+    # land off-canvas rather than needing a different list per zoom level.
+    DB_AXIS_LEVELS = (0, -6, -12, -18, -24, -30, -36, -42, -48, -54, -60)
+
+    def _redraw_db_axis(self, height):
+        """Narrow vertical ruler to the left of the waveform. In waveform
+        mode it marks amplitude in dBFS (mirrored above/below the center
+        silence line, since the waveform itself is bipolar); in
+        spectrogram mode there's no amplitude axis to show (color is
+        amplitude there) so this instead marks frequency, 0Hz at the
+        bottom to Nyquist at the top like any other spectrogram."""
+        if self.wave_view_mode == "spectrogram":
+            self._redraw_frequency_axis(height)
+            return
+        canvas = self.adb_axis_canvas
+        canvas.delete("all")
+        canvas.configure(bg=self._resolve_root_bg())
+        width = max(1, canvas.winfo_width())
+        mid = height / 2
+        vscale = mid * self.audio_vzoom  # same scale _draw_waveform_content uses, so the axis always matches
+        text_color = self._apply_appearance_mode(self.MUTED_TEXT)
+        canvas.create_line(width - 1, 0, width - 1, height, fill=text_color)
+        for db in self.DB_AXIS_LEVELS:
+            amp = 10 ** (db / 20.0)
+            y_top, y_bottom = mid - amp * vscale, mid + amp * vscale
+            if y_top < 0 or y_bottom > height:
+                continue  # zoomed in past this level, or zoomed out enough it'd crowd the one above/below it
+            canvas.create_line(width - 6, y_top, width, y_top, fill=text_color)
+            canvas.create_line(width - 6, y_bottom, width, y_bottom, fill=text_color)
+            canvas.create_text(width - 8, y_top, anchor="e", text=str(db),
+                               fill=text_color, font=("Segoe UI", 8))
+        canvas.create_line(width - 6, mid, width, mid, fill=text_color)
+        canvas.create_text(width - 8, mid, anchor="e", text="-∞",
+                           fill=text_color, font=("Segoe UI", 8))
+
+    # Frequency gridlines for the spectrogram axis, in Hz — 0 is always
+    # added at the bottom regardless of Nyquist.
+    FREQUENCY_AXIS_LEVELS_HZ = [1000, 2000, 4000, 8000, 16000]
+
+    def _redraw_frequency_axis(self, height):
+        canvas = self.adb_axis_canvas
+        canvas.delete("all")
+        canvas.configure(bg=self._resolve_root_bg())
+        width = max(1, canvas.winfo_width())
+        text_color = self._apply_appearance_mode(self.MUTED_TEXT)
+        nyquist = (self.audio_clip.sample_rate / 2.0) if self.audio_clip else 22050.0
+        canvas.create_line(width - 1, 0, width - 1, height, fill=text_color)
+        canvas.create_text(width - 8, height - 2, anchor="se", text="0",
+                           fill=text_color, font=("Segoe UI", 8))
+        for hz in self.FREQUENCY_AXIS_LEVELS_HZ:
+            if hz >= nyquist:
+                break
+            y = height - (hz / nyquist) * height
+            canvas.create_line(width - 6, y, width, y, fill=text_color)
+            label = f"{hz // 1000}k" if hz >= 1000 else str(hz)
+            canvas.create_text(width - 8, y, anchor="e", text=label,
+                               fill=text_color, font=("Segoe UI", 8))
+
+    def _update_spectrogram_caption(self):
+        if self.wave_view_mode != "spectrogram" or self.audio_clip is None:
+            self.aedit_spectrogram_caption.grid_remove()
+            return
+        nyquist_khz = self.audio_clip.sample_rate / 2000.0
+        self.aedit_spectrogram_caption.configure(
+            text=i18n.t(self.ui_lang, "aedit_spectrogram_caption", nyquist=f"{nyquist_khz:.1f}"))
+        self.aedit_spectrogram_caption.grid()
+
+    def _on_wave_view_change(self, value):
+        self.wave_view_mode = "spectrogram" if value == i18n.t(self.ui_lang, "aedit_view_spectrogram") \
+            else "waveform"
+        self._redraw_waveform()
+
+    def _update_playhead_line(self):
+        """Moves (or creates, or hides) just the playhead line — cheap
+        enough to call every tick during playback without the flicker a
+        full _redraw_waveform caused. While an isolated-selection Preview
+        is playing, the player's own get_time() starts back at 0 for just
+        that snippet, so _preview_offset_s maps it back onto the full
+        clip's timeline for display."""
+        canvas = self.awave_canvas
+        if self.audio_clip is None or self.audio_player.loaded_path is None:
+            return
+        start, end = self.audio_zoom
+        if end <= start:
+            return
+        offset = self._preview_offset_s if self.audio_preview is not None else 0.0
+        playhead_t = offset + self.audio_player.get_time()
+        height = max(1, canvas.winfo_height())
+        if start <= playhead_t <= end:
+            x = (playhead_t - start) / (end - start) * max(1, canvas.winfo_width())
+            if self._playhead_item is None:
+                self._playhead_item = canvas.create_line(
+                    x, 0, x, height, fill="#e05a5a", width=2, tags="playhead")
+            else:
+                canvas.coords(self._playhead_item, x, 0, x, height)
+                canvas.itemconfigure(self._playhead_item, state="normal")
+        elif self._playhead_item is not None:
+            canvas.itemconfigure(self._playhead_item, state="hidden")
+
+    def _on_wave_scroll(self, event):
+        """Mouse-wheel zoom, anchored at the cursor rather than the view
+        center — the point under the pointer stays put as you zoom, same
+        convention as a map or image viewer."""
+        if self.audio_clip is None:
+            return
+        anchor = self._wave_x_to_seconds(event.x)
+        factor = 0.8 if event.delta > 0 else 1.25
+        self._zoom_audio_edit_at(factor, anchor)
+
+    def _zoom_audio_edit_at(self, factor, anchor_time):
+        if self.audio_clip is None:
+            return
+        start, end = self.audio_zoom
+        full = self.audio_clip.duration
+        span = max(0.05, (end - start) * factor)
+        span = min(span, full) if full else span
+        rel = (anchor_time - start) / (end - start) if end > start else 0.5
+        new_start = anchor_time - rel * span
+        new_start = max(0.0, min(full - span, new_start)) if full else 0.0
+        self.audio_zoom = (new_start, new_start + span)
+        self._redraw_waveform()
+
+    VZOOM_MIN, VZOOM_MAX = 1.0, 20.0
+
+    def _on_db_axis_scroll(self, event):
+        """Scrolling the amplitude axis stretches/shrinks the waveform's
+        vertical scale — same scroll-to-zoom convention as the time axis,
+        just the other dimension. Only meaningful in waveform mode; the
+        spectrogram's axis is frequency, which this doesn't touch."""
+        if self.audio_clip is None or self.wave_view_mode != "waveform":
+            return
+        factor = 1.25 if event.delta > 0 else 0.8
+        self.audio_vzoom = min(self.VZOOM_MAX, max(self.VZOOM_MIN, self.audio_vzoom * factor))
+        self._redraw_waveform()
+
+    def _reset_vertical_zoom(self):
+        self.audio_vzoom = 1.0
+        self._redraw_waveform()
+
+    def _wave_x_to_seconds(self, x):
+        width = max(1, self.awave_canvas.winfo_width())
+        start, end = self.audio_zoom
+        return start + max(0.0, min(1.0, x / width)) * (end - start)
+
+    def _seek_audio_edit_to(self, seconds):
+        """Moves the playhead to `seconds` — Play then resumes from there,
+        and Insert Silence (with nothing selected) lands there too."""
+        if self.audio_clip is None or self.audio_clip.duration <= 0:
+            return
+        frac = max(0.0, min(1.0, seconds / self.audio_clip.duration))
+        self.audio_player.seek_fraction(frac)
+        self.aedit_time_label.configure(
+            text=f"{_fmt_time(self.audio_player.get_time())} / "
+                 f"{_fmt_time(self.audio_player.duration)}")
+
+    def _on_wave_press(self, event):
+        if self.audio_clip is None:
+            return
+        self._play_until = None
+        self._clear_audio_preview()
+        self._wave_drag_start = self._wave_x_to_seconds(event.x)
+        self.audio_selection = (self._wave_drag_start, self._wave_drag_start)
+        self._redraw_waveform()
+
+    def _on_wave_drag(self, event):
+        if self.audio_clip is None or not hasattr(self, "_wave_drag_start"):
+            return
+        current = self._wave_x_to_seconds(event.x)
+        self.audio_selection = tuple(sorted((self._wave_drag_start, current)))
+        self._redraw_waveform()
+
+    def _on_wave_release(self, _event):
+        if self.audio_clip is None:
+            return
+        if self.audio_selection and abs(self.audio_selection[1] - self.audio_selection[0]) < 0.05:
+            # A plain click, not a drag — moves the playhead there (shown
+            # as the vertical marker) instead of leaving a zero-width
+            # "selection" nothing downstream can act on.
+            click_time = self._wave_drag_start
+            self.audio_selection = None
+            self._seek_audio_edit_to(click_time)
+        self._redraw_waveform()
+        self._set_audio_edit_controls_enabled(True)
+
+    def _on_wave_right_click(self, _event):
+        """Right-click resets the waveform's clicked state — clears any
+        selection and moves the playhead (the red line) back to the
+        clip's start, undoing whatever the last left-click/drag left
+        behind without requiring the file to be reopened."""
+        if self.audio_clip is None:
+            return
+        self.audio_selection = None
+        self._seek_audio_edit_to(0.0)
+        self._redraw_waveform()
+
+    # -- editing operations -----------------------------------------------
+
+    def _after_audio_edit(self):
+        self.audio_preview = None
+        self._preview_offset_s = 0.0
+        self._play_until = None
+        # Any edit (cut/trim/apply/insert/etc.) shifts sample positions
+        # throughout the clip, so a match/silence list from before is no
+        # longer trustworthy — cleared here rather than in each
+        # individual edit method, since every one of them already funnels
+        # through this.
+        self._clear_find_results()
+        self._clear_silence_results()
+        # load_buffer() always resets playback to 0 (it's a fresh buffer
+        # as far as the player's concerned) — restoring the pre-edit time
+        # here keeps the playhead where the user actually was (e.g. right
+        # after clicking a point and inserting silence there) instead of
+        # jumping back to the start on every single edit.
+        playhead_t = self.audio_player.get_time()
+        self.audio_player.load_buffer(self.audio_clip.buffer, self.audio_clip.sample_rate)
+        self._seek_audio_edit_to(playhead_t)
+        self._refresh_audio_studio_ui()
+
+    def _audio_edit_cut(self):
+        if not self.audio_clip or not self.audio_selection:
+            self._set_audio_edit_status("aedit_status_need_selection")
+            return
+        start, end = self.audio_selection
+        self.audio_clipboard = self.audio_clip.cut(start, end)
+        self.audio_selection = None
+        self._after_audio_edit()
+
+    def _audio_edit_copy(self):
+        if not self.audio_clip or not self.audio_selection:
+            self._set_audio_edit_status("aedit_status_need_selection")
+            return
+        start, end = self.audio_selection
+        self.audio_clipboard = self.audio_clip.copy_region(start, end)
+        self._set_audio_edit_controls_enabled(True)
+
+    def _audio_edit_paste(self):
+        if not self.audio_clip or self.audio_clipboard is None:
+            return
+        at = self.audio_selection[0] if self.audio_selection else self.audio_clip.duration
+        self.audio_clip.paste(at, self.audio_clipboard)
+        self._after_audio_edit()
+
+    def _audio_edit_trim(self):
+        if not self.audio_clip or not self.audio_selection:
+            self._set_audio_edit_status("aedit_status_need_selection")
+            return
+        start, end = self.audio_selection
+        self.audio_clip.trim(start, end)
+        self.audio_selection = None
+        self._after_audio_edit()
+        self._zoom_audio_edit_fit()
+
+    def _audio_edit_split(self):
+        """Splits at the playhead (a single point — click the waveform to
+        place it, same as anywhere else in Edit) into two files: the half
+        before the split point stays open as the current clip, the half
+        after is written out alongside it. Split is point-based rather
+        than selection-based on purpose — Audio Studio only ever edits
+        one clip in memory at a time, so it produces two files rather
+        than two open clips, and a single point is all "cut this
+        recording into two files here" needs (unlike Trim, which keeps a
+        selected range and needs both a start and an end)."""
+        if not self.audio_clip:
+            return
+        at = self.audio_player.get_time()
+        before, after = self.audio_clip.split(at)
+        src = self.audio_clip_path or "clip.wav"
+        base, ext = os.path.splitext(os.path.basename(src))
+        folder = settings.audio_exports_folder()
+        after_path = transcriber.unique_path(
+            os.path.join(folder, f"{base} (split){ext or '.wav'}"))
+        audio_clip.write_wav(after_path, after, self.audio_clip.sample_rate)
+        # Markers past the split point went with `after`, which isn't
+        # tracked by this clip anymore — drop them; the rest are already
+        # at the right time (nothing before the split point moved).
+        markers_before = [dict(m) for m in self.audio_clip.markers]
+        self.audio_clip.markers = [m for m in self.audio_clip.markers if m["time"] < at]
+        self.audio_clip.apply(before, markers_before=markers_before)
+        self._after_audio_edit()
+        self._set_audio_edit_status("aedit_status_split", {"path": os.path.basename(after_path)})
+
+    INSERT_SILENCE_S = 1.0  # kept as one constant so the button's tooltip can't drift from the actual amount
+
+    def _audio_edit_insert_silence(self):
+        if not self.audio_clip:
+            return
+        at = self.audio_selection[0] if self.audio_selection else self.audio_player.get_time()
+        self.audio_clip.insert_silence(at, self.INSERT_SILENCE_S)
+        self._after_audio_edit()
+
+    def _audio_edit_undo(self):
+        if self.audio_clip and self.audio_clip.undo():
+            self._after_audio_edit()
+
+    def _audio_edit_redo(self):
+        if self.audio_clip and self.audio_clip.redo():
+            self._after_audio_edit()
+
+    def _audio_edit_revert(self):
+        if self.audio_clip and self.audio_clip.revert_to_original():
+            self._after_audio_edit()
+            self._zoom_audio_edit_fit()
+            self._set_audio_edit_status("aedit_status_reverted")
+
+    def _export_audio_clip(self, fmt):
+        if self.audio_clip is None:
+            return
+        base = os.path.splitext(os.path.basename(self.audio_clip_path or "clip"))[0]
+        folder = settings.audio_exports_folder()
+        path = transcriber.unique_path(os.path.join(folder, f"{base}.{fmt}"))
+        buffer, sample_rate = self.audio_clip.buffer, self.audio_clip.sample_rate
+
+        def work():
+            audio_export.export_audio(buffer, sample_rate, path, fmt=fmt)
+            return path
+
+        def done(_result, error):
+            if error is not None:  # already logged by _run_busy itself
+                self._set_audio_edit_status("aedit_status_export_failed")
+                return
+            self.audio_clip.mark_exported()
+            self._update_dirty_indicator()
+            self._set_audio_edit_status("aedit_status_exported", {"path": os.path.basename(path)})
+
+        self._run_busy("aedit_status_exporting", work, done)
+
+    # -- shared Enhance/Clean effect-row builder ---------------------------
+
+    def _build_effect_row(self, parent, row, label_key, slider_from, slider_to,
+                          slider_default, on_change, on_apply, fmt="{:.0f}"):
+        """One Enhance/Clean effect row: label, a slider, a live value
+        readout, a Revert button, and an Apply button. Moving the slider
+        itself updates the waveform's amber preview overlay live
+        (on_change fires on every drag tick, same as the value readout)
+        — no separate Preview step. The preview then stays up (even
+        through Play/Stop) until you explicitly choose Revert (discard
+        it, back to the real clip) or Apply (commit it, pushing an undo
+        entry). Every simple single-parameter effect in both subtabs
+        shares this instead of each hand-building a near-identical row."""
+        frame = ctk.CTkFrame(parent)
+        frame.grid(row=row, column=0, sticky="ew", padx=4, pady=4)
+        frame.grid_columnconfigure(1, weight=1)
+        label = ctk.CTkLabel(frame, text="", anchor="w", width=150)
+        label.grid(row=0, column=0, padx=(10, 8), pady=10, sticky="w")
+        value_label = ctk.CTkLabel(frame, text="", width=64, anchor="e")
+
+        def _on_move(v):
+            value_label.configure(text=fmt.format(float(v)))
+            on_change(v)
+
+        var = tk.DoubleVar(value=slider_default)
+        slider = ctk.CTkSlider(frame, from_=slider_from, to=slider_to,
+                               variable=var, command=_on_move)
+        value_label.configure(text=fmt.format(float(slider_default)))  # label only — on_change needs a loaded clip
+        slider.grid(row=0, column=1, sticky="ew", padx=(0, 8), pady=10)
+        value_label.grid(row=0, column=2, padx=(0, 10), pady=10)
+
+        def _revert():
+            # Also resets the slider back to its starting value — leaving
+            # it wherever it was dragged to but with the preview
+            # discarded would make the slider lie about what's actually
+            # showing on the waveform.
+            var.set(slider_default)
+            value_label.configure(text=fmt.format(float(slider_default)))
+            self._revert_effect_preview()
+
+        revert_btn = ctk.CTkButton(
+            frame, text="", width=80, height=26, fg_color="transparent",
+            text_color=self.OUTLINE_BUTTON_TEXT, border_width=1, command=_revert)
+        revert_btn.grid(row=0, column=3, padx=(0, 6), pady=10)
+        apply_btn = ctk.CTkButton(
+            frame, text="", width=90, height=26, command=lambda: on_apply(var.get()))
+        apply_btn.grid(row=0, column=4, padx=(0, 10), pady=10)
+        return {"frame": frame, "label": label, "label_key": label_key, "slider": slider, "var": var,
+                "value_label": value_label, "revert_btn": revert_btn, "apply_btn": apply_btn,
+                "fmt": fmt}
+
+    def _sync_effect_row_display(self, row, value):
+        """Moves a slider (and its value readout) to `value` without
+        triggering on_change/preview — used right after a one-click
+        preset applies its own hard-coded settings, so the slider shows
+        what was actually just applied instead of silently sitting at
+        its old default as if nothing happened."""
+        row["var"].set(value)
+        row["value_label"].configure(text=row["fmt"].format(float(value)))
+
+    # -- generic "please wait" modal for any button-triggered action that -----
+    # -- can take a noticeable moment (file decode, denoise, VAD, export) -----
+    #
+    # Distinct from Find Similar's own progress dialog (_show_find_progress_
+    # dialog): that one supports real percentage progress and Cancel because
+    # the search is naturally chunkable; none of these are, so this is just
+    # an indeterminate spinner with no cancel — still modal (grab_set), for
+    # the same reason Find Similar's is: leaving the rest of the app
+    # clickable while something is quietly running in the background is what
+    # trained people to think the app had frozen and keep clicking other
+    # buttons, which is worse than a plain "busy" state.
+
+    def _show_busy_dialog(self, title_key):
+        dlg = ctk.CTkToplevel(self)
+        dlg.title(i18n.t(self.ui_lang, title_key))
+        dlg.resizable(False, False)
+        dlg.transient(self)
+        dlg.protocol("WM_DELETE_WINDOW", lambda: None)  # no cancel — not safely interruptible mid-flight
+        ctk.CTkLabel(dlg, text=i18n.t(self.ui_lang, title_key)).pack(padx=30, pady=(24, 14))
+        bar = ctk.CTkProgressBar(dlg, width=260, mode="indeterminate")
+        bar.pack(padx=30, pady=(0, 24))
+        bar.start()
+        dlg.update_idletasks()
+        x = self.winfo_rootx() + (self.winfo_width() - dlg.winfo_width()) // 2
+        y = self.winfo_rooty() + (self.winfo_height() - dlg.winfo_height()) // 2
+        dlg.geometry(f"+{max(0, x)}+{max(0, y)}")
+        dlg.grab_set()  # modal — blocks the rest of the app while this is up, see note above
+        self._busy_dialog = dlg
+        self._busy_bar = bar
+
+    def _close_busy_dialog(self):
+        if self._busy_dialog is not None:
+            self._busy_bar.stop()
+            self._busy_dialog.grab_release()
+            self._busy_dialog.destroy()
+        self._busy_dialog = None
+        self._busy_bar = None
+
+    def _run_busy(self, title_key, work_fn, on_done):
+        """Runs work_fn() (no args — the caller closes over whatever
+        snapshot of state it needs, captured *before* this is called, so
+        the background thread never races a live self.* read against
+        whatever the main thread does next) on a background thread behind
+        the modal above. on_done(result, error) runs on the main thread
+        once work_fn returns or raises — exactly one of result/error is
+        not None."""
+        self._show_busy_dialog(title_key)
+
+        def task():
+            try:
+                result = work_fn()
+                self.events.put(("busy_done", on_done, result, None))
+            except Exception as exc:
+                settings.log_exception(f"Audio Studio: background task failed ({title_key}):")
+                self.events.put(("busy_done", on_done, None, exc))
+
+        threading.Thread(target=task, daemon=True).start()
+
+    def _selection_bounds(self):
+        """Sample-index bounds an Enhance/Clean effect should act on: the
+        current waveform selection if there is one, else the whole clip."""
+        if self.audio_selection:
+            return self.audio_clip.sample_bounds(*self.audio_selection)
+        return 0, len(self.audio_clip.buffer)
+
+    def _selected_buffer(self):
+        i0, i1 = self._selection_bounds()
+        return self.audio_clip.buffer[i0:i1]
+
+    def _update_effect_preview(self, result_buffer, autoplay=False):
+        """Shows `result_buffer` (the effect applied to the current
+        selection, or the whole clip) spliced into a full-length preview
+        copy — without touching audio_clip — on the waveform (amber).
+        Called on every slider drag tick (see _build_effect_row's
+        on_change), so moving a slider is itself the preview — there's no
+        separate Preview button/step to click first; Play (or an
+        already-running playback, which restarts on the new value) is
+        what actually lets you hear it. `autoplay` is for Denoise's own
+        explicit Preview button, which has no slider to drive this live.
+
+        Playback itself only covers what actually changed: with a
+        selection active, `result_buffer` alone (just that processed
+        snippet) is what's loaded, starting over at t=0 —
+        _preview_offset_s records where that snippet sits in the full
+        clip's timeline so _update_playhead_line/the time label can still
+        show a real position instead of a confusing "00:00 of 00:03" on a
+        5-minute recording. With no selection, the effect covers the
+        whole clip anyway, so the full composite is what's loaded."""
+        if self.audio_clip is None:
+            return
+        result_buffer, _removed_ranges = self._split_effect_result(result_buffer)
+        i0, i1 = self._selection_bounds()
+        composite = np.concatenate(
+            [self.audio_clip.buffer[:i0], result_buffer, self.audio_clip.buffer[i1:]])
+        self.audio_preview = composite  # waveform display always shows the full composite
+        # Composite-space sample range the amber tint should cover — the
+        # middle segment above, wherever it actually landed. Using the
+        # composite's own coordinates (not the original selection's)
+        # keeps this correct even for a length-changing effect (e.g.
+        # Clean's pause removal), where result_buffer isn't the same
+        # length as buffer[i0:i1] was.
+        self._preview_range_samples = (i0, i0 + len(result_buffer))
+        was_playing = self.audio_player.is_playing
+        if self.audio_selection:
+            self._preview_offset_s = self.audio_selection[0]
+            self._play_until = self._preview_offset_s + (len(result_buffer) / self.audio_clip.sample_rate)
+            self.audio_player.load_buffer(result_buffer, self.audio_clip.sample_rate)
+        else:
+            self._preview_offset_s = 0.0
+            self._play_until = None
+            self.audio_player.load_buffer(composite, self.audio_clip.sample_rate)
+        if autoplay or was_playing:
+            self.audio_player.play()
+        self._redraw_waveform()
+
+    @staticmethod
+    def _split_effect_result(result):
+        """An effect_fn (see Enhance/Clean's specs) normally returns just
+        a buffer; a length-changing one that needs markers kept in sync
+        (Clean's pause-shortening, via return_ranges=True) returns
+        (buffer, removed_ranges_s) instead — this normalizes either shape
+        to (buffer, removed_ranges_or_None)."""
+        if isinstance(result, tuple):
+            return result
+        return result, None
+
+    def _apply_audio_effect(self, result):
+        """Commits the effect result (a buffer, or a (buffer,
+        removed_ranges) pair — see _split_effect_result) by splicing it
+        into audio_clip at the same bounds Preview used, so what you
+        heard is what you get. removed_ranges, if present, keeps markers
+        in sync with whatever the effect shortened away."""
+        if self.audio_clip is None:
+            return
+        result_buffer, removed_ranges = self._split_effect_result(result)
+        i0, i1 = self._selection_bounds()
+        full = np.concatenate(
+            [self.audio_clip.buffer[:i0], result_buffer, self.audio_clip.buffer[i1:]])
+        if removed_ranges:
+            offset = i0 / self.audio_clip.sample_rate
+            self.audio_clip.apply_removing_ranges(
+                full, [(offset + s, offset + e) for s, e in removed_ranges])
+        else:
+            self.audio_clip.apply(full)
+        self._after_audio_edit()
+        self._set_audio_edit_status("aedit_status_effect_applied")
+
+    def _apply_auto_enhance(self):
+        """Runs the fixed Auto Enhance sequence (audio_clean.auto_enhance)
+        on the current selection — or the whole clip if nothing's
+        selected, same as every other Enhance row — via the normal
+        _apply_audio_effect splice, so this behaves exactly like any
+        other row's Apply. Moves every slider it touched to match what
+        was applied — leaving them at their old values would make the
+        panel lie about what the waveform now reflects. For a custom
+        sequence of your own choosing, see the Configurations button
+        beside this one."""
+        if self.audio_clip is None:
+            return
+        buffer, sample_rate = self._selected_buffer(), self.audio_clip.sample_rate
+
+        def work():
+            return audio_clean.auto_enhance(buffer, sample_rate)
+
+        def done(result, error):
+            if error is not None:  # already logged by _run_busy itself
+                self._set_audio_edit_status("aedit_status_effect_failed")
+                return
+            self._apply_audio_effect(result)
+            self._sync_effect_row_display(self.aenh_rows["high_pass"], audio_clean.AUTO_ENHANCE_HIGH_PASS_HZ)
+            self._sync_effect_row_display(self.aenh_rows["compress"], audio_clean.AUTO_ENHANCE_COMPRESS_DB)
+            self._sync_effect_row_display(self.aenh_rows["normalize"], audio_clean.AUTO_ENHANCE_NORMALIZE_DB)
+
+        self._run_busy("aenh_busy_title", work, done)
+
+    def _run_configuration(self, profile):
+        """Runs a saved custom configuration (see audio_profiles.py) the
+        same way _apply_auto_enhance runs the built-in one — on the
+        current selection, or the whole clip if nothing's selected, via
+        the normal _apply_audio_effect splice."""
+        if self.audio_clip is None:
+            return
+        buffer, sample_rate = self._selected_buffer(), self.audio_clip.sample_rate
+
+        def work():
+            return audio_profiles.run_profile(buffer, sample_rate, profile, return_ranges=True)
+
+        def done(result, error):
+            if error is not None:  # already logged by _run_busy itself
+                self._set_audio_edit_status("aedit_status_effect_failed")
+                return
+            result_buffer, removed_ranges, engine = result
+            self._apply_audio_effect((result_buffer, removed_ranges) if removed_ranges else result_buffer)
+            if engine is not None:
+                self.aenh_denoise_engine_label.configure(
+                    text=i18n.t(self.ui_lang, "aenh_denoise_engine", engine=engine))
+            for step in profile["steps"]:
+                if step["key"] in self.aenh_rows:
+                    self._sync_effect_row_display(self.aenh_rows[step["key"]], step["value"])
+
+        self._run_busy("aenh_busy_title", work, done)
+
+    # -- Enhance configurations: user-saved step sequences, managed from ----
+    # -- the "Configurations…" button beside Auto Enhance -------------------
+
+    # (step key, i18n label key) — every value-bearing key here matches a
+    # key in self.aenh_rows, so the builder dialog can prefill each
+    # value entry from that slider's current position. "pause" is
+    # deliberately last and handled separately wherever this is used —
+    # see _open_config_builder_dialog's own comment on why.
+    CONFIG_STEP_ORDER = (
+        ("denoise", "aenh_denoise"),
+        ("gate", "aclean_gate"),
+        ("high_pass", "aenh_highpass"),
+        ("low_pass", "aenh_lowpass"),
+        ("compress", "aenh_compress"),
+        ("amplify", "aenh_amplify"),
+        ("normalize", "aenh_normalize"),
+        ("loudness", "aenh_loudness"),
+        ("eq", "aenh_eq"),
+        ("clicks", "aclean_clicks"),
+        ("pause", "aclean_pause"),
+    )
+
+    def _open_configs_manager_dialog(self):
+        """The single entry point for everything to do with saved
+        configurations: create, run, open for editing, rename, delete —
+        a list of what's saved plus a "+ New" button, rather than a
+        permanent row of controls sitting in the main panel for a
+        feature most sessions won't touch."""
+        if self.audio_clip is None:
+            return
+        t = lambda k, **kw: i18n.t(self.ui_lang, k, **kw)  # noqa: E731
+        dlg = ctk.CTkToplevel(self)
+        dlg.title(t("aenh_configs_manager_title"))
+        dlg.resizable(False, False)
+        dlg.transient(self)
+
+        def close():
+            dlg.grab_release()
+            dlg.destroy()
+
+        dlg.protocol("WM_DELETE_WINDOW", close)
+
+        ctk.CTkLabel(dlg, text=t("aenh_configs_manager_intro"), text_color=self.MUTED_TEXT,
+                    wraplength=420, justify="left").grid(
+            row=0, column=0, sticky="w", padx=16, pady=(16, 8))
+
+        list_frame = ctk.CTkScrollableFrame(dlg, width=460, height=220, fg_color=("gray90", "gray17"))
+        list_frame.grid(row=1, column=0, sticky="ew", padx=16, pady=(0, 8))
+        list_frame.grid_columnconfigure(0, weight=1)
+
+        def render_list():
+            for w in list_frame.winfo_children():
+                w.destroy()
+            if not self.aenh_configs:
+                ctk.CTkLabel(list_frame, text=t("aenh_configs_none"), text_color=self.MUTED_TEXT).grid(
+                    row=0, column=0, sticky="w", padx=8, pady=8)
+                return
+            for i, cfg in enumerate(self.aenh_configs):
+                row = ctk.CTkFrame(list_frame, fg_color=("gray95", "gray24"))
+                row.grid(row=i, column=0, sticky="ew", pady=2)
+                row.grid_columnconfigure(0, weight=1)
+                ctk.CTkLabel(row, text=cfg["name"], anchor="w").grid(
+                    row=0, column=0, sticky="w", padx=(8, 8), pady=6)
+                ctk.CTkButton(row, text=t("aenh_config_run"), width=56, height=24,
+                             command=lambda c=cfg: run_config(c)).grid(row=0, column=1, padx=(0, 4), pady=6)
+                ctk.CTkButton(row, text=t("aenh_config_open"), width=56, height=24, fg_color="transparent",
+                             text_color=self.OUTLINE_BUTTON_TEXT, border_width=1,
+                             command=lambda c=cfg: open_for_edit(c)).grid(row=0, column=2, padx=(0, 4), pady=6)
+                ctk.CTkButton(row, text=t("aenh_config_rename"), width=70, height=24, fg_color="transparent",
+                             text_color=self.OUTLINE_BUTTON_TEXT, border_width=1,
+                             command=lambda c=cfg: rename_config(c)).grid(row=0, column=3, padx=(0, 4), pady=6)
+                ctk.CTkButton(row, text=t("aenh_config_delete_button"), width=56, height=24,
+                             fg_color="transparent", text_color=self.OUTLINE_BUTTON_TEXT, border_width=1,
+                             command=lambda c=cfg: delete_config(c)).grid(row=0, column=4, padx=(0, 8), pady=6)
+
+        def run_config(cfg):
+            close()
+            self._run_configuration(cfg)
+
+        def open_for_edit(cfg):
+            close()
+            self._open_config_builder_dialog(existing=cfg)
+
+        def rename_config(cfg):
+            new_name = simpledialog.askstring(
+                t("aenh_config_rename"), t("aenh_config_name_label"),
+                initialvalue=cfg["name"], parent=dlg)
+            if not new_name or not new_name.strip():
+                return
+            new_name = new_name.strip()
+            if new_name == cfg["name"]:
+                return
+            if any(c["name"] == new_name for c in self.aenh_configs):
+                messagebox.showerror(t("aenh_configs_manager_title"), t("aenh_config_name_taken"), parent=dlg)
+                return
+            cfg["name"] = new_name
+            audio_profiles.save_profiles(self.aenh_configs)
+            render_list()
+
+        def delete_config(cfg):
+            self.aenh_configs = [c for c in self.aenh_configs if c is not cfg]
+            audio_profiles.save_profiles(self.aenh_configs)
+            render_list()
+
+        render_list()
+
+        bottom_row = ctk.CTkFrame(dlg, fg_color="transparent")
+        bottom_row.grid(row=2, column=0, sticky="ew", padx=16, pady=(0, 16))
+        bottom_row.grid_columnconfigure(1, weight=1)
+        ctk.CTkButton(bottom_row, text=t("aenh_config_new_button"),
+                     command=lambda: (close(), self._open_config_builder_dialog())).grid(row=0, column=0)
+        ctk.CTkButton(bottom_row, text=t("aenh_config_close_button"), fg_color="transparent",
+                     text_color=self.OUTLINE_BUTTON_TEXT, border_width=1, command=close).grid(row=0, column=2)
+
+        dlg.update_idletasks()
+        x = self.winfo_rootx() + (self.winfo_width() - dlg.winfo_width()) // 2
+        y = self.winfo_rooty() + (self.winfo_height() - dlg.winfo_height()) // 2
+        dlg.geometry(f"+{max(0, x)}+{max(0, y)}")
+        dlg.grab_set()
+
+    def _open_config_builder_dialog(self, existing=None):
+        """A modal for building (or, with existing given, editing a copy
+        of) a named configuration: check which steps to include, set
+        each one's value (prefilled from that slider's current position,
+        or from `existing` if editing), and rank their order with ▲/▼ —
+        order matters, it's the sequence this configuration runs in.
+
+        "Shorten pauses" always sits last, below a separator, with no
+        ▲/▼ of its own: it's the only step that changes the recording's
+        *length* rather than just reshaping the sound in place, so it
+        has to run after every other step regardless of where it'd
+        otherwise rank — reordering the same-length steps around each
+        other is always safe, but a pause anywhere except last would
+        need remapping every step that comes after it."""
+        if self.audio_clip is None:
+            return
+        t = lambda k, **kw: i18n.t(self.ui_lang, k, **kw)  # noqa: E731
+        dlg = ctk.CTkToplevel(self)
+        dlg.title(t("aenh_config_builder_title"))
+        dlg.resizable(False, False)
+        dlg.transient(self)
+
+        def close():
+            dlg.grab_release()
+            dlg.destroy()
+
+        dlg.protocol("WM_DELETE_WINDOW", close)
+
+        name_row = ctk.CTkFrame(dlg, fg_color="transparent")
+        name_row.grid(row=0, column=0, sticky="ew", padx=16, pady=(16, 8))
+        ctk.CTkLabel(name_row, text=t("aenh_config_name_label")).grid(row=0, column=0, padx=(0, 8))
+        name_entry = ctk.CTkEntry(name_row, width=220)
+        if existing is not None:
+            name_entry.insert(0, existing["name"])
+        name_entry.grid(row=0, column=1)
+
+        rows_frame = ctk.CTkFrame(dlg, fg_color="transparent")
+        rows_frame.grid(row=1, column=0, sticky="ew", padx=16, pady=(0, 8))
+        builder_rows = []  # [{"key", "var", "value_entry", "frame"}, ...] — order here IS the rank (pause excluded)
+
+        def regrid():
+            for i, entry in enumerate(builder_rows):
+                entry["frame"].grid(row=i, column=0, sticky="ew", pady=2)
+
+        def move_entry(entry, delta):
+            # Looked up by identity, not a captured index — the buttons
+            # below are created once and must keep working after this
+            # list gets reordered out from under their original position.
+            idx = builder_rows.index(entry)
+            j = idx + delta
+            if 0 <= j < len(builder_rows):
+                builder_rows[idx], builder_rows[j] = builder_rows[j], builder_rows[idx]
+                regrid()
+
+        existing_keys = [s["key"] for s in existing["steps"]] if existing else []
+        existing_values = {s["key"]: s["value"] for s in existing["steps"]} if existing else {}
+        # Editing an existing configuration shows its own steps first, in
+        # their saved order (so the rank you already picked is exactly
+        # what you see) and every other available step after, unchecked.
+        ordered_keys = existing_keys + [k for k, _ in self.CONFIG_STEP_ORDER
+                                        if k not in existing_keys and k != "pause"]
+        label_lookup = dict(self.CONFIG_STEP_ORDER)
+
+        # Column widths are fixed across every row (a value-less step like
+        # "Noise reduction" still reserves the value column as blank
+        # space) specifically so the ▲/▼ buttons land in the same
+        # position on every row, checked or not, value or not.
+        VALUE_COLUMN_WIDTH = 80
+
+        for key in ordered_keys:
+            row_frame = ctk.CTkFrame(rows_frame, fg_color=("gray95", "gray24"))
+            var = ctk.BooleanVar(value=key in existing_keys)
+            ctk.CTkCheckBox(row_frame, text=t(label_lookup[key]), variable=var, width=170).grid(
+                row=0, column=0, padx=(8, 8), pady=6, sticky="w")
+            value_entry = None
+            if key in audio_profiles.STEP_KEYS_NO_VALUE:
+                ctk.CTkFrame(row_frame, width=VALUE_COLUMN_WIDTH, height=1, fg_color="transparent").grid(
+                    row=0, column=1, padx=(0, 8), pady=6)
+            else:
+                value_entry = ctk.CTkEntry(row_frame, width=VALUE_COLUMN_WIDTH)
+                default_value = existing_values.get(
+                    key, self.aenh_rows[key]["var"].get() if key in self.aenh_rows else 0.0)
+                value_entry.insert(0, f"{default_value:g}")
+                value_entry.grid(row=0, column=1, padx=(0, 8), pady=6)
+            entry = {"key": key, "var": var, "value_entry": value_entry, "frame": row_frame}
+            ctk.CTkButton(row_frame, text="▲", width=28, height=24,
+                         command=lambda e=entry: move_entry(e, -1)).grid(row=0, column=2, padx=(0, 2), pady=6)
+            ctk.CTkButton(row_frame, text="▼", width=28, height=24,
+                         command=lambda e=entry: move_entry(e, 1)).grid(row=0, column=3, pady=6)
+            builder_rows.append(entry)
+        regrid()
+
+        # "Shorten pauses" — always last, own row below a separator, no
+        # rank buttons at all (see this method's docstring for why).
+        next_row = len(builder_rows)
+        ctk.CTkFrame(rows_frame, height=2, fg_color=("gray70", "gray35")).grid(
+            row=next_row, column=0, sticky="ew", pady=(10, 8))
+        pause_frame = ctk.CTkFrame(rows_frame, fg_color=("gray95", "gray24"))
+        pause_frame.grid(row=next_row + 1, column=0, sticky="ew", pady=2)
+        pause_var = ctk.BooleanVar(value="pause" in existing_keys)
+        ctk.CTkCheckBox(pause_frame, text=t("aclean_pause"), variable=pause_var, width=170).grid(
+            row=0, column=0, padx=(8, 8), pady=6, sticky="w")
+        pause_value_entry = ctk.CTkEntry(pause_frame, width=VALUE_COLUMN_WIDTH)
+        pause_default = existing_values.get(
+            "pause", self.aenh_rows["pause"]["var"].get() if "pause" in self.aenh_rows else 1.5)
+        pause_value_entry.insert(0, f"{pause_default:g}")
+        pause_value_entry.grid(row=0, column=1, padx=(0, 8), pady=6)
+        self._add_tooltip(pause_frame, lambda: t("aenh_config_pause_tip"))
+
+        button_row = ctk.CTkFrame(dlg, fg_color="transparent")
+        button_row.grid(row=2, column=0, sticky="ew", padx=16, pady=(8, 16))
+        button_row.grid_columnconfigure(0, weight=1)
+        status_label = ctk.CTkLabel(button_row, text="", text_color="#e05a5a", anchor="w")
+        status_label.grid(row=0, column=0, sticky="w")
+
+        def on_save():
+            name = name_entry.get().strip()
+            if not name:
+                status_label.configure(text=t("aenh_config_name_required"))
+                return
+            if any(c["name"] == name and (existing is None or c is not existing) for c in self.aenh_configs):
+                status_label.configure(text=t("aenh_config_name_taken"))
+                return
+            steps = []
+            for entry in builder_rows:
+                if not entry["var"].get():
+                    continue
+                value = None
+                if entry["value_entry"] is not None:
+                    try:
+                        value = float(entry["value_entry"].get())
+                    except ValueError:
+                        status_label.configure(
+                            text=t("aenh_config_bad_value", step=t(label_lookup[entry["key"]])))
+                        return
+                steps.append({"key": entry["key"], "value": value})
+            if pause_var.get():
+                try:
+                    steps.append({"key": "pause", "value": float(pause_value_entry.get())})
+                except ValueError:
+                    status_label.configure(text=t("aenh_config_bad_value", step=t("aclean_pause")))
+                    return
+            if not steps:
+                status_label.configure(text=t("aenh_config_no_steps"))
+                return
+            if existing is not None:
+                self.aenh_configs = [c for c in self.aenh_configs if c is not existing]
+            self.aenh_configs.append({"name": name, "steps": steps})
+            audio_profiles.save_profiles(self.aenh_configs)
+            close()
+
+        ctk.CTkButton(button_row, text=t("aenh_config_save_button"), command=on_save).grid(
+            row=0, column=1, padx=(8, 6))
+        ctk.CTkButton(button_row, text=t("aenh_config_cancel_button"), fg_color="transparent",
+                     text_color=self.OUTLINE_BUTTON_TEXT, border_width=1, command=close).grid(
+            row=0, column=2)
+
+        dlg.update_idletasks()
+        x = self.winfo_rootx() + (self.winfo_width() - dlg.winfo_width()) // 2
+        y = self.winfo_rooty() + (self.winfo_height() - dlg.winfo_height()) // 2
+        dlg.geometry(f"+{max(0, x)}+{max(0, y)}")
+        dlg.grab_set()
+
+    def _revert_effect_preview(self):
+        """Discards the current Enhance/Clean preview without applying it
+        — the waveform drops back to the real (unmodified) clip. Distinct
+        from "Revert to original" in the save row below, which discards
+        every already-*applied* edit back to the pristine recording;
+        this only ever discards a not-yet-applied preview."""
+        self._play_until = None
+        self._clear_audio_preview()
+        self._redraw_waveform()
+
+    # ========================================= audio studio: enhance panel
+    #
+    # Built into the Edit subtab (a collapsible panel, see
+    # _build_audio_edit_tab/_toggle_enhance_panel) rather than a separate
+    # tab: these effects act on the waveform Edit is already showing, so
+    # switching tabs to reach them would hide the very thing they're
+    # changing. `parent` here is that panel's own CTkScrollableFrame.
+
+    # Enhance's rows fall into a few genuinely different kinds of tool
+    # (see the Loudness/tone vs. Noise/frequency vs. Repairs/timing
+    # split) — each group collapsible under its own heading, so a long,
+    # three-group panel stays scannable without scrolling past sliders
+    # you're not touching right now. Group name doubles as the second
+    # half of its i18n heading key ("tone" -> "aenh_heading_tone").
+    ENH_GROUPS = ("tone", "noise", "repair")
+
+    def _build_group_heading(self, parent, row, group):
+        """A clickable subheading collapsing/expanding every widget later
+        registered under `group` via self._enh_group_widgets[group]."""
+        btn = ctk.CTkButton(
+            parent, text="", anchor="w", fg_color="transparent",
+            hover_color=("gray85", "gray25"), text_color=self.OUTLINE_BUTTON_TEXT,
+            font=ctk.CTkFont(size=12, weight="bold"),
+            command=lambda g=group: self._toggle_enhance_group(g))
+        btn.grid(row=row, column=0, sticky="ew", padx=6, pady=(14, 2))
+        self._enh_group_headings[group] = btn
+        return btn
+
+    def _toggle_enhance_group(self, group):
+        self._enh_group_collapsed[group] = not self._enh_group_collapsed[group]
+        self._apply_enhance_group_visibility(group)
+
+    def _apply_enhance_group_visibility(self, group):
+        """Shows/hides every widget in the group per its collapsed state,
+        and refreshes the heading's arrow+text — called both right after
+        toggling and from _retranslate_audio_studio_tabs (language switch
+        needs the heading text redrawn too; re-applying the same
+        collapsed state to already-correct widgets is harmless)."""
+        collapsed = self._enh_group_collapsed[group]
+        for w in self._enh_group_widgets[group]:
+            w.grid_remove() if collapsed else w.grid()
+        arrow = "▸" if collapsed else "▾"
+        text = i18n.t(self.ui_lang, f"aenh_heading_{group}")
+        self._enh_group_headings[group].configure(text=f"{arrow} {text}")
+
+    def _build_enhance_panel(self, parent):
+        # Hint (left) and the one-click preset (right) share a row rather
+        # than each getting their own — with several sliders below
+        # already, every extra row here is vertical space the waveform
+        # above loses.
+        hint_row = ctk.CTkFrame(parent, fg_color="transparent")
+        hint_row.grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 10))
+        hint_row.grid_columnconfigure(0, weight=1)
+        # Doubles as the "open a file first" message and, once a clip is
+        # loaded, the reminder that effects act on the current selection
+        # (or the whole clip if nothing's selected) — see
+        # _set_audio_enhance_controls_enabled.
+        self.aenh_no_clip_label = ctk.CTkLabel(
+            hint_row, text="", anchor="w", text_color=self.MUTED_TEXT, wraplength=700, justify="left")
+        self.aenh_no_clip_label.grid(row=0, column=0, sticky="w")
+        # One-click "make this whole recording good" pipeline (see
+        # audio_clean.auto_enhance) — the Descript-style shortcut for
+        # anyone who'd rather not reason about individual sliders. Every
+        # slider below stays exactly as granular as before for when the
+        # one-click result isn't quite right — a tooltip spells out what
+        # it actually does and in what order, since the label alone
+        # ("Auto Enhance") doesn't say.
+        self.aenh_preset_button = ctk.CTkButton(
+            hint_row, text="", height=28, command=self._apply_auto_enhance)
+        self.aenh_preset_button.grid(row=0, column=1, sticky="e", padx=(8, 0))
+        self._add_tooltip(self.aenh_preset_button, lambda: i18n.t(self.ui_lang, "aenh_preset_tip"))
+        # A saved sequence of your own, alongside the fixed Auto Enhance
+        # one — everything about that (create/run/open/rename/delete)
+        # lives behind this one button instead of a permanent row of
+        # controls most sessions will never touch (see
+        # _open_configs_manager_dialog).
+        self.aenh_configs_button = ctk.CTkButton(
+            hint_row, text="", height=28, width=140, fg_color="transparent",
+            text_color=self.OUTLINE_BUTTON_TEXT, border_width=1, command=self._open_configs_manager_dialog)
+        self.aenh_configs_button.grid(row=0, column=2, sticky="e", padx=(8, 0))
+        self._add_tooltip(self.aenh_configs_button, lambda: i18n.t(self.ui_lang, "aenh_configs_button_tip"))
+
+        # Rows split into two groups, each under its own subheading —
+        # otherwise Amplify/EQ/Compressor and High-pass/Noise gate/Noise
+        # reduction all read as one undifferentiated pile of "audio
+        # knobs," which is exactly what made it hard to tell which one to
+        # reach for. "Loudness & tone" never changes *what* noise is
+        # present, only how the existing signal sounds; "Noise &
+        # frequency" is specifically about reducing unwanted sound, each
+        # row a different mechanism (see each one's own tooltip) — a
+        # one-line pointer at the top of that group says which situation
+        # each is actually for.
+        #
+        # (key, label_key, slider_from, slider_to, default, fmt, effect_fn)
+        # Every effect_fn takes the SELECTED buffer (self._selected_buffer()
+        # — the current waveform selection, or the whole clip if nothing's
+        # selected), not self.audio_clip.buffer directly, so Preview/Apply
+        # only ever touch what's actually highlighted.
+        tone_specs = [
+            ("amplify", "aenh_amplify", -24, 24, 0, "{:+.0f} dB", "aenh_amplify_tip",
+             lambda g: audio_dsp.amplify(self._selected_buffer(), g)),
+            ("normalize", "aenh_normalize", -12, 0, -3, "{:.0f} dB", "aenh_normalize_tip",
+             lambda g: audio_dsp.normalize(self._selected_buffer(), g)),
+            ("loudness", "aenh_loudness", -30, -6, -16, "{:.0f} LUFS", "aenh_loudness_tip",
+             lambda t: audio_dsp.normalize_lufs(self._selected_buffer(), self.audio_clip.sample_rate, t)),
+            ("eq", "aenh_eq", -12, 12, 0, "{:+.0f} dB", "aenh_eq_tip",
+             lambda g: audio_dsp.eq_band(self._selected_buffer(), self.audio_clip.sample_rate, 1000.0, g)),
+            ("compress", "aenh_compress", -40, 0, -20, "{:.0f} dB", "aenh_compress_tip",
+             lambda t: audio_dsp.compressor(self._selected_buffer(), self.audio_clip.sample_rate,
+                                            threshold_db=t)),
+        ]
+        noise_specs = [
+            ("high_pass", "aenh_highpass", 20, 2000, 100, "{:.0f} Hz", "aenh_highpass_tip",
+             lambda c: audio_dsp.high_pass(self._selected_buffer(), self.audio_clip.sample_rate, c)),
+            ("low_pass", "aenh_lowpass", 2000, 20000, 8000, "{:.0f} Hz", "aenh_lowpass_tip",
+             lambda c: audio_dsp.low_pass(self._selected_buffer(), self.audio_clip.sample_rate, c)),
+            ("gate", "aclean_gate", -60, -10, -40, "{:.0f} dB", "aclean_gate_tip",
+             lambda t: audio_dsp.noise_gate(self._selected_buffer(), self.audio_clip.sample_rate,
+                                            threshold_db=t)),
+        ]
+        self.aenh_rows = {}
+        self._enh_group_headings = {}
+        self._enh_group_widgets = {g: [] for g in self.ENH_GROUPS}
+        self._enh_group_collapsed = {g: False for g in self.ENH_GROUPS}
+        row = 1  # row 0 = hint_row (built above)
+        self._build_group_heading(parent, row, "tone")
+        row += 1
+        for key, label_key, lo, hi, default, fmt, tip_key, fn in tone_specs:
+            self.aenh_rows[key] = self._build_effect_row(
+                parent, row, label_key, lo, hi, default, fmt=fmt,
+                on_change=lambda v, fn=fn: self._update_effect_preview(fn(v)),
+                on_apply=lambda v, fn=fn: self._apply_audio_effect(fn(v)))
+            self._add_tooltip(self.aenh_rows[key]["label"], lambda k=tip_key: i18n.t(self.ui_lang, k))
+            self._enh_group_widgets["tone"].append(self.aenh_rows[key]["frame"])
+            row += 1
+
+        self._build_group_heading(parent, row, "noise")
+        row += 1
+        self.aenh_noise_guide_label = ctk.CTkLabel(
+            parent, text="", anchor="w", text_color=self.MUTED_TEXT, wraplength=900, justify="left")
+        self.aenh_noise_guide_label.grid(row=row, column=0, sticky="w", padx=10, pady=(0, 6))
+        self._enh_group_widgets["noise"].append(self.aenh_noise_guide_label)
+        row += 1
+        for key, label_key, lo, hi, default, fmt, tip_key, fn in noise_specs:
+            self.aenh_rows[key] = self._build_effect_row(
+                parent, row, label_key, lo, hi, default, fmt=fmt,
+                on_change=lambda v, fn=fn: self._update_effect_preview(fn(v)),
+                on_apply=lambda v, fn=fn: self._apply_audio_effect(fn(v)))
+            self._add_tooltip(self.aenh_rows[key]["label"], lambda k=tip_key: i18n.t(self.ui_lang, k))
+            self._enh_group_widgets["noise"].append(self.aenh_rows[key]["frame"])
+            row += 1
+
+        # Noise reduction — no slider (the model has its own tuned
+        # defaults), so it keeps its own explicit Preview button (unlike
+        # the rows above, dragging isn't how you'd trigger this) — plus
+        # Apply, and a note on which engine actually ran, since
+        # DeepFilterNet and its noisereduce fallback differ noticeably in
+        # quality.
+        denoise_frame = ctk.CTkFrame(parent)
+        denoise_frame.grid(row=row, column=0, sticky="ew", padx=4, pady=4)
+        denoise_frame.grid_columnconfigure(1, weight=1)
+        self.aenh_denoise_label = ctk.CTkLabel(denoise_frame, text="", anchor="w", width=150)
+        self.aenh_denoise_label.grid(row=0, column=0, padx=(10, 8), pady=10, sticky="w")
+        self._add_tooltip(self.aenh_denoise_label, lambda: i18n.t(self.ui_lang, "aenh_denoise_tip"))
+        self.aenh_denoise_engine_label = ctk.CTkLabel(
+            denoise_frame, text="", anchor="w", text_color=self.MUTED_TEXT)
+        self.aenh_denoise_engine_label.grid(row=0, column=1, sticky="ew", padx=(0, 8))
+        self.aenh_denoise_preview_button = ctk.CTkButton(
+            denoise_frame, text="", width=80, height=26, fg_color="transparent",
+            text_color=self.OUTLINE_BUTTON_TEXT, border_width=1, command=self._preview_denoise)
+        self.aenh_denoise_preview_button.grid(row=0, column=3, padx=(0, 6), pady=10)
+        self.aenh_denoise_revert_button = ctk.CTkButton(
+            denoise_frame, text="", width=80, height=26, fg_color="transparent",
+            text_color=self.OUTLINE_BUTTON_TEXT, border_width=1,
+            command=self._revert_effect_preview)
+        self.aenh_denoise_revert_button.grid(row=0, column=4, padx=(0, 6), pady=10)
+        self.aenh_denoise_apply_button = ctk.CTkButton(
+            denoise_frame, text="", width=80, height=26, command=self._apply_denoise)
+        self.aenh_denoise_apply_button.grid(row=0, column=5, padx=(0, 10), pady=10)
+        self._enh_group_widgets["noise"].append(denoise_frame)
+        row += 1
+
+        # Noise profile — the classic Audacity "select noise, Get Noise
+        # Profile, Apply" workflow: tunes denoising to this recording's
+        # own specific noise, which often beats the blind model-based
+        # denoise above on unusual/non-speech noise (a particular fridge
+        # hum, a fan). Optional — with no profile captured, the buttons
+        # above keep using blind DeepFilterNet/noisereduce as before.
+        profile_frame = ctk.CTkFrame(parent, fg_color="transparent")
+        profile_frame.grid(row=row, column=0, sticky="ew", padx=8, pady=(0, 8))
+        self.aenh_profile_label = ctk.CTkLabel(profile_frame, text="", anchor="w", text_color=self.MUTED_TEXT)
+        self.aenh_profile_label.grid(row=0, column=0, sticky="w", padx=(0, 10))
+        self.aenh_get_profile_button = ctk.CTkButton(
+            profile_frame, text="", width=190, height=26, fg_color="transparent",
+            text_color=self.OUTLINE_BUTTON_TEXT, border_width=1, command=self._capture_noise_profile)
+        self.aenh_get_profile_button.grid(row=0, column=1, padx=(0, 6))
+        self._add_tooltip(self.aenh_get_profile_button, lambda: i18n.t(self.ui_lang, "aenh_profile_tip"))
+        self.aenh_clear_profile_button = ctk.CTkButton(
+            profile_frame, text="", width=90, height=26, fg_color="transparent",
+            text_color=self.OUTLINE_BUTTON_TEXT, border_width=1, command=self._clear_noise_profile)
+        self.aenh_clear_profile_button.grid(row=0, column=2)
+        self._enh_group_widgets["noise"].append(profile_frame)
+        row += 1
+
+        # Third group: one-off repairs at a specific spot (a click *here*,
+        # a pause *there*) rather than a rule applied uniformly throughout
+        # — the one distinction among all these tools that actually holds
+        # up (unlike "fixes a problem", which every row above could just
+        # as easily claim: too quiet is a problem, hiss is a problem,
+        # everything here is "fixing a problem" from the listener's
+        # side — that's not a dividing line, it's just true of the whole
+        # panel).
+        self._build_group_heading(parent, row, "repair")
+        row += 1
+        repair_specs = [
+            ("pause", "aclean_pause", 0.5, 5.0, 1.5, "{:.1f}s", "aclean_pause_tip",
+             lambda mp: audio_clean.remove_long_pauses(
+                 self._selected_buffer(), self.audio_clip.sample_rate, max_pause_s=mp,
+                 return_ranges=True)),
+            ("clicks", "aclean_clicks", 2, 12, 6, "{:.0f}σ", "aclean_clicks_tip",
+             lambda th: audio_clean.remove_clicks(
+                 self._selected_buffer(), self.audio_clip.sample_rate, threshold=th)),
+        ]
+        for key, label_key, lo, hi, default, fmt, tip_key, fn in repair_specs:
+            self.aenh_rows[key] = self._build_effect_row(
+                parent, row, label_key, lo, hi, default, fmt=fmt,
+                on_change=lambda v, fn=fn: self._update_effect_preview(fn(v)),
+                on_apply=lambda v, fn=fn: self._apply_audio_effect(fn(v)))
+            if key == "pause":
+                self._add_tooltip(self.aenh_rows[key]["label"], lambda k=tip_key: i18n.t(
+                    self.ui_lang, k, keep=f"{audio_clean.DEFAULT_PAUSE_KEEP_S:g}"))
+            else:
+                self._add_tooltip(self.aenh_rows[key]["label"], lambda k=tip_key: i18n.t(self.ui_lang, k))
+            self._enh_group_widgets["repair"].append(self.aenh_rows[key]["frame"])
+            row += 1
+
+    def _capture_noise_profile(self):
+        if self.audio_clip is None or not self.audio_selection:
+            self._set_audio_edit_status("aedit_status_need_selection")
+            return
+        self.audio_noise_profile = self._selected_buffer().copy()
+        self._update_noise_profile_label()
+        self.aenh_clear_profile_button.configure(state="normal")
+
+    def _clear_noise_profile(self):
+        self.audio_noise_profile = None
+        self._update_noise_profile_label()
+        self.aenh_clear_profile_button.configure(state="disabled")
+
+    def _update_noise_profile_label(self):
+        if self.audio_noise_profile is not None and self.audio_clip is not None:
+            seconds = len(self.audio_noise_profile) / self.audio_clip.sample_rate
+            text = i18n.t(self.ui_lang, "aenh_profile_active", seconds=f"{seconds:.1f}")
+        else:
+            text = i18n.t(self.ui_lang, "aenh_profile_none")
+        self.aenh_profile_label.configure(text=text)
+
+    def _set_audio_enhance_controls_enabled(self, enabled):
+        state = "normal" if enabled else "disabled"
+        self.aenh_preset_button.configure(state=state)
+        self.aenh_no_clip_label.configure(text=i18n.t(
+            self.ui_lang, "aenh_selection_hint" if enabled else "aenh_no_clip"))
+        self.aenh_configs_button.configure(state=state)
+        for row in self.aenh_rows.values():
+            row["slider"].configure(state=state)
+            row["revert_btn"].configure(state=state)
+            row["apply_btn"].configure(state=state)
+        self.aenh_denoise_preview_button.configure(state=state)
+        self.aenh_denoise_revert_button.configure(state=state)
+        self.aenh_denoise_apply_button.configure(state=state)
+        self.aenh_get_profile_button.configure(state=state)
+        self.aenh_clear_profile_button.configure(
+            state="normal" if enabled and self.audio_noise_profile is not None else "disabled")
+
+    def _run_denoise_async(self, on_result):
+        """Computes Enhance's Noise reduction row on a background thread
+        behind the busy modal — DeepFilterNet especially can take a real
+        moment — then calls on_result(result_buffer) on the main thread.
+        Preview and Apply only differ in what they do with that result,
+        so they both just supply a different on_result."""
+        if self.audio_clip is None:
+            return
+        buffer = self._selected_buffer()
+        sample_rate = self.audio_clip.sample_rate
+        profile = self.audio_noise_profile
+
+        def work():
+            if profile is not None:
+                return audio_denoise.denoise_with_profile(buffer, sample_rate, profile), "profile"
+            return audio_denoise.denoise(buffer, sample_rate)
+
+        def done(payload, error):
+            if error is not None:  # already logged by _run_busy itself
+                self._set_audio_edit_status("aedit_status_effect_failed")
+                return
+            result, engine = payload
+            # "profile" is a plain sentinel from work() above, not yet
+            # translated — i18n.t only happens here, on the main thread.
+            engine_label = i18n.t(self.ui_lang, "aenh_profile_engine") if engine == "profile" else engine
+            self.aenh_denoise_engine_label.configure(
+                text=i18n.t(self.ui_lang, "aenh_denoise_engine", engine=engine_label))
+            on_result(result)
+
+        self._run_busy("aenh_busy_title_denoise", work, done)
+
+    def _preview_denoise(self):
+        self._run_denoise_async(lambda result: self._update_effect_preview(result, autoplay=True))
+
+    def _apply_denoise(self):
+        self._run_denoise_async(self._apply_audio_effect)
+
+    def _detect_sections(self):
+        """Auto-labeled markers ("Section 1", "Section 2", …) — one at
+        the start of the recording's speech, and one after every real
+        break (a pause of at least audio_clean.DEFAULT_SECTION_GAP_S)
+        since speech last stopped. Reuses the same VAD detection
+        audio_clean.detect_silences/remove_long_pauses already run, not a
+        second pass — see audio_clean.speech_sections for why it merges
+        across short pauses instead of marking every one. Replaces only
+        the previous auto set; user-added markers are untouched (see
+        AudioClip.replace_auto_markers). Runs on a background thread
+        behind the busy modal — VAD inference on a long recording is
+        real work, not instant."""
+        if self.audio_clip is None:
+            return
+        buffer, sample_rate = self.audio_clip.buffer, self.audio_clip.sample_rate
+
+        def work():
+            return audio_clean.speech_sections(buffer, sample_rate)
+
+        def done(starts, error):
+            if error is not None:  # already logged by _run_busy itself
+                self._set_audio_edit_status("aedit_status_sections_failed")
+                return
+            labels = [(start, i18n.t(self.ui_lang, "aedit_section_label", n=i + 1))
+                     for i, start in enumerate(starts)]
+            self.audio_clip.replace_auto_markers(labels)
+            self._redraw_waveform()
+            self._render_markers_panel()
+            self._set_audio_edit_status("aedit_status_sections_found", {"count": len(labels)})
+
+        self._run_busy("aenh_busy_title_sections", work, done)
+
+    # -- user-added markers -------------------------------------------------
+
+    def _add_marker_at_playhead(self):
+        if self.audio_clip is None:
+            return
+        label = simpledialog.askstring(
+            i18n.t(self.ui_lang, "aedit_marker_dialog_title"),
+            i18n.t(self.ui_lang, "aedit_marker_dialog_prompt"),
+            parent=self)
+        if not label:
+            return
+        self.audio_clip.add_marker(self.audio_player.get_time(), label, auto=False)
+        self._redraw_waveform()
+        self._render_markers_panel()
+
+    def _marker_lane_x_to_seconds(self, x):
+        width = max(1, self.amarker_canvas.winfo_width())
+        start, end = self.audio_zoom
+        return start + max(0.0, min(1.0, x / width)) * (end - start)
+
+    def _marker_near_x(self, x, tolerance_px=10):
+        """Returns the index into audio_clip.markers whose flag is within
+        tolerance_px of `x`, or None — used by every marker-lane
+        interaction so they all agree on which marker was hit. Widened
+        from the original 6px: the flags themselves are only ~7px wide,
+        which made them easy to miss by a pixel or two in practice."""
+        if self.audio_clip is None or not self.audio_clip.markers:
+            return None
+        width = max(1, self.amarker_canvas.winfo_width())
+        start, end = self.audio_zoom
+        if end <= start:
+            return None
+        best_index, best_dist = None, tolerance_px + 1
+        for i, m in enumerate(self.audio_clip.markers):
+            mx = (m["time"] - start) / (end - start) * width
+            dist = abs(mx - x)
+            if dist < best_dist:
+                best_index, best_dist = i, dist
+        return best_index
+
+    def _on_marker_lane_click(self, event):
+        index = self._marker_near_x(event.x)
+        if index is None:
+            return
+        self._seek_audio_edit_to(self.audio_clip.markers[index]["time"])
+        self._redraw_waveform()
+
+    def _on_marker_lane_double_click(self, event):
+        index = self._marker_near_x(event.x)
+        if index is not None:
+            self._rename_marker(index)
+
+    def _on_marker_lane_right_click(self, event):
+        """Right-clicking a marker used to delete it immediately, with no
+        way to rename one at all — neither was discoverable. A small
+        context menu makes both an explicit, visible choice instead."""
+        index = self._marker_near_x(event.x)
+        if index is None:
+            return
+        menu = tk.Menu(self, tearoff=0)
+        menu.add_command(label=i18n.t(self.ui_lang, "aedit_marker_rename"),
+                         command=lambda: self._rename_marker(index))
+        menu.add_command(label=i18n.t(self.ui_lang, "aedit_marker_delete"),
+                         command=lambda: self._delete_marker(index))
+        menu.tk_popup(event.x_root, event.y_root)
+
+    def _rename_marker(self, index):
+        if self.audio_clip is None or not (0 <= index < len(self.audio_clip.markers)):
+            return
+        current = self.audio_clip.markers[index]["label"]
+        new_label = simpledialog.askstring(
+            i18n.t(self.ui_lang, "aedit_marker_dialog_title"),
+            i18n.t(self.ui_lang, "aedit_marker_dialog_prompt"),
+            initialvalue=current, parent=self)
+        if new_label:
+            self.audio_clip.markers[index]["label"] = new_label
+            self._redraw_waveform()
+            self._render_markers_panel()
+
+    def _delete_marker(self, index):
+        if self.audio_clip is None:
+            return
+        self.audio_clip.remove_marker_at(index)
+        self._redraw_waveform()
+        self._render_markers_panel()
+
+    def _redraw_marker_lane(self):
+        canvas = self.amarker_canvas
+        canvas.delete("all")
+        canvas.configure(bg=self._resolve_root_bg())
+        if self.audio_clip is None or not self.audio_clip.markers:
+            return
+        width = max(1, canvas.winfo_width())
+        height = max(1, canvas.winfo_height())
+        start, end = self.audio_zoom
+        if end <= start:
+            return
+        color = self.EFFECT_PANEL_ACCENT
+        for m in self.audio_clip.markers:
+            if not (start <= m["time"] <= end):
+                continue
+            x = (m["time"] - start) / (end - start) * width
+            canvas.create_polygon(x, 1, x + 7, 4, x, 8, fill=color, outline=color)
+            canvas.create_line(x, 0, x, height, fill=color)
+            canvas.create_text(x + 9, height / 2, anchor="w", text=m["label"],
+                               fill=color, font=("Segoe UI", 8))
+
+    # ===================================================== audio studio: find
+    # similar segments — a third collapsible panel beside Enhance/Clean
+    # (see _toggle_effects_panel). Select a snippet (e.g. one time a word
+    # or phrase is said), search for every other place it recurs, review
+    # each match (jump to it, listen), then remove whichever are checked
+    # in a single batch.
+
+    # Matches panel's display-filter presets — value -> minimum score to
+    # show. The search itself already only returns >=80% (see
+    # audio_find.DEFAULT_THRESHOLD), so "≥80%" here shows everything
+    # found; the tighter presets just narrow which of those already-
+    # found matches are worth reviewing, without re-running the search.
+    FIND_FILTER_VALUES = {"≥80%": 0.80, "≥85%": 0.85, "≥90%": 0.90, "≥95%": 0.95}
+
+    def _build_find_panel(self, parent):
+        top = ctk.CTkFrame(parent, fg_color="transparent")
+        top.grid(row=0, column=0, sticky="ew", padx=8, pady=(4, 8))
+        top.grid_columnconfigure(0, weight=1)
+        self.afind_hint_label = ctk.CTkLabel(
+            top, text="", anchor="w", text_color=self.MUTED_TEXT, wraplength=700, justify="left")
+        self.afind_hint_label.grid(row=0, column=0, sticky="w")
+        self.afind_filter_menu = ctk.CTkOptionMenu(
+            top, width=100, values=list(self.FIND_FILTER_VALUES.keys()),
+            command=self._on_find_filter_change)
+        self.afind_filter_menu.set("≥80%")
+        self.afind_filter_menu.grid(row=0, column=1, sticky="e", padx=(8, 0))
+        self._add_tooltip(self.afind_filter_menu, lambda: i18n.t(self.ui_lang, "afind_filter_tip"))
+
+        self.afind_rows_frame = ctk.CTkScrollableFrame(parent, fg_color="transparent")
+        self.afind_rows_frame.grid(row=1, column=0, sticky="nsew", padx=4, pady=(0, 8))
+        self.afind_rows_frame.grid_columnconfigure(0, weight=1)
+
+        bottom = ctk.CTkFrame(parent, fg_color="transparent")
+        bottom.grid(row=2, column=0, sticky="ew", padx=8, pady=(0, 8))
+        self.afind_select_all_button = ctk.CTkButton(
+            bottom, text="", width=90, height=30, fg_color="transparent",
+            text_color=self.OUTLINE_BUTTON_TEXT, border_width=1, state="disabled",
+            command=lambda: self._set_all_match_checks(True))
+        self.afind_select_all_button.grid(row=0, column=0, padx=(0, 6))
+        self.afind_select_none_button = ctk.CTkButton(
+            bottom, text="", width=90, height=30, fg_color="transparent",
+            text_color=self.OUTLINE_BUTTON_TEXT, border_width=1, state="disabled",
+            command=lambda: self._set_all_match_checks(False))
+        self.afind_select_none_button.grid(row=0, column=1, padx=(0, 14))
+        self.afind_delete_button = ctk.CTkButton(
+            bottom, text="", height=30, state="disabled", command=self._delete_checked_matches)
+        self.afind_delete_button.grid(row=0, column=2, padx=(0, 8))
+
+        # _find_matches: [(start_s, end_s, score), ...] from the last search.
+        # _find_vars: one BooleanVar per match, parallel to _find_matches.
+        self._clear_find_results()
+
+    def _run_find_similar(self):
+        """Runs the search on a background thread behind a modal "please
+        wait" dialog: even after the find_similar_segments perf fix a
+        long recording can take a noticeable moment, and the previous
+        synchronous call froze the whole window for that whole moment
+        with no way to tell it was still working, let alone stop it."""
+        if self.audio_clip is None:
+            return
+        if not self.audio_selection:
+            self._set_audio_edit_status("aedit_status_need_selection")
+            return
+        start, end = self.audio_selection
+        buffer = self.audio_clip.buffer
+        sample_rate = self.audio_clip.sample_rate
+        cancel_event = threading.Event()
+        self._find_cancel_event = cancel_event
+
+        def progress_cb(frac, results_so_far):
+            self.events.put(("find_similar", "progress", (frac, len(results_so_far))))
+
+        def cancel_cb():
+            return cancel_event.is_set()
+
+        def work():
+            try:
+                results = audio_find.find_similar_segments(
+                    buffer, sample_rate, start, end,
+                    progress_cb=progress_cb, cancel_cb=cancel_cb)
+                status = "cancelled" if cancel_event.is_set() else "done"
+                self.events.put(("find_similar", status, results))
+            except Exception:
+                settings.log_exception("Audio Studio: find-similar failed:")
+                self.events.put(("find_similar", "error", []))
+
+        self._show_find_progress_dialog()
+        threading.Thread(target=work, daemon=True).start()
+
+    def _show_find_progress_dialog(self):
+        dlg = ctk.CTkToplevel(self)
+        dlg.title(i18n.t(self.ui_lang, "afind_searching_title"))
+        dlg.resizable(False, False)
+        dlg.transient(self)
+        # No title-bar close — Cancel (below) is the only way out, so a
+        # stray Alt-F4/Escape can't leave the search running with the
+        # rest of the app silently un-grabbed.
+        dlg.protocol("WM_DELETE_WINDOW", lambda: None)
+        self._find_progress_label = ctk.CTkLabel(
+            dlg, text=i18n.t(self.ui_lang, "afind_searching_status", pct=0, count=0))
+        self._find_progress_label.pack(padx=24, pady=(22, 10))
+        self._find_progress_bar = ctk.CTkProgressBar(dlg, width=300)
+        self._find_progress_bar.set(0)
+        self._find_progress_bar.pack(padx=24, pady=(0, 16))
+        self._find_progress_cancel_btn = ctk.CTkButton(
+            dlg, text=i18n.t(self.ui_lang, "afind_cancel_search"),
+            command=self._cancel_find_similar)
+        self._find_progress_cancel_btn.pack(pady=(0, 18))
+        dlg.update_idletasks()
+        x = self.winfo_rootx() + (self.winfo_width() - dlg.winfo_width()) // 2
+        y = self.winfo_rooty() + (self.winfo_height() - dlg.winfo_height()) // 2
+        dlg.geometry(f"+{max(0, x)}+{max(0, y)}")
+        # Modal: grabs all input so the rest of the app can't be clicked
+        # while the search is running, per the user's explicit ask.
+        dlg.grab_set()
+        self._find_progress_dialog = dlg
+
+    def _update_find_progress_dialog(self, frac, count):
+        if self._find_progress_dialog is None:
+            return
+        self._find_progress_bar.set(frac)
+        self._find_progress_label.configure(
+            text=i18n.t(self.ui_lang, "afind_searching_status", pct=int(frac * 100), count=count))
+
+    def _cancel_find_similar(self):
+        if self._find_cancel_event is not None:
+            self._find_cancel_event.set()
+        if self._find_progress_cancel_btn is not None:
+            self._find_progress_cancel_btn.configure(
+                state="disabled", text=i18n.t(self.ui_lang, "afind_cancelling"))
+
+    def _close_find_progress_dialog(self):
+        if self._find_progress_dialog is not None:
+            self._find_progress_dialog.grab_release()
+            self._find_progress_dialog.destroy()
+        self._find_progress_dialog = None
+        self._find_progress_label = None
+        self._find_progress_bar = None
+        self._find_progress_cancel_btn = None
+        self._find_cancel_event = None
+
+    def _on_find_similar_event(self, status, payload):
+        if status == "progress":
+            frac, count = payload
+            self._update_find_progress_dialog(frac, count)
+            return
+        self._close_find_progress_dialog()
+        self._find_matches = payload  # whatever was found so far, for "cancelled" and "error" too
+        self._find_has_searched = True
+        self.active_effects_panel = "find"
+        self._show_active_effects_panel()
+        self._render_find_results()
+        # The Matches panel becoming visible for the very first time
+        # resizes the waveform canvas (it now shares vertical space with
+        # the panel below it) — Tk only recomputes that geometry on its
+        # next idle pass, so without forcing it here _redraw_waveform
+        # below would read the canvas's still-stale (taller, pre-panel)
+        # size just this once and draw at the wrong scale, correcting
+        # itself only on the next unrelated redraw (found via a real
+        # first-search-looks-wrong-then-fixes-itself report).
+        self.awave_canvas.update_idletasks()
+        self._redraw_waveform()  # without this, the green overlay kept showing the PREVIOUS search's matches
+
+    def _on_find_filter_change(self, value):
+        self._find_min_score = self.FIND_FILTER_VALUES.get(value, 0.80)
+        self._render_find_results()
+        self._redraw_waveform()  # checked-match overlay needs to drop whatever just got filtered out
+
+    def _render_find_results(self):
+        for w in self.afind_rows_frame.winfo_children():
+            w.destroy()
+        self._find_vars = []
+        self._find_visible_matches = [m for m in self._find_matches if m[2] >= self._find_min_score]
+        if not self._find_matches:
+            key = "afind_none_found" if self._find_has_searched else "afind_hint"
+            self.afind_hint_label.configure(text=i18n.t(self.ui_lang, key))
+            self.afind_delete_button.configure(state="disabled")
+            self.afind_select_all_button.configure(state="disabled")
+            self.afind_select_none_button.configure(state="disabled")
+            self._update_rows_scrollbar(self.afind_rows_frame)
+            return
+        if not self._find_visible_matches:
+            self.afind_hint_label.configure(text=i18n.t(
+                self.ui_lang, "afind_none_at_filter", count=len(self._find_matches)))
+            self.afind_delete_button.configure(state="disabled")
+            self.afind_select_all_button.configure(state="disabled")
+            self.afind_select_none_button.configure(state="disabled")
+            self._update_rows_scrollbar(self.afind_rows_frame)
+            return
+        self.afind_hint_label.configure(
+            text=i18n.t(self.ui_lang, "afind_found", count=len(self._find_visible_matches)))
+        for i, (start, end, score) in enumerate(self._find_visible_matches):
+            var = ctk.BooleanVar(value=True)
+            self._find_vars.append(var)
+            row = ctk.CTkFrame(self.afind_rows_frame, fg_color=("gray95", "gray24"))
+            row.grid(row=i, column=0, sticky="ew", pady=2)
+            row.grid_columnconfigure(1, weight=1)
+            ctk.CTkCheckBox(row, text="", variable=var, width=20,
+                           command=self._redraw_waveform).grid(
+                row=0, column=0, padx=(8, 6), pady=6)
+            ctk.CTkLabel(
+                row, anchor="w",
+                text=f"{_fmt_time(start)} – {_fmt_time(end)}   ({score * 100:.0f}%)",
+            ).grid(row=0, column=1, sticky="ew", pady=6)
+            play_btn = ctk.CTkButton(
+                row, text=i18n.t(self.ui_lang, "afind_play"), width=60, height=24,
+                fg_color="transparent", text_color=self.OUTLINE_BUTTON_TEXT, border_width=1,
+                command=lambda s=start, e=end: self._play_match(s, e))
+            play_btn.grid(row=0, column=2, padx=(6, 0), pady=6)
+            jump_btn = ctk.CTkButton(
+                row, text=i18n.t(self.ui_lang, "afind_jump"), width=70, height=24,
+                fg_color="transparent", text_color=self.OUTLINE_BUTTON_TEXT, border_width=1,
+                command=lambda s=start, e=end: self._jump_to_match(s, e))
+            jump_btn.grid(row=0, column=3, padx=(6, 8), pady=6)
+        self.afind_delete_button.configure(state="normal")
+        self.afind_select_all_button.configure(state="normal")
+        self.afind_select_none_button.configure(state="normal")
+        self._update_rows_scrollbar(self.afind_rows_frame)
+
+    def _update_rows_scrollbar(self, frame):
+        """Hides a Matches/No speech/Markers rows panel's scrollbar when
+        everything already fits, showing it only once content actually
+        overflows the fixed-height area — CTkScrollableFrame has no such
+        behavior built in (its scrollbar is always gridded, a thin full-
+        length thumb even with one row), so this reads the canvas's
+        actual content height against its visible height after every
+        render and toggles it by hand."""
+        frame.update_idletasks()
+        canvas = frame._parent_canvas
+        bbox = canvas.bbox("all")
+        content_h = (bbox[3] - bbox[1]) if bbox else 0
+        if content_h > canvas.winfo_height():
+            frame._scrollbar.grid()
+        else:
+            frame._scrollbar.grid_remove()
+
+    def _pan_into_view(self, t):
+        """Shifts the zoom window just enough to bring time `t` into view,
+        keeping the current zoom *width* unchanged — Jump should move the
+        view, not change how zoomed-in it is."""
+        if self.audio_clip is None:
+            return
+        start, end = self.audio_zoom
+        width = end - start
+        if start <= t <= end:
+            return
+        full = self.audio_clip.duration
+        new_start = max(0.0, min(full - width, t - width / 2))
+        self.audio_zoom = (new_start, min(full, new_start + width))
+
+    def _jump_to_match(self, start, end):
+        """Selects and seeks to a match without zooming in — Play (beside
+        this button in the row) is the one that actually starts audio."""
+        if self.audio_clip is None:
+            return
+        self.audio_selection = (start, end)
+        self._pan_into_view(start)
+        self._seek_audio_edit_to(start)
+        self._redraw_waveform()
+
+    def _play_match(self, start, end):
+        """Jumps to the match (same as _jump_to_match) and immediately
+        plays just that span — unlike the transport Play button, this
+        always starts playback from the beginning of the match rather
+        than toggling pause if something else was already playing."""
+        if self.audio_clip is None:
+            return
+        self.audio_player.pause()
+        self._jump_to_match(start, end)
+        self._play_until = end
+        self.audio_player.play()
+        self._render_audio_edit_play_button()
+
+    def _set_all_match_checks(self, checked):
+        for var in self._find_vars:
+            var.set(checked)
+        self._redraw_waveform()
+
+    def _delete_checked_matches(self):
+        if self.audio_clip is None:
+            return
+        ranges = [m[:2] for m, v in zip(self._find_visible_matches, self._find_vars) if v.get()]
+        if not ranges:
+            return
+        self.audio_clip.remove_ranges(ranges)
+        self._after_audio_edit()  # also clears _find_matches — the positions just shifted
+        self._zoom_audio_edit_fit()
+        self._set_audio_edit_status("aedit_status_removed_matches", {"count": len(ranges)})
+
+    # ==================================================== audio studio: markers
+    # panel — a fourth collapsible panel beside Enhance/Clean/Matches,
+    # listing every marker (both auto-detected sections and user-added
+    # ones) with the same review-then-act shape as Find Similar: check
+    # the ones you want, Play/Jump/Rename any one, or delete a batch.
+
+    def _build_markers_panel(self, parent):
+        # "Detect sections" lives here (not in Clean, where it used to
+        # be) because what it actually does is add markers — it just
+        # happens to reuse Clean's own VAD detection to decide where.
+        # Same row as the hint label (far right of it), not its own row —
+        # the hint text already has the height, so a whole extra row just
+        # for one button would be pure wasted space.
+        top = ctk.CTkFrame(parent, fg_color="transparent")
+        top.grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 8))
+        top.grid_columnconfigure(0, weight=1)
+        self.amark_hint_label = ctk.CTkLabel(
+            top, text="", anchor="w", text_color=self.MUTED_TEXT, wraplength=700, justify="left")
+        self.amark_hint_label.grid(row=0, column=0, sticky="w")
+        self.amark_sections_button = ctk.CTkButton(
+            top, text="", width=160, height=28, fg_color="transparent",
+            text_color=self.OUTLINE_BUTTON_TEXT, border_width=1, command=self._detect_sections)
+        self.amark_sections_button.grid(row=0, column=1, sticky="e", padx=(8, 0))
+        self._add_tooltip(self.amark_sections_button, lambda: i18n.t(
+            self.ui_lang, "aclean_sections_tip", min_gap=audio_clean.DEFAULT_SECTION_GAP_S))
+
+        self.amark_rows_frame = ctk.CTkScrollableFrame(parent, fg_color="transparent")
+        self.amark_rows_frame.grid(row=1, column=0, sticky="nsew", padx=4, pady=(0, 8))
+        self.amark_rows_frame.grid_columnconfigure(0, weight=1)
+
+        bottom = ctk.CTkFrame(parent, fg_color="transparent")
+        bottom.grid(row=2, column=0, sticky="ew", padx=8, pady=(0, 8))
+        self.amark_select_all_button = ctk.CTkButton(
+            bottom, text="", width=90, height=30, fg_color="transparent",
+            text_color=self.OUTLINE_BUTTON_TEXT, border_width=1, state="disabled",
+            command=lambda: self._set_all_marker_checks(True))
+        self.amark_select_all_button.grid(row=0, column=0, padx=(0, 6))
+        self.amark_select_none_button = ctk.CTkButton(
+            bottom, text="", width=90, height=30, fg_color="transparent",
+            text_color=self.OUTLINE_BUTTON_TEXT, border_width=1, state="disabled",
+            command=lambda: self._set_all_marker_checks(False))
+        self.amark_select_none_button.grid(row=0, column=1, padx=(0, 14))
+        self.amark_delete_button = ctk.CTkButton(
+            bottom, text="", height=30, state="disabled", command=self._delete_checked_markers)
+        self.amark_delete_button.grid(row=0, column=2, padx=(0, 8))
+
+        self._marker_vars = []  # one BooleanVar per audio_clip.markers entry, parallel to it
+        self._render_markers_panel()
+
+    def _render_markers_panel(self):
+        for w in self.amark_rows_frame.winfo_children():
+            w.destroy()
+        self._marker_vars = []
+        markers = self.audio_clip.markers if self.audio_clip is not None else []
+        if not markers:
+            self.amark_hint_label.configure(text=i18n.t(self.ui_lang, "amark_none"))
+            for btn in (self.amark_select_all_button, self.amark_select_none_button,
+                       self.amark_delete_button):
+                btn.configure(state="disabled")
+            self._update_rows_scrollbar(self.amark_rows_frame)
+            return
+        self.amark_hint_label.configure(text=i18n.t(self.ui_lang, "amark_found", count=len(markers)))
+        for i, m in enumerate(markers):
+            var = ctk.BooleanVar(value=False)
+            self._marker_vars.append(var)
+            row = ctk.CTkFrame(self.amark_rows_frame, fg_color=("gray95", "gray24"))
+            row.grid(row=i, column=0, sticky="ew", pady=2)
+            row.grid_columnconfigure(1, weight=1)
+            ctk.CTkCheckBox(row, text="", variable=var, width=20).grid(
+                row=0, column=0, padx=(8, 6), pady=6)
+            ctk.CTkLabel(row, anchor="w", text=f"{_fmt_time(m['time'])}   {m['label']}").grid(
+                row=0, column=1, sticky="ew", pady=6)
+            ctk.CTkButton(
+                row, text=i18n.t(self.ui_lang, "afind_play"), width=56, height=24,
+                fg_color="transparent", text_color=self.OUTLINE_BUTTON_TEXT, border_width=1,
+                command=lambda idx=i: self._play_marker(idx),
+            ).grid(row=0, column=2, padx=(6, 0), pady=6)
+            ctk.CTkButton(
+                row, text=i18n.t(self.ui_lang, "afind_jump"), width=56, height=24,
+                fg_color="transparent", text_color=self.OUTLINE_BUTTON_TEXT, border_width=1,
+                command=lambda idx=i: self._jump_to_marker(idx),
+            ).grid(row=0, column=3, padx=(6, 0), pady=6)
+            ctk.CTkButton(
+                row, text=i18n.t(self.ui_lang, "aedit_marker_rename"), width=70, height=24,
+                fg_color="transparent", text_color=self.OUTLINE_BUTTON_TEXT, border_width=1,
+                command=lambda idx=i: self._rename_marker(idx),
+            ).grid(row=0, column=4, padx=(6, 8), pady=6)
+        for btn in (self.amark_select_all_button, self.amark_select_none_button, self.amark_delete_button):
+            btn.configure(state="normal")
+        self._update_rows_scrollbar(self.amark_rows_frame)
+
+    def _set_all_marker_checks(self, checked):
+        for var in self._marker_vars:
+            var.set(checked)
+
+    def _delete_checked_markers(self):
+        if self.audio_clip is None:
+            return
+        indices = [i for i, v in enumerate(self._marker_vars) if v.get()]
+        for i in sorted(indices, reverse=True):  # delete from the end so earlier indices stay valid
+            self.audio_clip.remove_marker_at(i)
+        self._render_markers_panel()
+        self._redraw_waveform()
+
+    def _jump_to_marker(self, index):
+        if self.audio_clip is None or not (0 <= index < len(self.audio_clip.markers)):
+            return
+        t = self.audio_clip.markers[index]["time"]
+        self.audio_selection = None
+        self._pan_into_view(t)
+        self._seek_audio_edit_to(t)
+        self._redraw_waveform()
+
+    def _play_marker(self, index):
+        """Plays onward from the marker — markers are points, not
+        ranges, so unlike _play_match there's no natural end to stop at."""
+        if self.audio_clip is None or not (0 <= index < len(self.audio_clip.markers)):
+            return
+        self.audio_player.pause()
+        self._jump_to_marker(index)
+        self._play_until = None
+        self.audio_player.play()
+        self._render_audio_edit_play_button()
+
+    def _clear_find_results(self):
+        self._find_matches = []
+        self._find_visible_matches = []
+        self._find_vars = []
+        self._find_has_searched = False
+        if hasattr(self, "afind_hint_label"):  # not yet built during initial clip-less state
+            self._render_find_results()
+
+    # ==================================================== audio studio: no-speech
+    # panel (internal name still "silence" — see audio_clean.detect_silences
+    # for why the user-facing label is "No speech" instead) — beside
+    # Matches, listing every stretch with no detected speech with the same
+    # review-then-act shape: check the ones to remove, or Play/Jump any
+    # one. "Detect no-speech" in the toolbar (beside Find similar) is what
+    # populates this list — it used to just print a one-line count/
+    # duration summary in the Clean subtab, which told you a number but
+    # gave nothing to actually act on.
+
+    def _build_silence_panel(self, parent):
+        self.asilence_hint_label = ctk.CTkLabel(
+            parent, text="", anchor="w", text_color=self.MUTED_TEXT, wraplength=900, justify="left")
+        self.asilence_hint_label.grid(row=0, column=0, sticky="w", padx=8, pady=(4, 8))
+
+        self.asilence_rows_frame = ctk.CTkScrollableFrame(parent, fg_color="transparent")
+        self.asilence_rows_frame.grid(row=1, column=0, sticky="nsew", padx=4, pady=(0, 8))
+        self.asilence_rows_frame.grid_columnconfigure(0, weight=1)
+
+        bottom = ctk.CTkFrame(parent, fg_color="transparent")
+        bottom.grid(row=2, column=0, sticky="ew", padx=8, pady=(0, 8))
+        self.asilence_select_all_button = ctk.CTkButton(
+            bottom, text="", width=90, height=30, fg_color="transparent",
+            text_color=self.OUTLINE_BUTTON_TEXT, border_width=1, state="disabled",
+            command=lambda: self._set_all_silence_checks(True))
+        self.asilence_select_all_button.grid(row=0, column=0, padx=(0, 6))
+        self.asilence_select_none_button = ctk.CTkButton(
+            bottom, text="", width=90, height=30, fg_color="transparent",
+            text_color=self.OUTLINE_BUTTON_TEXT, border_width=1, state="disabled",
+            command=lambda: self._set_all_silence_checks(False))
+        self.asilence_select_none_button.grid(row=0, column=1, padx=(0, 14))
+        self.asilence_delete_button = ctk.CTkButton(
+            bottom, text="", height=30, state="disabled", command=self._delete_checked_silences)
+        self.asilence_delete_button.grid(row=0, column=2, padx=(0, 8))
+
+        # _silence_spans: [(start_s, end_s), ...] from the last detection.
+        # _silence_vars: one BooleanVar per span, parallel to it.
+        self._clear_silence_results()
+
+    def _detect_silences(self):
+        """Runs VAD-based silence detection and shows the results in the
+        Silence panel — every gap between detected speech, reviewable and
+        deletable one by one or in bulk, the same shape as Find Similar's
+        Matches panel. Runs on a background thread behind the busy modal,
+        same reasoning as Detect sections — VAD over a whole recording
+        isn't instant."""
+        if self.audio_clip is None:
+            return
+        buffer, sample_rate = self.audio_clip.buffer, self.audio_clip.sample_rate
+
+        def work():
+            return audio_clean.detect_silences(buffer, sample_rate)
+
+        def done(spans, error):
+            self._silence_spans = [] if error is not None else spans  # error already logged by _run_busy
+            self._silence_has_searched = True
+            self.active_effects_panel = "silence"
+            self._show_active_effects_panel()
+            self._render_silence_results()
+            self.awave_canvas.update_idletasks()  # see the matching comment in _on_find_similar_event
+            self._redraw_waveform()
+
+        self._run_busy("aenh_busy_title_silences", work, done)
+
+    def _render_silence_results(self):
+        for w in self.asilence_rows_frame.winfo_children():
+            w.destroy()
+        self._silence_vars = []
+        if not self._silence_spans:
+            key = "asilence_none_found" if self._silence_has_searched else "asilence_hint"
+            self.asilence_hint_label.configure(text=i18n.t(self.ui_lang, key))
+            self.asilence_delete_button.configure(state="disabled")
+            self.asilence_select_all_button.configure(state="disabled")
+            self.asilence_select_none_button.configure(state="disabled")
+            self._update_rows_scrollbar(self.asilence_rows_frame)
+            return
+        total = sum(e - s for s, e in self._silence_spans)
+        self.asilence_hint_label.configure(text=i18n.t(
+            self.ui_lang, "asilence_found", count=len(self._silence_spans), seconds=f"{total:.1f}"))
+        for i, (start, end) in enumerate(self._silence_spans):
+            var = ctk.BooleanVar(value=False)
+            self._silence_vars.append(var)
+            row = ctk.CTkFrame(self.asilence_rows_frame, fg_color=("gray95", "gray24"))
+            row.grid(row=i, column=0, sticky="ew", pady=2)
+            row.grid_columnconfigure(1, weight=1)
+            ctk.CTkCheckBox(row, text="", variable=var, width=20,
+                           command=self._redraw_waveform).grid(
+                row=0, column=0, padx=(8, 6), pady=6)
+            ctk.CTkLabel(
+                row, anchor="w",
+                text=f"{_fmt_time(start)} – {_fmt_time(end)}   ({end - start:.1f}s)",
+            ).grid(row=0, column=1, sticky="ew", pady=6)
+            play_btn = ctk.CTkButton(
+                row, text=i18n.t(self.ui_lang, "afind_play"), width=60, height=24,
+                fg_color="transparent", text_color=self.OUTLINE_BUTTON_TEXT, border_width=1,
+                command=lambda s=start, e=end: self._play_match(s, e))
+            play_btn.grid(row=0, column=2, padx=(6, 0), pady=6)
+            jump_btn = ctk.CTkButton(
+                row, text=i18n.t(self.ui_lang, "afind_jump"), width=70, height=24,
+                fg_color="transparent", text_color=self.OUTLINE_BUTTON_TEXT, border_width=1,
+                command=lambda s=start, e=end: self._jump_to_match(s, e))
+            jump_btn.grid(row=0, column=3, padx=(6, 8), pady=6)
+        self.asilence_delete_button.configure(state="normal")
+        self.asilence_select_all_button.configure(state="normal")
+        self.asilence_select_none_button.configure(state="normal")
+        self._update_rows_scrollbar(self.asilence_rows_frame)
+
+    def _set_all_silence_checks(self, checked):
+        for var in self._silence_vars:
+            var.set(checked)
+        self._redraw_waveform()
+
+    def _delete_checked_silences(self):
+        if self.audio_clip is None:
+            return
+        ranges = [s for s, v in zip(self._silence_spans, self._silence_vars) if v.get()]
+        if not ranges:
+            return
+        self.audio_clip.remove_ranges(ranges)
+        self._after_audio_edit()  # also clears _silence_spans — the positions just shifted
+        self._zoom_audio_edit_fit()
+        self._set_audio_edit_status("aedit_status_removed_matches", {"count": len(ranges)})
+
+    def _clear_silence_results(self):
+        self._silence_spans = []
+        self._silence_vars = []
+        self._silence_has_searched = False
+        if hasattr(self, "asilence_hint_label"):  # not yet built during initial clip-less state
+            self._render_silence_results()
+
+    # -- Audio Studio: translation -----------------------------------------
+
+    def _retranslate_audio_studio_tabs(self):
+        t = lambda key, **kw: i18n.t(self.ui_lang, key, **kw)  # noqa: E731
+
+        self.arec_mic_label.configure(text=t("arec_mic_label"))
+        self.arec_rate_label.configure(text=t("arec_rate_label"))
+        self.arec_channels_label.configure(text=t("arec_channels_label"))
+        self.arec_level_label.configure(text=t("arec_level_label"))
+        self.arec_filename_label.configure(text=t("arec_filename_label"))
+        self.arec_filename_entry.configure(placeholder_text=t("live_filename_placeholder"))
+        self.arec_start_button.configure(text=t("arec_start_button"))
+        self.arec_pause_button.configure(text=t(
+            "arec_resume" if (self.audio_recorder and self.audio_recorder.is_paused) else "arec_pause"))
+        self.arec_stop_button.configure(text=t("arec_stop_button"))
+        self.arec_edit_button.configure(text=t("arec_edit_button"))
+        self.arec_open_folder_button.configure(text=t("open_output_folder"))
+        self._refresh_audio_record_mic_menu()
+        if self.audio_record_status_key:
+            self.arec_status_line.configure(
+                text=t(self.audio_record_status_key, **(self.audio_record_status_detail or {})))
+
+        self.aedit_open_button.configure(text=t("aedit_open_button"))
+        if self.audio_clip is None:
+            self.aedit_file_label.configure(text=t("aedit_no_file"))
+        self._render_audio_edit_play_button()
+        self.aedit_stop_button.configure(text=t("player_stop"))
+        self.aedit_zoom_fit_button.configure(text=t("aedit_zoom_fit"))
+        self.aedit_cut_button.configure(text=t("aedit_cut_button"))
+        self.aedit_copy_button.configure(text=t("aedit_copy_button"))
+        self.aedit_paste_button.configure(text=t("aedit_paste_button"))
+        self.aedit_trim_button.configure(text=t("aedit_trim_button"))
+        self.aedit_split_button.configure(text=t("aedit_split_button"))
+        self.aedit_silence_button.configure(text=t("aedit_silence_button"))
+        self.aedit_undo_button.configure(text=t("aedit_undo_button"))
+        self.aedit_redo_button.configure(text=t("aedit_redo_button"))
+        self.aedit_find_button.configure(text=t("aedit_find_button"))
+        self.aedit_detect_silence_button.configure(text=t("aedit_detect_silence_button"))
+        self.aedit_marker_button.configure(text=t("aedit_marker_button"))
+        self.aedit_save_wav_button.configure(text=t("aedit_save_wav_button"))
+        self.aedit_save_mp3_button.configure(text=t("aedit_save_mp3_button"))
+        self.aedit_revert_button.configure(text=t("aedit_revert_button"))
+        self.aedit_open_folder_button.configure(text=t("open_output_folder"))
+        self._render_effects_toggle_buttons()
+        view_values = [t("aedit_view_waveform"), t("aedit_view_spectrogram")]
+        self.aedit_view_toggle.configure(values=view_values)
+        self.aedit_view_toggle.set(
+            view_values[1] if self.wave_view_mode == "spectrogram" else view_values[0])
+        # CTkSegmentedButton.configure(values=...) destroys and recreates
+        # its internal segment buttons every time — even when the values
+        # are unchanged — which silently orphaned any tooltip bound
+        # before the first call (i.e. always, since _retranslate() runs
+        # once during __init__ right after the tooltip was attached).
+        # Re-bind after every reconfigure rather than only once at build.
+        self._add_tooltip_to_segmented(
+            self.aedit_view_toggle, lambda: i18n.t(self.ui_lang, "aedit_tip_view_toggle"))
+        self._update_selection_label()
+        self._update_dirty_indicator()
+        if self.audio_status_key:
+            self.aedit_status_line.configure(
+                text=t(self.audio_status_key, **(self.audio_status_detail or {})))
+
+        self.aenh_preset_button.configure(text=t("aenh_preset_button"))
+        self.aenh_no_clip_label.configure(text=t(
+            "aenh_selection_hint" if self.audio_clip else "aenh_no_clip"))
+        self.aenh_configs_button.configure(text=t("aenh_configs_button"))
+        self.aenh_noise_guide_label.configure(text=t("aenh_noise_guide"))
+        for group in self.ENH_GROUPS:
+            self._apply_enhance_group_visibility(group)  # also redraws the heading's text in the new language
+        for row in self.aenh_rows.values():
+            row["label"].configure(text=t(row["label_key"]))
+            row["revert_btn"].configure(text=t("aenh_revert"))
+            row["apply_btn"].configure(text=t("aenh_apply"))
+        self.aenh_denoise_label.configure(text=t("aenh_denoise"))
+        self.aenh_denoise_preview_button.configure(text=t("aenh_preview"))
+        self.aenh_denoise_revert_button.configure(text=t("aenh_revert"))
+        self.aenh_denoise_apply_button.configure(text=t("aenh_apply"))
+        self.aenh_get_profile_button.configure(text=t("aenh_get_profile_button"))
+        self.aenh_clear_profile_button.configure(text=t("aenh_clear_profile_button"))
+        self._update_noise_profile_label()
+
+        self.amark_sections_button.configure(text=t("aclean_sections_button"))
+
+        self.afind_select_all_button.configure(text=t("afind_select_all"))
+        self.afind_select_none_button.configure(text=t("afind_select_none"))
+        self.afind_delete_button.configure(text=t("afind_delete_button"))
+        self._render_find_results()  # re-renders the hint text and any match rows/Jump buttons
+
+        self.asilence_select_all_button.configure(text=t("afind_select_all"))
+        self.asilence_select_none_button.configure(text=t("afind_select_none"))
+        self.asilence_delete_button.configure(text=t("afind_delete_button"))
+        self._render_silence_results()  # re-renders the hint text and any silence rows/buttons
+
+        self.amark_select_all_button.configure(text=t("afind_select_all"))
+        self.amark_select_none_button.configure(text=t("afind_select_none"))
+        self.amark_delete_button.configure(text=t("afind_delete_button"))
+        self._render_markers_panel()  # re-renders the hint text and any marker rows/buttons
+
+        has_clip = self.audio_clip is not None
+        self._set_audio_edit_controls_enabled(has_clip)
+        self._set_audio_enhance_controls_enabled(has_clip)
+        self._redraw_waveform()  # refreshes the spectrogram caption's language too
 
     # ------------------------------------------------------ transcribe tab
 
@@ -999,7 +4116,7 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         download for the same reason _refresh_model_rows itself bails: a
         rebuild would destroy the row label that download's progress is
         being written to."""
-        if self.current_tab == 4 and not self.model_downloads:
+        if self.current_tab == self.LEAF_SETTINGS and not self.model_downloads:
             self._refresh_model_rows()
 
     # -- model manager ----------------------------------------------------
@@ -1244,7 +4361,7 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
             i18n.t(self.ui_lang, "save_failed_folder_title"),
             i18n.t(self.ui_lang, key),
         ):
-            self._show_tab(4)
+            self._show_tab(self.LEAF_SETTINGS)
             self._change_output_folder()
 
     def _change_output_folder(self):
@@ -1591,7 +4708,39 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         self.punct_toggle_button.configure(
             fg_color=("gray75", "gray30") if visible else "transparent")
 
-    TAB_KEYS = ["tab_transcribe", "tab_live", "tab_edit", "tab_llm", "tab_settings"]
+    # Two-level tab structure: an outer strip of 4 groups, two of which
+    # (Audio Studio, Transcription Studio) have their own inner strip of
+    # subtabs. `self.current_tab` is always a *leaf* index into LEAF_KEYS
+    # — every existing per-feature check (Live tab tick, Edit tab
+    # autoload, etc.) keys off one specific leaf, never a group, so
+    # keeping one flat index is far less invasive than threading a
+    # (group, leaf) pair through all of them.
+    # Enhance isn't its own leaf — it lives inside the Edit leaf's own
+    # collapsible panel (see _build_enhance_panel, _toggle_effects_panel)
+    # so the waveform it acts on is always the one on screen, not a tab
+    # switch away. AI moved from being its own top-level group to
+    # Transcription Studio's 4th subtab, alongside Transcribe/Live/Edit.
+    LEAF_AUDIO_RECORD, LEAF_AUDIO_EDIT, \
+        LEAF_TRANSCRIBE, LEAF_LIVE, LEAF_EDIT, LEAF_AI, LEAF_SETTINGS = range(7)
+    LEAF_KEYS = [
+        "tab_audio_record", "tab_audio_edit",
+        "tab_transcribe", "tab_live", "tab_edit", "tab_llm",
+        "tab_settings",
+    ]
+    GROUP_KEYS = [
+        "tab_group_audio_studio", "tab_group_transcription_studio",
+        "tab_group_settings",
+    ]
+    # Leaves (indices into LEAF_KEYS), in on-screen order, belonging to
+    # each group. A group with only one leaf gets no inner strip at all —
+    # clicking its outer button shows that leaf directly.
+    GROUP_LEAVES = [
+        [LEAF_AUDIO_RECORD, LEAF_AUDIO_EDIT],
+        [LEAF_TRANSCRIBE, LEAF_LIVE, LEAF_EDIT, LEAF_AI],
+        [LEAF_SETTINGS],
+    ]
+    GROUP_TRANSCRIPTION_STUDIO = 1  # index into GROUP_KEYS/GROUP_LEAVES — for the Live-badge tint
+
     # Selected tab matches the content panel's background (so it visually
     # merges into it); unselected tabs use the app's normal frame color.
     TAB_SELECTED_BG = ("gray92", "gray14")
@@ -1771,18 +4920,18 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         self.tab_canvas.xview_moveto(new_x / content_w)
 
     def _ensure_active_tab_visible(self):
-        """Pans the tab strip so the currently selected tab's button is
+        """Pans the tab strip so the currently selected group's button is
         fully in view — otherwise a language switch reflowing tab widths
         (or programmatic tab changes) could leave the active tab scrolled
         out of sight with no visual indication it's still selected."""
-        if not (0 <= self.current_tab < len(self.tab_buttons)):
+        if not (0 <= self.current_group < len(self.tab_buttons)):
             return
         self.tab_canvas.update_idletasks()
         content_w = max(1, self.tab_bar.winfo_reqwidth())
         viewport_w = max(1, self.tab_canvas.winfo_width())
         if content_w <= viewport_w:
             return
-        btn = self.tab_buttons[self.current_tab]
+        btn = self.tab_buttons[self.current_group]
         btn_x0, btn_x1 = btn.winfo_x(), btn.winfo_x() + btn.winfo_width()
         cur_x0 = self.tab_canvas.canvasx(0)
         if btn_x0 < cur_x0:
@@ -1790,59 +4939,103 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         elif btn_x1 > cur_x0 + viewport_w:
             self.tab_canvas.xview_moveto(max(0, btn_x1 - viewport_w) / content_w)
 
+    def _leaf_group(self, leaf):
+        for group_index, leaves in enumerate(self.GROUP_LEAVES):
+            if leaf in leaves:
+                return group_index
+        return 0
+
+    def _leaf_frames(self):
+        return [self.audio_record_frame, self.audio_edit_frame,
+                self.transcribe_frame, self.live_frame, self.edit_frame, self.llm_frame,
+                self.settings_frame]
+
+    def _show_group(self, group_index):
+        """Outer tab bar click: shows whichever leaf was last active in
+        that group (or its first leaf, the first time)."""
+        leaves = self.GROUP_LEAVES[group_index]
+        self._show_tab(self._group_last_leaf.get(group_index, leaves[0]))
+
     def _show_tab(self, index):
         # A live session deliberately keeps running when you switch away —
         # that's the point of Save Draft: dictate, then work the early
-        # minutes in Edit & Export while the rest keeps coming in. The
-        # worker thread and its mic stream are already fully independent of
-        # which tab is on screen; _style_tab_buttons' recording badge on
-        # this tab is the reminder that it's still going.
+        # minutes in Transcription Studio's Edit subtab while the rest
+        # keeps coming in. The worker thread and its mic stream are
+        # already fully independent of which tab is on screen;
+        # _style_tab_buttons' recording badge is the reminder it's still
+        # going. Audio Studio's recorder is the same story.
         self.current_tab = index
-        frames = [self.transcribe_frame, self.live_frame, self.edit_frame,
-                  self.llm_frame, self.settings_frame]
-        for i, frame in enumerate(frames):
+        self.current_group = self._leaf_group(index)
+        self._group_last_leaf[self.current_group] = index
+        for group_index, strip in self.subtab_strips.items():
+            wrapper = strip[1].master  # the scroll-strip's own wrapper frame
+            if group_index == self.current_group:
+                wrapper.grid()
+            else:
+                wrapper.grid_remove()
+        for i, frame in enumerate(self._leaf_frames()):
             if i == index:
-                # Explicit args, not a bare grid() — the live/edit/AI frames
-                # may never have been gridded before (see _build_ui), so
+                # Explicit args, not a bare grid() — most leaf frames may
+                # never have been gridded before (see _build_ui), so
                 # there's no remembered geometry for a bare call to restore.
                 frame.grid(row=0, column=0, sticky="nsew")
             else:
                 frame.grid_remove()
-        if index == 1:
+        if index == self.LEAF_LIVE:
             self._refresh_mic_menu()
             self._maybe_preload_sensevoice()
-        elif index == 2:
+        elif index == self.LEAF_EDIT:
             self._maybe_autoload_edit()
-        elif index == 3:
+        elif index == self.LEAF_AI:
             self._maybe_autoload_llm()
-        elif index == 4:
+        elif index == self.LEAF_SETTINGS:
             self._refresh_settings_tab()
+        elif index == self.LEAF_AUDIO_RECORD:
+            self._refresh_audio_record_mic_menu()
         self._style_tab_buttons()
         self._ensure_active_tab_visible()
 
-    # Recording-badge tints for the Live Transcription tab button — a color
-    # change only, never text, so the badge can't affect any tab's width or
-    # force a layout recompute when a session starts/stops/goes idle.
+    # Recording-badge tints for the Live Transcription subtab (and, while
+    # Transcription Studio isn't the active group, its outer tab button
+    # too) — a color change only, never text, so the badge can't affect
+    # any tab's width or force a layout recompute when a session
+    # starts/stops/goes idle.
     LIVE_TAB_RECORDING_COLOR = "#e05a5a"
     LIVE_TAB_IDLE_COLOR = "#d99a30"
 
     def _style_tab_buttons(self):
+        live_color = (self.LIVE_TAB_IDLE_COLOR if self.live_tab_idle
+                     else self.LIVE_TAB_RECORDING_COLOR)
         for i, btn in enumerate(self.tab_buttons):
-            selected = i == self.current_tab
+            selected = i == self.current_group
             text_color = ("gray10", "gray95") if selected else ("gray35", "gray65")
-            # Only tinted while unselected — looking straight at the Live
-            # tab already shows the real status line/text area, a much
-            # richer signal than a tinted label, so the normal selected
-            # styling wins there instead of fighting it for attention.
-            if i == 1 and self.live_running and not selected:
-                text_color = (self.LIVE_TAB_IDLE_COLOR if self.live_tab_idle
-                             else self.LIVE_TAB_RECORDING_COLOR)
+            # Only tinted while its own group isn't the one on screen —
+            # looking straight at the Live subtab already shows the real
+            # status line/text area, a much richer signal than a tinted
+            # label, so the normal selected styling wins there instead of
+            # fighting it for attention.
+            if (i == self.GROUP_TRANSCRIPTION_STUDIO and self.live_running
+                    and self.current_tab != self.LEAF_LIVE):
+                text_color = live_color
             btn.configure(
                 fg_color=self.TAB_SELECTED_BG if selected else self.TAB_UNSELECTED_BG,
                 hover_color=self.TAB_SELECTED_BG if selected else self.TAB_UNSELECTED_HOVER,
                 text_color=text_color,
                 font=ctk.CTkFont(size=13, weight="bold" if selected else "normal"),
             )
+        for group_index, (_content, _canvas, _left, _right, buttons) in self.subtab_strips.items():
+            leaves = self.GROUP_LEAVES[group_index]
+            group_active = group_index == self.current_group
+            for leaf, btn in zip(leaves, buttons):
+                selected = group_active and leaf == self.current_tab
+                text_color = ("gray10", "gray95") if selected else self.MUTED_TEXT
+                if leaf == self.LEAF_LIVE and self.live_running and not selected:
+                    text_color = live_color
+                btn.configure(
+                    fg_color=self.TAB_SELECTED_BG if selected else "transparent",
+                    text_color=text_color,
+                    font=ctk.CTkFont(size=12, weight="bold" if selected else "normal"),
+                )
 
     def _edit_has_unsaved_changes(self):
         if self._edit_loaded_text is None:
@@ -1909,21 +5102,31 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         t = lambda key, **kw: i18n.t(self.ui_lang, key, **kw)  # noqa: E731
         self.title(f"{t('app_title')} v{settings.APP_VERSION}")
 
-        # tabs — all five share one width, sized to fit the widest label
-        # (measured in the bold variant, which the selected tab uses, so
-        # selecting a tab never changes any width). A single fixed constant
-        # stopped fitting once the fifth tab arrived, so it's computed from
-        # the current language's own longest label instead.
+        # outer group tabs — all four share one width, sized to fit the
+        # widest label (measured in the bold variant, which the selected
+        # tab uses, so selecting one never changes any width). Computed
+        # from the current language's own longest label rather than a
+        # fixed constant, same reasoning as the old five-tab strip.
         tab_font = ctk.CTkFont(size=13, weight="bold")
-        texts = [t(key) for key in self.TAB_KEYS]
-        uniform_width = max(64, max(tab_font.measure(text) for text in texts) + 34)
-        for btn, text in zip(self.tab_buttons, texts):
+        group_texts = [t(key) for key in self.GROUP_KEYS]
+        uniform_width = max(64, max(tab_font.measure(text) for text in group_texts) + 34)
+        for btn, text in zip(self.tab_buttons, group_texts):
             btn.configure(text=text, width=uniform_width)
+        # inner subtab strips — each button sized to its own label instead
+        # of a shared uniform width, same approach _make_scroll_strip's
+        # other user (the AI tab's action row) already takes.
+        sub_font = ctk.CTkFont(size=12)
+        for group_index, (content, canvas, left_btn, right_btn, buttons) in self.subtab_strips.items():
+            for leaf, btn in zip(self.GROUP_LEAVES[group_index], buttons):
+                label = t(self.LEAF_KEYS[leaf])
+                btn.configure(text=label, width=max(70, sub_font.measure(label) + 28))
+            self._finalize_scroll_strip(canvas, content, left_btn, right_btn)
         self._style_tab_buttons()
         # Tab widths just changed (language switch) — re-check whether the
         # strip still fits its viewport and keep the active tab in view.
         self._update_tab_scroll_state()
         self._ensure_active_tab_visible()
+        self._retranslate_audio_studio_tabs()
 
         # transcribe tab
         self.quality_label.configure(text=t("quality_label"))
@@ -2046,7 +5249,7 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
     # ======================================================= transcribe tab
 
     def _on_drop(self, event):
-        if self.current_tab != 0:
+        if self.current_tab != self.LEAF_TRANSCRIBE:
             return
         try:
             paths = self.tk.splitlist(event.data)
@@ -2145,7 +5348,7 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         self._register_edit_file(row["path"], row["output"])
         entry = next(e for e in self.edit_files if e["audio"] == row["path"])
         self._load_edit_entry(entry)
-        self._show_tab(2)
+        self._show_tab(self.LEAF_EDIT)
 
     def _remove_row(self, row):
         if self.running:
@@ -2281,9 +5484,9 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
             if index < len(self.rows):
                 self.rows[index]["output"] = output_path
                 self._register_edit_file(self.rows[index]["path"], output_path)
-                if self.current_tab == 2:
+                if self.current_tab == self.LEAF_EDIT:
                     self._maybe_autoload_edit()
-                elif self.current_tab == 3:
+                elif self.current_tab == self.LEAF_AI:
                     self._maybe_autoload_llm()
         elif kind == "finished":
             self._set_running(False)
@@ -2305,6 +5508,12 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
             self._on_audio_loaded(event[1], event[2])
         elif kind == "audio_reloaded":
             self._on_audio_reloaded(event[1])
+        elif kind == "find_similar":
+            self._on_find_similar_event(event[1], event[2])
+        elif kind == "busy_done":
+            _, on_done, result, error = event
+            self._close_busy_dialog()
+            on_done(result, error)
         elif kind == "live_status":
             _, key, detail = event
             if key == "ready":
@@ -2397,6 +5606,8 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
             self._on_model_dl_event(event[1], event[2], event[3])
         elif kind == "update_check":
             self._on_update_check_result(event[1])
+        elif kind in ("record_started", "record_stopped"):
+            self._on_audio_record_event(kind, *event[1:])
 
     def _render_row_status(self, row):
         text = i18n.job_status_text(self.ui_lang, row["status_key"], row["status_detail"])
@@ -2718,9 +5929,9 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         else:
             return
         self._refresh_llm_menu()
-        if self.current_tab == 2:
+        if self.current_tab == self.LEAF_EDIT:
             self._maybe_autoload_edit()
-        elif self.current_tab == 3:
+        elif self.current_tab == self.LEAF_AI:
             self._maybe_autoload_llm()
 
     def _on_live_stopped(self):
@@ -2959,11 +6170,11 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
                     "player_preparing", {"speed": _speed_label(speed), "pct": 0})
 
     def _tick_player(self):
-        if self.current_tab == 1 and self.live_running and self.live_worker:
+        if self.current_tab == self.LEAF_LIVE and self.live_running and self.live_worker:
             # Rough perceptual scaling: speech RMS sits around 0.02–0.2, so
             # ×12 maps quiet speech near 1/4 bar and normal speech near full.
             self.live_level_bar.set(min(1.0, self.live_worker.level * 12))
-        if self.current_tab == 2 and self.player.loaded_path is not None:
+        if self.current_tab == self.LEAF_EDIT and self.player.loaded_path is not None:
             if self.player.is_playing:
                 self.position_slider.set(self.player.get_fraction())
                 self.time_label.configure(
@@ -2971,6 +6182,38 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
             elif self.play_button.cget("text") == i18n.t(self.ui_lang, "player_pause"):
                 # Playback ended on its own.
                 self._render_play_button()
+        if self.current_tab == self.LEAF_AUDIO_RECORD and self.audio_recorder is not None:
+            self.arec_timer_label.configure(
+                text=_fmt_time(self.audio_recorder.elapsed_seconds))
+            self.arec_level_bar.set(min(1.0, self.audio_recorder.level * 12))
+            self._redraw_record_waveform()
+        if self.current_tab == self.LEAF_AUDIO_EDIT and self.audio_clip is not None:
+            if self.audio_player.is_playing and self._play_until is not None \
+                    and (self._preview_offset_s + self.audio_player.get_time()) >= self._play_until:
+                # Reached the end of a selection-limited Play/Preview —
+                # stop exactly there instead of continuing into whatever
+                # comes after the selection.
+                self.audio_player.pause()
+                self._play_until = None
+                self._clear_audio_preview()
+                self._render_audio_edit_play_button()
+                self._redraw_waveform()
+            elif self.audio_player.is_playing:
+                offset = self._preview_offset_s if self.audio_preview is not None else 0.0
+                self.aedit_time_label.configure(
+                    text=f"{_fmt_time(offset + self.audio_player.get_time())} / "
+                         f"{_fmt_time(self.audio_clip.duration)}")
+                self._update_playhead_line()
+            elif self.aedit_play_button.cget("text") == i18n.t(self.ui_lang, "player_pause"):
+                # Playback ended on its own. A Preview deliberately stays
+                # up (amber tint, still loaded) after this — reaching the
+                # end of a preview is "you finished listening," not "you
+                # decided to discard it"; Player.play() already rewinds
+                # to the start on the next click, so this can just be
+                # replayed. Apply/Revert (or starting a new selection)
+                # are the only things that end a Preview now.
+                self._play_until = None
+                self._render_audio_edit_play_button()
         self.after(TICK_MS, self._tick_player)
 
     def _save_edit(self):

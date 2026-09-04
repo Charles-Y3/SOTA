@@ -4,7 +4,9 @@ UI_LANGUAGES = ["en", "zh"]
 
 STRINGS = {
     "en": {
-        "app_title": "SOTA — Smart Offline Transcription Application",
+        # Display name only (v2 rename) — internal identifiers (repo name,
+        # app-data folder, update-checker's GitHub lookup) all stay "SOTA".
+        "app_title": "Smart Offline Transcription & Audio",
         "tab_transcribe": "Transcribe",
         "tab_edit": "Edit & Export",
         "quality_label": "Quality",
@@ -240,9 +242,307 @@ STRINGS = {
         "settings_reset_confirm_title": "SOTA",
         "settings_reset_confirm": "Reset all settings to their defaults? Downloaded"
                                    " models and saved transcripts are not affected.",
+        # --- Audio Studio (v2)
+        "tab_group_audio_studio": "Audio Studio",
+        "tab_group_transcription_studio": "Transcription Studio",
+        "tab_group_settings": "Settings",
+        "tab_audio_record": "Record",
+        "tab_audio_edit": "Edit",
+        "audio_filetypes": "Audio files",
+        "aenh_preview": "Preview",
+        "aenh_revert": "Revert",
+        "aenh_apply": "Apply",
+        # -- Record subtab
+        "arec_mic_label": "Microphone",
+        "arec_rate_label": "Sample rate",
+        "arec_channels_label": "Channels",
+        "arec_level_label": "Level",
+        "arec_filename_label": "Filename (optional):",
+        "arec_start_button": "Start Recording",
+        "arec_pause": "Pause",
+        "arec_resume": "Resume",
+        "arec_stop_button": "Stop",
+        "arec_edit_button": "Open in Edit",
+        "arec_status_recording": "Recording…",
+        "arec_status_paused": "Paused",
+        "arec_status_saved": "Saved — {path}",
+        "arec_status_failed": "Recording failed — see sota.log for details.",
+        # -- Edit subtab
+        "aedit_group_clipboard": "Clipboard",
+        "aedit_group_structure": "Structure",
+        "aedit_group_history": "History & Search",
+        "aedit_dirty": "● Unsaved changes",
+        "aedit_selection_info": "Selection: {start}–{end} ({dur}s)",
+        "aedit_no_selection": "No selection",
+        "aedit_view_waveform": "Waveform",
+        "aedit_view_spectrogram": "Spectrogram",
+        "aedit_tip_view_toggle": "Waveform shows amplitude over time;"
+                                 " Spectrogram shows frequency content —"
+                                 " useful for finding exactly where a hum,"
+                                 " hiss, or specific sound sits.",
+        "aedit_spectrogram_caption": "Vertical axis: frequency, 0 Hz at"
+                                    " bottom to {nyquist} kHz (this"
+                                    " recording's max) at top. Brighter/"
+                                    " warmer color = louder at that"
+                                    " frequency and moment in time.",
+        "aedit_tip_timeline_scroll": "Scroll here to zoom in/out in time,"
+                                    " centered on the cursor — same as"
+                                    " scrolling on the waveform itself.",
+        "aedit_tip_vaxis_scroll": "Scroll here to zoom the waveform's"
+                                 " vertical scale — stretches quiet audio"
+                                 " taller to see its shape more clearly."
+                                 " Double-click to reset.",
+        "aedit_marker_rename": "Rename…",
+        "aedit_marker_delete": "Delete",
+        "aedit_file_status": "{name} · {duration}",
+        "aedit_open_dialog": "Open an audio file to edit",
+        "aedit_open_button": "Open a file…",
+        "aedit_no_file": "No audio file open.",
+        "aedit_zoom_fit": "Fit",
+        "aedit_cut_button": "Cut",
+        "aedit_copy_button": "Copy",
+        "aedit_paste_button": "Paste",
+        "aedit_trim_button": "Trim",
+        "aedit_split_button": "Split",
+        "aedit_silence_button": "Insert silence",
+        "aedit_undo_button": "Undo",
+        "aedit_redo_button": "Redo",
+        "aedit_find_button": "Find similar…",
+        "aedit_marker_button": "Add marker",
+        "aedit_tip_marker": "Adds a labeled marker at the current playhead"
+                            " position. Click a marker's flag to jump to"
+                            " it; right-click to delete it.",
+        "aedit_marker_dialog_title": "Add marker",
+        "aedit_marker_dialog_prompt": "Label for this marker:",
+        "aedit_section_label": "Section {n}",
+        "aedit_status_sections_found": "Found {count} section(s) — see the markers above the waveform.",
+        "aedit_status_sections_failed": "Section detection failed — see sota.log for details.",
+        "aedit_tip_trim": "Keeps only the selected region and discards the"
+                          " rest. Needs a selection — drag on the waveform first.",
+        "aedit_tip_split": "Splits the clip in two at the playhead (click"
+                           " the waveform to place it). The part after the"
+                           " split is saved as a new file; the part before"
+                           " stays open here.",
+        "aedit_tip_silence": "Inserts {seconds:.0f}s of silence at the"
+                             " playhead, or at the start of the selection"
+                             " if one is active.",
+        "aedit_tip_find": "Finds other places in the recording that sound"
+                          " like the current selection, so you can review"
+                          " and remove every occurrence. Needs a selection"
+                          " — drag on the waveform first.",
+        "aedit_detect_silence_button": "Detect no-speech",
+        "aedit_tip_detect_silence": "Finds every stretch of at least"
+                                   " {min_gap:.1f}s where no speech was"
+                                   " detected — not just true silence, a"
+                                   " clap or loud noise counts too — and"
+                                   " lists them in the No speech panel"
+                                   " below to review. Skips brief natural"
+                                   " pauses shorter than that. Doesn't"
+                                   " need a selection, it scans the whole"
+                                   " clip.",
+        "aedit_status_removed_matches": "Removed {count} segment(s).",
+        "aedit_save_wav_button": "Export WAV",
+        "aedit_save_mp3_button": "Export MP3",
+        "aedit_revert_button": "Revert to original",
+        "aedit_status_loading": "Loading…",
+        "aedit_status_loaded": "Loaded.",
+        "aedit_status_load_failed": "Could not open that file — see sota.log for details.",
+        "aedit_status_need_selection": "Select a region on the waveform first (click and drag).",
+        "aedit_status_effect_applied": "Effect applied.",
+        "aedit_status_effect_failed": "Something went wrong — see sota.log for details.",
+        "aedit_status_reverted": "Reverted to the original recording.",
+        "aedit_status_split": "Split — the second half was saved as {path}.",
+        "aedit_status_exporting": "Exporting…",
+        "aedit_status_exported": "Exported — {path}",
+        "aedit_status_export_failed": "Export failed — see sota.log for details.",
+        "aedit_previewing": "Previewing — not applied",
+        # -- Enhance subtab
+        "aenh_toggle": "Enhance",
+        "aenh_preset_button": "✨ Auto Enhance",
+        "aenh_preset_tip": "Runs a fixed tone/loudness pass in one step —"
+                          " High-pass filter, Compressor, then Normalize"
+                          " — on the selected region, or the whole clip"
+                          " if nothing's selected, same as every slider"
+                          " below. Deliberately doesn't touch noise"
+                          " reduction, noise gate, clicks/pops, or"
+                          " pauses — those are either heavier processing"
+                          " that isn't safe to apply blind, or one-off"
+                          " repairs at a specific spot. The three sliders"
+                          " it does touch update afterward to show what"
+                          " was actually applied. For a sequence of your"
+                          " own choosing, see Configurations beside this"
+                          " button.",
+        "aenh_no_clip": "Open a file in the Edit subtab first.",
+        "aenh_selection_hint": "Applies to the selected region on the waveform"
+                                " (drag to select) — or the whole clip if"
+                                " nothing's selected.",
+        "aenh_configs_button": "⚙ Configurations…",
+        "aenh_configs_button_tip": "Manage your own saved sequences —"
+                                  " create, run, edit, rename, or delete."
+                                  " Auto Enhance beside this always runs"
+                                  " its own fixed sequence; this is where"
+                                  " a sequence of your own choosing lives"
+                                  " instead.",
+        "aenh_configs_manager_title": "Configurations",
+        "aenh_configs_manager_intro": "Your own saved sequences of Enhance"
+                                     " steps — run one, open it to change"
+                                     " which steps and order it uses, or"
+                                     " create a new one from scratch.",
+        "aenh_configs_none": "No saved configurations yet.",
+        "aenh_config_run": "Run",
+        "aenh_config_open": "Open",
+        "aenh_config_rename": "Rename",
+        "aenh_config_delete_button": "Delete",
+        "aenh_config_new_button": "+ New configuration",
+        "aenh_config_close_button": "Close",
+        "aenh_config_name_taken": "A configuration with that name already exists.",
+        "aenh_config_builder_title": "Configuration",
+        "aenh_config_name_label": "Name:",
+        "aenh_config_name_required": "Enter a name for this configuration.",
+        "aenh_config_bad_value": "{step}'s value must be a number.",
+        "aenh_config_no_steps": "Check at least one step to include.",
+        "aenh_config_pause_tip": "Always runs last, and can't be"
+                               " reordered — it's the only step here that"
+                               " changes the recording's length rather"
+                               " than just reshaping the sound in place,"
+                               " so every other (same-length) step has to"
+                               " run before it.",
+        "aenh_config_save_button": "Save",
+        "aenh_config_cancel_button": "Cancel",
+        "aenh_heading_tone": "Loudness & tone",
+        "aenh_heading_noise": "Noise & frequency",
+        "aenh_noise_guide": "• High/Low-pass filter — blocks everything"
+                           " above/below a cutoff; suited to steady"
+                           " hum/rumble in one frequency range"
+                           " (frequency domain)\n"
+                           "• Noise gate — mutes stretches that are"
+                           " quiet, full stop; suited to noise only"
+                           " between words (time domain)\n"
+                           "• Noise reduction (below) — suited to noise"
+                           " mixed into the speech itself (time and"
+                           " frequency domains)",
+        "aenh_heading_repair": "Repairs & timing",
+        "aenh_amplify": "Amplify",
+        "aenh_amplify_tip": "Multiplies the volume by a fixed amount —"
+                           " a blunt overall boost/cut. Doesn't adapt to"
+                           " how loud different parts already are, unlike"
+                           " Normalize or Loudness below.",
+        "aenh_normalize": "Normalize",
+        "aenh_normalize_tip": "Scales the single loudest sample to sit"
+                             " at this level — controls headroom/clipping,"
+                             " not how loud the audio sounds overall. For"
+                             " perceived loudness (e.g. a podcast target),"
+                             " use Loudness (LUFS) below instead.",
+        "aenh_loudness": "Loudness (LUFS)",
+        "aenh_loudness_tip": "Scales overall perceived loudness to this"
+                            " LUFS target — the standard podcasts/streaming"
+                            " use. Unlike Normalize above, this accounts for"
+                            " how loud the audio actually sounds, not just"
+                            " its single loudest peak.",
+        "aenh_highpass": "High-pass filter",
+        "aenh_highpass_tip": "Cuts low-frequency rumble below this"
+                            " frequency — mic handling noise, desk bumps,"
+                            " AC/fan hum.",
+        "aenh_lowpass": "Low-pass filter",
+        "aenh_lowpass_tip": "Cuts high-frequency hiss/noise above this"
+                           " frequency.",
+        "aenh_eq": "EQ (1 kHz band)",
+        "aenh_eq_tip": "Boosts or cuts frequencies around 1 kHz — the"
+                      " range that carries most vocal presence/clarity.",
+        "aenh_compress": "Compressor",
+        "aenh_compress_tip": "Turns down volume once it crosses this"
+                            " threshold, narrowing the gap between the"
+                            " loudest and quietest parts — makes speech"
+                            " sound more consistently loud rather than"
+                            " changing the overall level like Amplify.",
+        "aenh_denoise": "Noise reduction",
+        "aenh_denoise_tip": "Removes background noise (hiss, hum, fan,"
+                           " traffic) from the selection using an AI model"
+                           " — reaches noise happening even *under* speech."
+                           " Different from Noise gate below, which only"
+                           " mutes the quiet gaps *between* speech.",
+        "aenh_denoise_engine": "Engine used: {engine}",
+        "aenh_busy_title": "Applying Auto Enhance…",
+        "aenh_busy_title_denoise": "Reducing noise…",
+        "aenh_busy_title_sections": "Detecting sections…",
+        "aenh_busy_title_silences": "Detecting no-speech…",
+        "aenh_profile_engine": "noise profile",
+        "aenh_profile_none": "No noise profile captured — using blind denoising above.",
+        "aenh_profile_active": "Noise profile: {seconds}s captured — denoise above will use it.",
+        "aenh_get_profile_button": "Get noise profile",
+        "aenh_profile_tip": "Tunes noise reduction to this recording's own"
+                           " specific noise instead of guessing — select a"
+                           " noise-only moment (no speech) on the waveform"
+                           " first, then click this.",
+        "aenh_clear_profile_button": "Clear profile",
+        # -- "Repairs & timing" group (was the separate Clean subtab)
+        "aclean_pause": "Shorten pauses longer than",
+        "aclean_pause_tip": "Shortens any silent gap longer than this many"
+                           " seconds down to a brief {keep}s breath,"
+                           " instead of cutting it away completely —"
+                           " speech segments themselves are never touched.",
+        "aclean_gate": "Noise gate",
+        "aclean_gate_tip": "Mutes stretches whose volume falls below this"
+                          " level — good for hiss/hum in the gaps between"
+                          " speech. Different from Noise reduction above,"
+                          " which also reaches noise happening under"
+                          " speech, not just between it.",
+        "aclean_clicks": "Remove clicks/pops",
+        "aclean_clicks_tip": "Detects short, abrupt spikes (a mic bump,"
+                            " a pop) that jump far outside the normal"
+                            " sample-to-sample variation, and smooths them"
+                            " out — a spike-detection heuristic, not full"
+                            " denoising, so it won't touch steady"
+                            " background hiss or hum.",
+        "aclean_sections_button": "Detect sections",
+        "aclean_sections_tip": "Adds a marker after every real break in"
+                              " speech — a pause of {min_gap:.0f}s or"
+                              " longer — useful as chapter/section"
+                              " breakpoints. Shorter pauses (a breath, a"
+                              " sentence boundary) don't start a new one."
+                              " Re-running it replaces the previous"
+                              " auto-detected markers; markers you added"
+                              " yourself are left alone.",
+        # -- Find similar segments panel
+        "afind_toggle": "Matches",
+        "afind_hint": "Select a region on the waveform, then click"
+                      " “Find similar…” to search the whole recording for"
+                      " other places that sound like it.",
+        "afind_none_found": "No similar segments found.",
+        "afind_found": "{count} similar segment(s) found — review and choose which to remove.",
+        "afind_none_at_filter": "{count} segment(s) found, but none at this filter level"
+                              " — try a lower percentage.",
+        "afind_filter_tip": "Shows only matches at or above this score —"
+                           " the search itself already only keeps ≥80%"
+                           " matches, so this just narrows which of those"
+                           " are worth reviewing, without re-searching.",
+        "afind_play": "Play",
+        "afind_jump": "Jump",
+        "afind_select_all": "Select all",
+        "afind_select_none": "Select none",
+        "afind_delete_button": "Delete selected",
+        "afind_searching_title": "Finding similar segments…",
+        "afind_searching_status": "Searching… {pct}% done, {count} found so far",
+        "afind_cancel_search": "Cancel",
+        "afind_cancelling": "Cancelling…",
+        # -- No-speech panel (was labeled "Silence" — renamed since a span
+        # here just means VAD didn't detect speech, which a loud clap or
+        # cough also triggers despite not being remotely quiet)
+        "asilence_toggle": "No speech",
+        "asilence_hint": "Click “Detect no-speech” above the waveform to"
+                        " scan the whole recording for stretches with no"
+                        " detected speech.",
+        "asilence_none_found": "No no-speech stretches found.",
+        "asilence_found": "{count} stretch(es) with no speech found,"
+                         " {seconds}s total — review and choose which to"
+                         " remove.",
+        # -- Markers panel
+        "amark_toggle": "Markers",
+        "amark_none": "No markers yet — use Add marker, or Detect sections below.",
+        "amark_found": "{count} marker(s).",
     },
     "zh": {
-        "app_title": "SOTA — 智慧離線轉錄應用程式",
+        "app_title": "智慧離線轉錄與音訊",
         "tab_transcribe": "轉錄",
         "tab_edit": "編輯與匯出",
         "quality_label": "品質",
@@ -457,6 +757,256 @@ STRINGS = {
         "settings_reset_confirm_title": "SOTA",
         "settings_reset_confirm": "要將所有設定重設為預設值嗎？已下載的模型與"
                                    "已儲存的轉錄稿不受影響。",
+        # --- Audio Studio (v2)
+        "tab_group_audio_studio": "音訊工作室",
+        "tab_group_transcription_studio": "轉錄工作室",
+        "tab_group_settings": "設定",
+        "tab_audio_record": "錄音",
+        "tab_audio_edit": "編輯",
+        "audio_filetypes": "音訊檔案",
+        "aenh_preview": "預覽",
+        "aenh_revert": "還原",
+        "aenh_apply": "套用",
+        # -- Record subtab
+        "arec_mic_label": "麥克風",
+        "arec_rate_label": "取樣率",
+        "arec_channels_label": "聲道數",
+        "arec_level_label": "音量",
+        "arec_filename_label": "檔名（選填）：",
+        "arec_start_button": "開始錄音",
+        "arec_pause": "暫停",
+        "arec_resume": "繼續",
+        "arec_stop_button": "停止",
+        "arec_edit_button": "在編輯中開啟",
+        "arec_status_recording": "錄音中…",
+        "arec_status_paused": "已暫停",
+        "arec_status_saved": "已儲存 — {path}",
+        "arec_status_failed": "錄音失敗 — 詳情請見 sota.log。",
+        # -- Edit subtab
+        "aedit_group_clipboard": "剪貼簿",
+        "aedit_group_structure": "結構",
+        "aedit_group_history": "歷史紀錄與搜尋",
+        "aedit_dirty": "● 尚未儲存的變更",
+        "aedit_selection_info": "選取範圍：{start}–{end}（{dur} 秒）",
+        "aedit_no_selection": "尚未選取範圍",
+        "aedit_view_waveform": "波形圖",
+        "aedit_view_spectrogram": "頻譜圖",
+        "aedit_tip_view_toggle": "波形圖顯示隨時間變化的音量；"
+                                 "頻譜圖顯示頻率內容 — 方便找出"
+                                 "嗡嗡聲、嘶聲或特定聲音的確切位置。",
+        "aedit_spectrogram_caption": "縱軸：頻率，下方為 0 Hz，上方為"
+                                    "此錄音的最高頻率 {nyquist} kHz。"
+                                    "顏色越亮／越暖，代表該頻率、"
+                                    "該時刻的音量越大。",
+        "aedit_tip_timeline_scroll": "在此捲動可依游標位置放大／縮小時間軸"
+                                    "— 效果與在波形圖上捲動相同。",
+        "aedit_tip_vaxis_scroll": "在此捲動可縮放波形的垂直比例 — "
+                                 "將較安靜的聲音拉高，方便看清其形狀。"
+                                 "雙擊可重設。",
+        "aedit_marker_rename": "重新命名…",
+        "aedit_marker_delete": "刪除",
+        "aedit_file_status": "{name} · {duration}",
+        "aedit_open_dialog": "開啟音訊檔案以進行編輯",
+        "aedit_open_button": "開啟檔案…",
+        "aedit_no_file": "尚未開啟音訊檔案。",
+        "aedit_zoom_fit": "符合視窗",
+        "aedit_cut_button": "剪下",
+        "aedit_copy_button": "複製",
+        "aedit_paste_button": "貼上",
+        "aedit_trim_button": "修剪",
+        "aedit_split_button": "分割",
+        "aedit_silence_button": "插入靜音",
+        "aedit_undo_button": "復原",
+        "aedit_redo_button": "取消復原",
+        "aedit_find_button": "尋找相似片段…",
+        "aedit_marker_button": "新增標記",
+        "aedit_tip_marker": "在目前播放位置新增一個帶標籤的標記。"
+                            "點擊標記旗幟可跳至該處；按右鍵可刪除。",
+        "aedit_marker_dialog_title": "新增標記",
+        "aedit_marker_dialog_prompt": "此標記的標籤：",
+        "aedit_section_label": "第 {n} 段",
+        "aedit_status_sections_found": "找到 {count} 個段落 — 請見波形圖上方的標記。",
+        "aedit_status_sections_failed": "段落偵測失敗 — 詳情請見 sota.log。",
+        "aedit_tip_trim": "僅保留選取的範圍，其餘捨棄。需要先在波形圖上拖曳選取範圍。",
+        "aedit_tip_split": "在播放位置（點擊波形圖以設定）將錄音分割成兩段："
+                           "後半段會儲存為新檔案，前半段則繼續留在此處編輯。",
+        "aedit_tip_silence": "在播放位置（若有選取範圍則為選取範圍的起點）"
+                             "插入 {seconds:.0f} 秒的靜音。",
+        "aedit_tip_find": "在整段錄音中尋找與目前選取範圍聽起來相似的片段，"
+                          "方便您逐一檢視並移除。需要先在波形圖上拖曳選取範圍。",
+        "aedit_detect_silence_button": "偵測無語音片段",
+        "aedit_tip_detect_silence": "找出整段錄音中所有長度達 {min_gap:.1f} 秒"
+                                   "以上、未偵測到語音的片段 — 不只是真正的"
+                                   "靜音，拍手聲或大聲的噪音也會被視為"
+                                   "「無語音」— 並列在下方的「無語音」分頁中"
+                                   "供您檢視。較短的自然停頓不會列入。"
+                                   "不需要先選取範圍，會掃描整段錄音。",
+        "aedit_status_removed_matches": "已移除 {count} 個片段。",
+        "aedit_save_wav_button": "匯出 WAV",
+        "aedit_save_mp3_button": "匯出 MP3",
+        "aedit_revert_button": "還原為原始檔",
+        "aedit_status_loading": "載入中…",
+        "aedit_status_loaded": "已載入。",
+        "aedit_status_load_failed": "無法開啟該檔案 — 詳情請見 sota.log。",
+        "aedit_status_need_selection": "請先在波形圖上拖曳選取一段範圍。",
+        "aedit_status_effect_applied": "已套用效果。",
+        "aedit_status_effect_failed": "發生錯誤 — 詳情請見 sota.log。",
+        "aedit_status_reverted": "已還原為原始錄音。",
+        "aedit_status_split": "已分割 — 後半段已儲存為 {path}。",
+        "aedit_status_exporting": "匯出中…",
+        "aedit_status_exported": "已匯出 — {path}",
+        "aedit_status_export_failed": "匯出失敗 — 詳情請見 sota.log。",
+        "aedit_previewing": "預覽中 — 尚未套用",
+        # -- Enhance subtab
+        "aenh_toggle": "強化",
+        "aenh_preset_button": "✨ 一鍵優化",
+        "aenh_preset_tip": "一次執行固定的音量／音色流程 — 高通濾波、"
+                          "壓縮器，最後是正規化 — 套用於選取的範圍，"
+                          "若未選取範圍則套用於整段錄音，與下方每個"
+                          "滑桿的行為相同。特意不包含降噪、雜訊閘、"
+                          "爆音／喀嚓聲移除或停頓處理 — 這些若非不適合"
+                          "盲目套用的較強處理，就是針對特定位置的"
+                          "個別修復。套用後，它實際用到的三個滑桿會"
+                          "更新顯示實際套用的數值。若想使用自己選擇的"
+                          "流程，請見旁邊的「設定組合」。",
+        "aenh_no_clip": "請先在「編輯」分頁中開啟檔案。",
+        "aenh_selection_hint": "套用於波形圖上選取的範圍（拖曳以選取）；"
+                                "若未選取任何範圍，則套用於整段錄音。",
+        "aenh_configs_button": "⚙ 設定組合…",
+        "aenh_configs_button_tip": "管理您自己儲存的流程 — 建立、執行、"
+                                  "編輯、重新命名或刪除。旁邊的「一鍵"
+                                  "優化」永遠執行其固定的流程；您自己"
+                                  "選擇的流程則在這裡管理。",
+        "aenh_configs_manager_title": "設定組合",
+        "aenh_configs_manager_intro": "您自己儲存的強化步驟流程 — 可執行、"
+                                     "開啟以修改所使用的步驟與順序，"
+                                     "或從頭建立新的流程。",
+        "aenh_configs_none": "尚無已儲存的設定組合。",
+        "aenh_config_run": "執行",
+        "aenh_config_open": "開啟",
+        "aenh_config_rename": "重新命名",
+        "aenh_config_delete_button": "刪除",
+        "aenh_config_new_button": "+ 新增設定組合",
+        "aenh_config_close_button": "關閉",
+        "aenh_config_name_taken": "已存在同名的設定組合。",
+        "aenh_config_builder_title": "設定組合",
+        "aenh_config_name_label": "名稱：",
+        "aenh_config_name_required": "請輸入此設定組合的名稱。",
+        "aenh_config_bad_value": "「{step}」的數值必須是數字。",
+        "aenh_config_no_steps": "請至少勾選一個步驟。",
+        "aenh_config_pause_tip": "永遠排在最後，且無法調整順序 — 這是"
+                               "唯一會改變錄音「長度」的步驟，而非僅"
+                               "重塑聲音本身，因此其他（不改變長度的）"
+                               "步驟都必須先於它執行。",
+        "aenh_config_save_button": "儲存",
+        "aenh_config_cancel_button": "取消",
+        "aenh_heading_tone": "音量與音色",
+        "aenh_heading_noise": "噪音與頻率",
+        "aenh_noise_guide": "• 高通／低通濾波器 — 封鎖截止頻率以上／以下的"
+                           "所有頻率；適合單一頻段的持續嗡嗡聲／隆隆聲"
+                           "（頻率域）\n"
+                           "• 雜訊閘 — 直接將偏安靜的段落靜音；適合"
+                           "只出現在字句之間的噪音（時間域）\n"
+                           "• 降噪（下方）— 適合混雜在語音本身之中的噪音"
+                           "（時間與頻率域）",
+        "aenh_heading_repair": "修復與時間軸",
+        "aenh_amplify": "增益",
+        "aenh_amplify_tip": "以固定倍率調整音量 — 是概略的整體增減，"
+                           "不會因錄音各段原本音量不同而調整，"
+                           "與下方的「正規化」或「音量標準化」不同。",
+        "aenh_normalize": "正規化",
+        "aenh_normalize_tip": "將整段中最大聲的取樣點調整到此音量 — "
+                             "控制的是動態餘裕／避免削波，並非整體聽感"
+                             "音量。若要調整聽感音量（如 Podcast 標準），"
+                             "請改用下方的「音量標準化（LUFS）」。",
+        "aenh_loudness": "音量標準化（LUFS）",
+        "aenh_loudness_tip": "將整體聽感音量調整到此 LUFS 目標值 — "
+                            "Podcast／串流平台常用的標準。與上方的"
+                            "「正規化」不同，這會考量實際聽起來的音量，"
+                            "而非只看最大峰值。",
+        "aenh_highpass": "高通濾波器",
+        "aenh_highpass_tip": "切除此頻率以下的低頻隆隆聲 — 例如麥克風"
+                            "碰撞聲、桌面震動、空調／風扇噪音。",
+        "aenh_lowpass": "低通濾波器",
+        "aenh_lowpass_tip": "切除此頻率以上的高頻嘶聲／雜訊。",
+        "aenh_eq": "等化器（1 kHz 頻段）",
+        "aenh_eq_tip": "增強或衰減 1 kHz 附近的頻率 — 這是人聲清晰度"
+                      "與存在感最主要的頻段。",
+        "aenh_compress": "壓縮器",
+        "aenh_compress_tip": "音量超過此閾值時自動調低，縮小最大聲與"
+                            "最小聲之間的差距 — 讓語音音量更一致，"
+                            "與整體調高／調低音量的「增益」不同。",
+        "aenh_denoise": "降噪",
+        "aenh_denoise_tip": "使用 AI 模型移除選取範圍的背景噪音（嘶聲、"
+                           "電流聲、風扇、交通噪音）— 連語音「底下」的"
+                           "噪音也能處理。與下方的「雜訊閘」不同，"
+                           "雜訊閘只會靜音語音之間的空隙。",
+        "aenh_denoise_engine": "使用引擎：{engine}",
+        "aenh_busy_title": "正在套用一鍵優化…",
+        "aenh_busy_title_denoise": "正在降噪…",
+        "aenh_busy_title_sections": "正在偵測段落…",
+        "aenh_busy_title_silences": "正在偵測無語音片段…",
+        "aenh_profile_engine": "雜訊樣本",
+        "aenh_profile_none": "尚未擷取雜訊樣本 — 上方降噪將使用一般模式。",
+        "aenh_profile_active": "雜訊樣本：已擷取 {seconds} 秒 — 上方降噪將使用此樣本。",
+        "aenh_get_profile_button": "擷取雜訊樣本",
+        "aenh_profile_tip": "讓降噪針對這段錄音「特有」的噪音調整，"
+                           "而非用通用猜測 — 請先在波形圖上選取一段"
+                           "只有噪音、沒有語音的範圍，再點擊此按鈕。",
+        "aenh_clear_profile_button": "清除樣本",
+        # -- 「修復與時間軸」群組（原本是獨立的「清理」分頁）
+        "aclean_pause": "縮短超過此長度的停頓",
+        "aclean_pause_tip": "將長度超過此秒數的靜音停頓，縮短為 {keep} 秒"
+                           "的短暫停頓，而非整段剪掉 — 語音段落本身"
+                           "完全不會被更動。",
+        "aclean_gate": "雜訊閘",
+        "aclean_gate_tip": "將音量低於此水準的段落靜音 — 適合處理語音"
+                          "之間空隙中的嘶聲／電流聲。與上方的「降噪」"
+                          "不同，降噪連語音底下的噪音也能處理，"
+                          "不只是語音之間的空隙。",
+        "aclean_clicks": "移除爆音／喀嚓聲",
+        "aclean_clicks_tip": "偵測明顯超出正常取樣變化範圍的短暫尖峰"
+                            "（如麥克風碰撞聲、爆音），並將其平滑處理 — "
+                            "屬於尖峰偵測的簡易演算法，並非完整降噪，"
+                            "不會處理持續性的背景嘶聲或電流聲。",
+        "aclean_sections_button": "偵測段落",
+        "aclean_sections_tip": "在語音出現真正的停頓（{min_gap:.0f} 秒以上）"
+                              "之後加入標記 — 適合當作章節/段落分界點。"
+                              "較短的停頓（換氣、句子之間）不會產生新標記。"
+                              "再次執行會取代先前自動偵測的標記；"
+                              "您自行新增的標記不會受影響。",
+        # -- Find similar segments panel
+        "afind_toggle": "相似片段",
+        "afind_hint": "先在波形圖上選取一段範圍，再點擊「尋找相似片段…」"
+                      "即可在整段錄音中搜尋聽起來相似的其他片段。",
+        "afind_none_found": "找不到相似的片段。",
+        "afind_found": "找到 {count} 個相似片段 — 請檢視並選擇要移除的項目。",
+        "afind_none_at_filter": "找到 {count} 個片段，但在此篩選條件下沒有符合的"
+                              " — 請嘗試較低的百分比。",
+        "afind_filter_tip": "只顯示達到此分數以上的相似片段 — 搜尋本身已"
+                           "只保留 80% 以上的結果，這裡只是進一步篩選要"
+                           "檢視哪些，不會重新搜尋。",
+        "afind_play": "播放",
+        "afind_jump": "跳至",
+        "afind_select_all": "全選",
+        "afind_select_none": "全不選",
+        "afind_delete_button": "刪除已勾選",
+        "afind_searching_title": "正在尋找相似片段…",
+        "afind_searching_status": "搜尋中… 已完成 {pct}%，目前找到 {count} 個",
+        "afind_cancel_search": "取消",
+        "afind_cancelling": "正在取消…",
+        # -- No-speech panel（原稱「靜音」— 已更名，因為只要 VAD 未偵測到
+        # 語音就會被列入，拍手聲或咳嗽聲等明顯不安靜的聲音也會被列入）
+        "asilence_toggle": "無語音",
+        "asilence_hint": "點擊波形圖上方的「偵測無語音片段」，即可掃描整段"
+                        "錄音找出未偵測到語音的片段。",
+        "asilence_none_found": "找不到無語音的片段。",
+        "asilence_found": "找到 {count} 個無語音片段，共 {seconds} 秒 — "
+                         "請檢視並選擇要移除的項目。",
+        # -- Markers panel
+        "amark_toggle": "標記",
+        "amark_none": "尚無標記 — 可使用「新增標記」，或使用下方的「偵測段落」。",
+        "amark_found": "共 {count} 個標記。",
     },
 }
 

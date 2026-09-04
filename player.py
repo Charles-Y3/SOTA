@@ -194,6 +194,33 @@ class Player:
             self.set_speed(speed)
         return True
 
+    def load_buffer(self, buffer, sample_rate):
+        """Loads audio already in memory (an Audio Studio preview/edit
+        buffer) rather than decoding from a file — resampled to
+        PLAYBACK_RATE exactly like a file `load()` decodes to, so every
+        other method here (speed-changing, streaming) needs no changes
+        to handle it."""
+        self.stop()
+        buffer = np.asarray(buffer, dtype=np.float32)
+        if sample_rate != PLAYBACK_RATE and buffer.size:
+            from math import gcd
+
+            from scipy.signal import resample_poly
+
+            g = gcd(int(sample_rate), PLAYBACK_RATE)
+            up, down = PLAYBACK_RATE // g, int(sample_rate) // g
+            buffer = resample_poly(buffer, up, down)
+        samples = np.ascontiguousarray(buffer, dtype=np.float32)
+        with self._lock:
+            self._base = samples
+            self.duration = len(samples) / PLAYBACK_RATE
+            self.loaded_path = "<buffer>"
+            self._cache = {1.0: samples}
+            self._speed = 1.0
+            self._buf = samples
+            self._pos = 0
+        return True
+
     # -- transport ----------------------------------------------------------
 
     def _ensure_sd(self):

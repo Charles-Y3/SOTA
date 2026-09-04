@@ -24,3 +24,32 @@ llama-cpp-python==0.3.19
 torch==2.13.0
 torchaudio==2.11.0
 funasr>=1.3.14
+# Audio Studio (v2): DSP filters/EQ/compression for the Enhance subtab and
+# resampling in audio_clean.py's VAD-based silence/pause detection.
+scipy>=1.11.0
+# Audio Studio noise reduction: DeepFilterNet is the primary engine (own
+# tiny pretrained checkpoint, fetched/cached by its own init_df() on first
+# use); noisereduce is the zero-download spectral-gating fallback used
+# when DeepFilterNet isn't available or its model can't be fetched.
+# KNOWN ISSUE as of DeepFilterNet 0.5.6: it imports
+# torchaudio.backend.common.AudioMetaData, which doesn't exist on the
+# torchaudio version pinned above — confirmed by import error, not
+# assumed. audio_denoise.denoise() catches this and falls back to
+# noisereduce automatically, so Enhance's noise reduction still works,
+# just always via the weaker engine until this is resolved (either a
+# DeepFilterNet release that supports this torchaudio, or bumping
+# torchaudio — which risks the same pre-AVX512 crash torch is pinned
+# against elsewhere in this file, so needs its own verification pass).
+deepfilternet>=0.5.6
+noisereduce>=3.0.0
+# MP3 export for Audio Studio's finished/edited audio. Pure-Python-
+# installable LAME binding — avoids bundling/shelling out to ffmpeg.
+lameenc>=1.6.1
+# ITU-R BS.1770 loudness measurement/normalization (Enhance's LUFS row) —
+# pure Python + numpy/scipy, no compiled extensions.
+pyloudnorm>=0.1.1
+# Spectrogram rendering (Edit subtab's Waveform/Spectrogram toggle) needs
+# PIL.Image/ImageTk. Already present transitively via customtkinter, but
+# pinned explicitly rather than relying on another package's transitive
+# dependency by accident.
+Pillow>=10.0.0
