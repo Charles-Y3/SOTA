@@ -22,12 +22,29 @@ import transcriber  # only for unique_path — no transcription code used
 DEFAULT_SAMPLE_RATE = 44100
 SAMPLE_RATE_OPTIONS = [16000, 22050, 44100, 48000]
 CHANNEL_OPTIONS = [1, 2]
+BIT_DEPTH_OPTIONS = [16, 24]
+DEFAULT_BIT_DEPTH = 16
+CLIP_THRESHOLD = 0.98
+MIC_TEST_SECONDS = 5.0
 
 
 def _rms(audio):
     if len(audio) == 0:
         return 0.0
     return float(np.sqrt(np.mean(audio.astype("float64") ** 2)))
+
+
+def _pack_pcm24(audio):
+    """Packs a float32 array (range ~[-1, 1]) as little-endian signed
+    24-bit PCM bytes. numpy has no native int24 dtype, so scale into the
+    int32 range, then drop the (always-zero after this scaling) top byte
+    of each little-endian int32 word."""
+    clipped = np.clip(audio, -1.0, 1.0)
+    as_int32 = (clipped * 8388607.0).astype("<i4")
+    as_bytes = as_int32.tobytes()
+    # Each int32 word is 4 bytes little-endian; keep the low 3, drop the top.
+    view = np.frombuffer(as_bytes, dtype=np.uint8).reshape(-1, 4)
+    return view[:, :3].tobytes()
 
 
 def list_input_devices():
@@ -78,6 +95,21 @@ def _resolve_device(device_name):
     return None
 
 
+def resolved_device_label(device_name):
+    """Human-readable name of the mic that will actually be used —
+    `device_name` itself when it still exists, otherwise the system's
+    current default input device (covers both the empty "use default"
+    selection and a previously-selected device that's since disappeared)."""
+    if device_name and _resolve_device(device_name) is not None:
+        return device_name
+    try:
+        import sounddevice as sd
+
+        return sd.query_devices(kind="input")["name"]
+    except Exception:
+        return device_name or ""
+
+
 class AudioRecorder(threading.Thread):
     """Records raw audio from the microphone to a WAV file: pause/resume
     mid-session, an incremental level meter, and auto-save-as-you-go (the
@@ -88,21 +120,25 @@ class AudioRecorder(threading.Thread):
 
     TICK_S = 0.15
     PEAK_WINDOW_S = 0.05  # one waveform column per 50ms of audio
+    RECENT_AUDIO_S = 30.0  # how far back the fine-grained waveform buffer reaches — see recent_snapshot()
 
     def __init__(self, events, device_name="", sample_rate=DEFAULT_SAMPLE_RATE,
-                channels=1, custom_stem=None):
+                channels=1, custom_stem=None, gain=1.0, bit_depth=DEFAULT_BIT_DEPTH):
         super().__init__(daemon=True)
         self.events = events
         self.device_name = device_name or ""
         self.sample_rate = sample_rate
         self.channels = max(1, min(2, channels))
         self.custom_stem = custom_stem or None
+        self.gain = gain
+        self.bit_depth = bit_depth if bit_depth in BIT_DEPTH_OPTIONS else DEFAULT_BIT_DEPTH
         self.stop_event = threading.Event()
         self._paused = threading.Event()
         self._lock = threading.Lock()
         self._pending_disk = []
         self._recorded_samples = 0
         self.level = 0.0
+        self._clipped = False
         self._wav = None
         self._audio_path = None
         self._stream = None
@@ -114,6 +150,20 @@ class AudioRecorder(threading.Thread):
         self._peak_maxes = []
         self._peak_remainder = np.zeros(0, dtype=np.float32)
         self._peak_window_samples = max(1, int(sample_rate * self.PEAK_WINDOW_S))
+        # A SEPARATE, deliberately bounded rolling buffer of raw samples
+        # covering only the last RECENT_AUDIO_S seconds — the peak cache
+        # above is coarse (50ms buckets) by design to stay cheap over an
+        # arbitrarily long recording, but that coarseness is exactly what
+        # makes the live waveform look blocky when the visible window is
+        # short (early in a recording, or zoomed in). This buffer trades a
+        # small, capped amount of memory (~5MB at 44.1kHz float32 for 30s)
+        # for pixel-accurate rendering of whatever's recent, the same way
+        # _pending_disk buffers chunks for the WAV writer — a list of
+        # chunks, trimmed from the front once the total exceeds the cap,
+        # not a from-scratch ring-buffer implementation.
+        self._recent_chunks = []
+        self._recent_len = 0
+        self._recent_cap_samples = max(1, int(sample_rate * self.RECENT_AUDIO_S))
 
     def stop(self):
         self.stop_event.set()
@@ -129,6 +179,18 @@ class AudioRecorder(threading.Thread):
         return self._paused.is_set()
 
     @property
+    def clipped(self):
+        """True if any sample has hit CLIP_THRESHOLD since the last
+        reset_clip_flag() call (sticky, so a brief overload isn't missed
+        between UI ticks)."""
+        with self._lock:
+            return self._clipped
+
+    def reset_clip_flag(self):
+        with self._lock:
+            self._clipped = False
+
+    @property
     def elapsed_seconds(self):
         with self._lock:
             samples = self._recorded_samples
@@ -141,12 +203,30 @@ class AudioRecorder(threading.Thread):
         if self._paused.is_set():
             return
         chunk = indata.copy()
+        if self.gain != 1.0:
+            chunk *= self.gain
         mono = chunk[:, 0]
+        is_clipped = bool(np.any(np.abs(mono) >= CLIP_THRESHOLD))
         with self._lock:
             self._pending_disk.append(chunk)
             self._recorded_samples += len(chunk)
             self._accumulate_peaks(mono)
+            self._accumulate_recent(mono)
+            if is_clipped:
+                self._clipped = True
         self.level = _rms(mono)
+
+    def _accumulate_recent(self, mono_chunk):
+        """Called under self._lock, right alongside _accumulate_peaks —
+        same input, different purpose (see RECENT_AUDIO_S's comment in
+        __init__). Appends the new chunk, then drops whole chunks off the
+        front until the total is back under the cap; dropping by whole
+        chunks (not trimming mid-chunk) keeps this O(1) amortized instead
+        of slicing a numpy array on every callback."""
+        self._recent_chunks.append(mono_chunk.copy())
+        self._recent_len += len(mono_chunk)
+        while len(self._recent_chunks) > 1 and self._recent_len - len(self._recent_chunks[0]) >= self._recent_cap_samples:
+            self._recent_len -= len(self._recent_chunks.pop(0))
 
     def _accumulate_peaks(self, mono_chunk):
         """Called under self._lock. Folds `mono_chunk` into fixed-size
@@ -169,6 +249,24 @@ class AudioRecorder(threading.Thread):
         with self._lock:
             return list(self._peak_mins), list(self._peak_maxes)
 
+    def recent_snapshot(self):
+        """Returns (buffer, start_offset_s): a concatenated float32 array
+        of up to the last RECENT_AUDIO_S seconds of raw mono samples, and
+        the absolute recording-timeline offset (seconds since the
+        recording started) its first sample corresponds to — a caller
+        comparing a visible (start_s, end_s) window against this offset
+        can tell whether that window falls entirely within the fine-
+        grained buffer, and if so, compute pixel-accurate peaks directly
+        from it (e.g. via audio_clip.peaks_from_buffer) instead of the
+        coarser PEAK_WINDOW_S cache peaks_snapshot() returns."""
+        with self._lock:
+            chunks = list(self._recent_chunks)
+            recent_len = self._recent_len
+            total_samples = self._recorded_samples
+        buffer = np.concatenate(chunks) if chunks else np.zeros(0, dtype=np.float32)
+        start_offset_s = (total_samples - recent_len) / self.sample_rate if self.sample_rate else 0.0
+        return buffer, start_offset_s
+
     def _open_wav(self):
         import wave
 
@@ -186,7 +284,7 @@ class AudioRecorder(threading.Thread):
             path = transcriber.unique_path(os.path.join(folder, stem + ".wav"))
             wav = wave.open(path, "wb")
             wav.setnchannels(self.channels)
-            wav.setsampwidth(2)
+            wav.setsampwidth(3 if self.bit_depth == 24 else 2)
             wav.setframerate(self.sample_rate)
             self._wav, self._audio_path = wav, path
         except Exception:
@@ -200,8 +298,11 @@ class AudioRecorder(threading.Thread):
             return
         try:
             audio = np.concatenate(chunks)
-            pcm16 = (np.clip(audio, -1.0, 1.0) * 32767.0).astype(np.int16)
-            self._wav.writeframes(pcm16.tobytes())
+            if self.bit_depth == 24:
+                self._wav.writeframes(_pack_pcm24(audio))
+            else:
+                pcm16 = (np.clip(audio, -1.0, 1.0) * 32767.0).astype(np.int16)
+                self._wav.writeframes(pcm16.tobytes())
         except Exception:
             settings.log_exception("Audio Studio recording write failed:")
 
@@ -240,3 +341,61 @@ class AudioRecorder(threading.Thread):
             seconds = self.elapsed_seconds
             self._close_wav()
             self._emit("record_stopped", self._audio_path, seconds)
+
+
+class MicTester(threading.Thread):
+    """A short, disk-free "Test Mic" run: opens the same input stream an
+    AudioRecorder would, exposes the same level/clipped readout, and
+    auto-stops itself after MIC_TEST_SECONDS — nothing is written to disk.
+    Deliberately not a subclass of AudioRecorder (no WAV writer, no
+    pause/resume, no pending-disk buffer to manage) so it can't drag any
+    of that unrelated bookkeeping in by accident."""
+
+    def __init__(self, device_name="", sample_rate=DEFAULT_SAMPLE_RATE,
+                channels=1, gain=1.0, duration=MIC_TEST_SECONDS):
+        super().__init__(daemon=True)
+        self.device_name = device_name or ""
+        self.sample_rate = sample_rate
+        self.channels = max(1, min(2, channels))
+        self.gain = gain
+        self.duration = duration
+        self.stop_event = threading.Event()
+        self._lock = threading.Lock()
+        self.level = 0.0
+        self._clipped = False
+        self._stream = None
+
+    def stop(self):
+        self.stop_event.set()
+
+    @property
+    def clipped(self):
+        with self._lock:
+            return self._clipped
+
+    def _on_audio(self, indata, _frames, _time_info, _status):
+        mono = indata[:, 0] * self.gain
+        if np.any(np.abs(mono) >= CLIP_THRESHOLD):
+            with self._lock:
+                self._clipped = True
+        self.level = _rms(mono)
+
+    def run(self):
+        import sounddevice as sd
+
+        try:
+            device = _resolve_device(self.device_name)
+            self._stream = sd.InputStream(
+                samplerate=self.sample_rate, channels=self.channels,
+                dtype="float32", device=device, callback=self._on_audio)
+            self._stream.start()
+            self.stop_event.wait(self.duration)
+        except Exception:
+            settings.log_exception("Audio Studio mic test failed:")
+        finally:
+            if self._stream is not None:
+                try:
+                    self._stream.stop()
+                    self._stream.close()
+                except Exception:
+                    pass

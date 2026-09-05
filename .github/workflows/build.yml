@@ -33,13 +33,18 @@ jobs:
           pip install "setuptools>=77.0.3,<81" -r requirements.txt pyinstaller
 
       - name: Build SOTA.exe
-        # scipy/noisereduce/df(DeepFilterNet)/pyloudnorm/PIL/lameenc added
-        # for Audio Studio (v2) — none were in this list before, so
-        # PyInstaller's default import analysis was the only thing
-        # finding them; --selftest below only opens the main window and
-        # never touches Enhance/Denoise/Export, so a packaging gap in any
-        # of these wouldn't have been caught by the smoke test at all,
-        # only by an actual user clicking those buttons in a built app.
+        # scipy/noisereduce/pyloudnorm/PIL/lameenc added for Audio Studio
+        # (v2) — none were in this list before, so PyInstaller's default
+        # import analysis was the only thing finding them; --selftest
+        # below only opens the main window and never touches Enhance/
+        # Denoise/Export, so a packaging gap in any of these wouldn't
+        # have been caught by the smoke test at all, only by an actual
+        # user clicking those buttons in a built app. DeepFilterNet
+        # ('df') was removed — it never actually ran (a torchaudio API it
+        # needs was removed in the torchaudio version pinned in
+        # requirements.txt) — the AI panel's NSNet2 model runs through
+        # onnxruntime instead (already hidden-imported below, needed by
+        # faster-whisper's own VAD regardless).
         run: >
           pyinstaller --noconfirm --clean --windowed --name SOTA
           --collect-all customtkinter
@@ -56,7 +61,6 @@ jobs:
           --collect-all torchaudio
           --collect-all scipy
           --collect-all noisereduce
-          --collect-all df
           --collect-all pyloudnorm
           --collect-all PIL
           --collect-all lameenc

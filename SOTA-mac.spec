@@ -15,15 +15,19 @@ datas = []
 binaries = []
 hiddenimports = ['onnxruntime']
 datas += collect_data_files('faster_whisper')
-# scipy/noisereduce/df(DeepFilterNet)/pyloudnorm/PIL/lameenc: Audio
-# Studio (v2)'s own dependencies, not in this list until now — see the
-# matching comment in .github/workflows/build.yml's Windows job for why
-# that's a real gap (the --selftest smoke test never exercises Enhance/
-# Denoise/Export, so a packaging miss here would only surface when an
-# actual user clicked one of those buttons in the built .app).
+# scipy/noisereduce/pyloudnorm/PIL/lameenc: Audio Studio (v2)'s own
+# dependencies, not in this list until now — see the matching comment in
+# .github/workflows/build.yml's Windows job for why that's a real gap
+# (the --selftest smoke test never exercises Enhance/Denoise/Export, so a
+# packaging miss here would only surface when an actual user clicked one
+# of those buttons in the built .app). DeepFilterNet ('df') was removed —
+# it never actually ran (a torchaudio API it needs was removed in the
+# torchaudio version pinned in requirements.txt) — the AI panel's NSNet2
+# model runs through onnxruntime instead (already hidden-imported above,
+# needed by faster-whisper's own VAD regardless).
 for pkg in ('customtkinter', 'tkinterdnd2', 'sounddevice', 'av', 'docx',
             'ctranslate2', 'llama_cpp', 'opencc', 'funasr', 'torch',
-            'torchaudio', 'scipy', 'noisereduce', 'df', 'pyloudnorm',
+            'torchaudio', 'scipy', 'noisereduce', 'pyloudnorm',
             'PIL', 'lameenc'):
     tmp_ret = collect_all(pkg)
     datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]

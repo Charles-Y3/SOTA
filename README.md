@@ -329,7 +329,7 @@ macOS), so it always ships with the release.
 
 Note: since v1.2.0 the build bundles PyTorch and FunASR (for the SenseVoice
 engine) alongside the existing dependencies, and since v2.0.0 it also
-bundles Audio Studio's DSP dependencies (scipy, noisereduce, DeepFilterNet,
+bundles Audio Studio's DSP dependencies (scipy, noisereduce, onnxruntime,
 pyloudnorm, Pillow, lameenc) — so both the build itself and the resulting
 `dist\SOTA` folder are noticeably larger and slower to produce than earlier
 versions.
@@ -457,10 +457,12 @@ work, run locally instead of through a cloud API:
 - **[NumPy](https://numpy.org/)** / **[SciPy](https://scipy.org/)** — the
   WSOLA time-stretching used by the variable-speed player, and Audio
   Studio's filters, resampling, and spectrogram computation.
-- **[DeepFilterNet](https://github.com/Rikorose/DeepFilterNet)** /
-  **[noisereduce](https://github.com/timsainb/noisereduce)** — Audio
-  Studio's noise reduction (DeepFilterNet when available, noisereduce's
-  spectral gating as a fallback).
+- **[noisereduce](https://github.com/timsainb/noisereduce)** — Audio
+  Studio Enhance's noise reduction (spectral gating).
+- **[ONNX Runtime](https://github.com/microsoft/onnxruntime)** /
+  **[NSNet2](https://github.com/microsoft/DNS-Challenge)** (Microsoft,
+  model weights CC BY 4.0) — the AI panel's ML-based noise reduction,
+  kept separate from Enhance's manual (non-ML) tool above.
 - **[pyloudnorm](https://github.com/csteinmetz1/pyloudnorm)** — Audio
   Studio's LUFS loudness normalization.
 - **[lameenc](https://github.com/chrisstaite/lameenc)** — Audio Studio's

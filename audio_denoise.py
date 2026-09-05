@@ -1,67 +1,20 @@
 """Noise reduction for Audio Studio's Enhance subtab.
 
-DeepFilterNet (MIT license) is the primary engine: much better on
-non-stationary noise (fan/traffic/keyboard, not just steady hiss) than
-spectral gating, and its ~2MB pretrained checkpoint is fetched and cached
-by its own init_df() the first time it runs — no separate download-
-progress plumbing is needed the way Whisper/SenseVoice's model manager
-needs one, since the file is tiny and DeepFilterNet handles its own
-caching. noisereduce (spectral gating, MIT, zero downloads at all) is the
-fallback for anyone who declines/can't reach that download, or if
-DeepFilterNet fails to import/initialize for any reason — Enhance's
-"Apply" action should never hard-fail over an optional dependency this
-deep in the stack.
+Deliberately the "traditional" (non-ML) noise-reduction method only —
+noisereduce's spectral gating: it estimates a noise profile from the
+buffer (or from a user-captured reference clip) and subtracts it in the
+frequency domain, zero downloads, zero model weights. The ML-based option
+(NSNet2, via audio_ai_edit.py) lives exclusively in the Edit tab's AI
+panel — kept out of this module on purpose, so Enhance's manual row stays
+a plain, fully-deterministic DSP tool a user can reason about directly,
+and the AI panel is the only place a model-driven result appears. (This
+module previously also tried DeepFilterNet first; it was removed because
+it never actually ran — a torchaudio API it depends on was removed in the
+torchaudio version pinned in requirements.txt, so it always silently fell
+back to noisereduce anyway. See git history for the removed code.)
 """
 
-from math import gcd
-
 import numpy as np
-
-_df_cache = {}
-
-
-def deepfilternet_available():
-    try:
-        import df.enhance  # noqa: F401
-    except Exception:
-        return False
-    return True
-
-
-def _get_df():
-    if "model" not in _df_cache:
-        from df.enhance import init_df
-
-        model, df_state, _ = init_df()
-        _df_cache["model"] = model
-        _df_cache["state"] = df_state
-    return _df_cache["model"], _df_cache["state"]
-
-
-def _resample(buffer, orig_sr, target_sr):
-    if orig_sr == target_sr or buffer.size == 0:
-        return buffer.astype(np.float32)
-    from scipy.signal import resample_poly
-
-    g = gcd(orig_sr, target_sr)
-    up, down = target_sr // g, orig_sr // g
-    return resample_poly(buffer, up, down).astype(np.float32)
-
-
-def denoise_deepfilternet(buffer, sample_rate):
-    """Runs DeepFilterNet on a mono float32 buffer at any sample rate —
-    DeepFilterNet trains at a fixed rate of its own (48kHz), unrelated to
-    Audio Studio's editing rate, so this resamples there and back."""
-    import torch
-    from df.enhance import enhance
-
-    model, df_state = _get_df()
-    model_sr = df_state.sr()
-    audio = _resample(buffer, sample_rate, model_sr)
-    tensor = torch.from_numpy(audio).unsqueeze(0)  # (channels=1, samples)
-    enhanced = enhance(model, df_state, tensor)
-    enhanced = enhanced.squeeze(0).detach().cpu().numpy().astype(np.float32)
-    return _resample(enhanced, model_sr, sample_rate)
 
 
 def denoise_spectral_gate(buffer, sample_rate, prop_decrease=0.8, stationary=False,
@@ -98,27 +51,17 @@ def denoise_spectral_gate(buffer, sample_rate, prop_decrease=0.8, stationary=Fal
 def denoise_with_profile(buffer, sample_rate, noise_profile):
     """Denoises `buffer` using `noise_profile` (a short noise-only
     recording captured elsewhere in the same clip) as the reference —
-    tends to beat blind/model-based denoising on noise that's unusual or
+    tends to beat blind noise-profile guessing on noise that's unusual or
     specific to one recording (a particular fridge hum, a fan), since
     it's tuned to that exact noise rather than general speech patterns."""
     return denoise_spectral_gate(buffer, sample_rate, noise_clip=noise_profile)
 
 
-def denoise(buffer, sample_rate, prefer_deepfilternet=True, prop_decrease=0.8, stationary=False):
-    """Best-effort dispatcher — tries DeepFilterNet first (if preferred),
-    silently falls back to noisereduce on any failure (package missing,
-    first-run download failing offline, unexpected runtime error).
-    Returns (denoised_buffer, engine_used) so the caller can tell the user
-    which one actually ran, since the two differ noticeably in quality.
-
-    prop_decrease/stationary only affect the noisereduce fallback (there's
-    no equivalent knob on DeepFilterNet) — see denoise_spectral_gate for
-    what they do and why a blind/automatic caller should hand in gentler
-    values than the manual Enhance row's own defaults."""
-    if prefer_deepfilternet:
-        try:
-            return denoise_deepfilternet(buffer, sample_rate), "deepfilternet"
-        except Exception:
-            pass
+def denoise(buffer, sample_rate, prop_decrease=0.8, stationary=False):
+    """Enhance's Noise reduction row — noisereduce's spectral gating,
+    always. Returns (denoised_buffer, engine_used) — "noisereduce" is the
+    only possible value, but the shape is kept so callers (and the
+    "Engine: {engine}" status label) don't need to special-case a single-
+    engine dispatcher versus a multi-engine one."""
     return denoise_spectral_gate(buffer, sample_rate, prop_decrease=prop_decrease,
                                  stationary=stationary), "noisereduce"

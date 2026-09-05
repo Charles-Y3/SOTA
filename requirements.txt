@@ -27,21 +27,27 @@ funasr>=1.3.14
 # Audio Studio (v2): DSP filters/EQ/compression for the Enhance subtab and
 # resampling in audio_clean.py's VAD-based silence/pause detection.
 scipy>=1.11.0
-# Audio Studio noise reduction: DeepFilterNet is the primary engine (own
-# tiny pretrained checkpoint, fetched/cached by its own init_df() on first
-# use); noisereduce is the zero-download spectral-gating fallback used
-# when DeepFilterNet isn't available or its model can't be fetched.
-# KNOWN ISSUE as of DeepFilterNet 0.5.6: it imports
+# Audio Studio Enhance's noise reduction: noisereduce's spectral gating —
+# the ONLY engine here on purpose (the ML-based option, NSNet2, lives
+# exclusively in the Edit tab's AI panel via audio_ai_edit.py, run
+# through onnxruntime — already a dependency below/transitively via
+# faster-whisper's own VAD filter, so no new heavy runtime is added for
+# it). DeepFilterNet was removed from this project entirely: it never
+# actually ran here — DeepFilterNet 0.5.6 imports
 # torchaudio.backend.common.AudioMetaData, which doesn't exist on the
-# torchaudio version pinned above — confirmed by import error, not
-# assumed. audio_denoise.denoise() catches this and falls back to
-# noisereduce automatically, so Enhance's noise reduction still works,
-# just always via the weaker engine until this is resolved (either a
-# DeepFilterNet release that supports this torchaudio, or bumping
-# torchaudio — which risks the same pre-AVX512 crash torch is pinned
-# against elsewhere in this file, so needs its own verification pass).
-deepfilternet>=0.5.6
+# torchaudio version pinned above (confirmed by import error, not
+# assumed), so audio_denoise.denoise() silently fell back to noisereduce
+# on every call regardless of the setting. See git history if it's ever
+# worth revisiting (would need either a DeepFilterNet release supporting
+# this torchaudio, or bumping torchaudio — which risks the same
+# pre-AVX512 crash torch is pinned against elsewhere in this file, so
+# needs its own verification pass).
 noisereduce>=3.0.0
+# NSNet2 (the AI panel's ML noise reduction, audio_ai_edit.py) runs
+# through onnxruntime. Already present transitively via faster-whisper's
+# own VAD filter, but pinned explicitly here since SOTA's own code now
+# imports it directly too — same reasoning as the Pillow pin below.
+onnxruntime>=1.17.0
 # MP3 export for Audio Studio's finished/edited audio. Pure-Python-
 # installable LAME binding — avoids bundling/shelling out to ffmpeg.
 lameenc>=1.6.1

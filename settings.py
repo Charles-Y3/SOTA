@@ -5,7 +5,7 @@ import os
 import sys
 import traceback
 
-APP_VERSION = "2.0.0"
+APP_VERSION = "2.1.0"
 
 
 def _default_app_dir():
@@ -143,6 +143,14 @@ DEFAULTS = {
     "live_mic_device": "",
     # "" = DEFAULT_OUTPUT_FOLDER (output/ next to the app).
     "output_folder": "",
+    # Audio Studio's AI panel: words/phrases Remove Filler Words looks
+    # for (audio_ai_edit.py) — an entry may be a single word ("um") or a
+    # multi-word phrase ("you know"). User-editable via the AI panel's
+    # "Filler Words…" button — kept in prefs, not hardcoded, since what
+    # counts as a filler is genuinely dialect/speaker-dependent (English-
+    # only for now, same limitation the detector itself has).
+    "ai_filler_words": ["um", "uh", "erm", "hmm", "uhh", "umm", "mm", "ah", "aah", "er",
+                        "you know", "i mean", "sort of", "kind of"],
 }
 
 
