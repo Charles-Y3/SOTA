@@ -151,6 +151,22 @@ DEFAULTS = {
     # only for now, same limitation the detector itself has).
     "ai_filler_words": ["um", "uh", "erm", "hmm", "uhh", "umm", "mm", "ah", "aah", "er",
                         "you know", "i mean", "sort of", "kind of"],
+    # Recording/transcription safeguards (app.py's _check_recording_safeguards) —
+    # three escalating tiers (warn/alert/stop) across three dimensions
+    # (how long a recording's been running, free disk space, free RAM).
+    # "Stop" is the only tier that actually acts (auto-stops the
+    # recording); warn/alert only ever show a dismissible notice, never
+    # interrupt anything — see app.py's _show_safeguard_notice. All nine
+    # are user-editable in Settings.
+    "safeguard_warn_hours": 2.0,
+    "safeguard_alert_hours": 4.0,
+    "safeguard_stop_hours": 8.0,
+    "safeguard_warn_disk_minutes": 10.0,
+    "safeguard_alert_disk_minutes": 2.0,
+    "safeguard_stop_disk_minutes": 0.5,
+    "safeguard_warn_ram_gb": 1.0,
+    "safeguard_alert_ram_gb": 0.4,
+    "safeguard_stop_ram_gb": 0.15,
 }
 
 

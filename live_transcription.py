@@ -251,6 +251,15 @@ class LiveTranscriber(threading.Thread):
     def stop(self):
         self.stop_event.set()
 
+    @property
+    def elapsed_seconds(self):
+        """Same shape as audio_record.AudioRecorder's own property — lets
+        app.py's recording-safeguard checks (duration warnings) treat both
+        recorders identically without knowing which one they're looking at."""
+        with self._lock:
+            samples = self._recorded_samples
+        return samples / SAMPLE_RATE if SAMPLE_RATE else 0.0
+
     def request_partial_save(self):
         """Manual trigger for the same save _step() already fires on its own
         whenever a paragraph completes (see the natural_pause branch there)

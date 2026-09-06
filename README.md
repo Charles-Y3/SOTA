@@ -1,23 +1,21 @@
 # SOTA — Smart Offline Transcription & Audio
 
-**Version 2.0.0**
+**Version 2.1.0**
 
 Drop in audio files, click **Transcribe All**, and get a transcript for each
 file — saved as `.docx` if Microsoft Word is installed, otherwise `.txt`. Or
-dictate straight from your microphone in the **Live Transcription** tab. New
-in this version, the **Audio Studio** group lets you record, edit, and clean
-up audio entirely on its own — no transcript required. Everything runs
-locally on your computer — after the one-time model download(s), no internet
-is needed and no audio ever leaves your machine.
+dictate straight from your microphone in the **Live Transcription** tab. The
+**Audio Studio** group lets you record, edit, clean up, and AI-analyze audio
+entirely on its own — no transcript required. Everything runs locally on
+your computer — after the one-time model download(s), no internet is
+needed and no audio ever leaves your machine.
 
 ## Two studios
 
-- **Audio Studio** — record from the microphone, or open any audio file, and
-  edit/enhance/clean it up: cut/copy/paste, trim, split, undo/redo,
-  waveform or spectrogram view, loudness/tone/noise-reduction effects, save
-  your own reusable effect sequences, find & remove repeated segments,
-  detect sections and no-speech gaps, add labeled markers, and export as
-  WAV or MP3.
+- **Audio Studio** — record from the microphone or open any audio file, edit
+  it (cut/trim/split/effects/noise reduction), run an AI health check for
+  problems like noise, filler words, and long pauses, and export as WAV or
+  MP3. See **Audio Studio** below for the full tour.
 - **Transcription Studio** — Transcribe / Live / Edit / AI: drop audio files
   in for a batch transcript, dictate live via SenseVoice, replay a file and
   fix its transcript, or run a local LLM over a transcript to
@@ -27,11 +25,13 @@ is needed and no audio ever leaves your machine.
 
 **Audio Studio**
 
-1. **Record** — capture audio straight from the microphone.
+1. **Record** — capture audio straight from the microphone, with live
+   markers, a disk-space readout, and safeguards against a recording left
+   running unattended.
 2. **Edit** — open any audio file (or a fresh recording) to cut, trim,
-   split, enhance, clean, and export it. Enhance/Clean/Find aren't separate
-   subtabs — they're collapsible panels inside Edit, so they always act on
-   the waveform already on screen.
+   split, enhance, clean, AI-analyze, and export it. Enhance/Clean/Matches/
+   Markers/AI aren't separate subtabs — they're collapsible panels inside
+   Edit, so they always act on the waveform already on screen.
 
 **Transcription Studio**
 
@@ -143,13 +143,35 @@ everything captured up to that moment is already on disk and playable.
 ## Audio Studio
 
 A pair of tabs for working with audio on its own, independent of
-transcription.
+transcription. Every time shown anywhere in Audio Studio (the waveform
+ruler, player readouts, marker/pause/match rows) is **HH:MM:SS**, since a
+recording here can easily run well past an hour.
 
 ### Record tab
 
-Capture audio straight from the microphone, same device picker as Live
-Transcription. Stop and the recording opens directly in the Edit tab, ready
-to trim and clean up.
+1. Pick a **microphone** (same device picker as Live Transcription) and set
+   the **input gain**; a level meter and clip warning show whether the
+   signal is too quiet or too hot before you commit to a take. **Test Mic**
+   runs a quick 5-second check with no recording involved.
+2. Choose the **format** — sample rate, channels, bit depth (16/24-bit), and
+   WAV or MP3 output — and see, right below it, how much space this
+   recording has used so far and how much free space is left on the drive.
+3. Click **Start Recording**. While it runs you can **Pause/Resume**, and
+   **Mark** drops a labeled marker at the current position without
+   stopping — e.g. one per speaker turn — shown live on the timeline as a
+   small numbered flag.
+4. Click **Stop**, then **Open in Edit** to send the recording (and any
+   markers you dropped) straight into the Edit tab.
+
+**Safeguards against a recording left running unattended** (Settings →
+**Recording Safeguards**, thresholds are editable there): three escalating
+tiers — Warn, Alert, and Auto-stop — across recording duration, free disk
+space, and free system RAM. Warn/Alert only ever show a dismissible notice
+(visible regardless of which tab you're on) and never interrupt anything;
+Auto-stop actually stops the recording and saves it, so it can't silently
+run forever, fill the disk, or crash the app. The same duration tiers also
+watch Live Transcription's own recordings, and the disk/RAM tiers watch
+batch Transcribe jobs too.
 
 ### Edit tab
 
@@ -164,12 +186,7 @@ to trim and clean up.
    - **Clipboard** — Cut / Copy / Paste, same shortcuts as any editor.
    - **Structure** — Trim (keep only the selection), Split (cut the clip in
      two at the playhead), Insert silence.
-   - **History & Search** — Undo / Redo, **Find similar…** (finds other
-     places in the recording that sound like your selection — filler
-     words, repeated phrases — so you can review and remove every
-     occurrence at once), **Add marker** (drops a labeled marker at the
-     current playhead; markers stay correctly positioned through cuts,
-     trims, and pastes, and are restored by undo/redo too).
+   - **History** — Undo / Redo.
 4. **Enhance** panel — loudness, tone, and noise controls, each with a live
    preview before you commit:
    - **✨ Auto Enhance** — a fixed one-click pass (high-pass filter →
@@ -191,19 +208,63 @@ to trim and clean up.
      **Get noise profile** — select a stretch of just the background noise
      first, then it's used automatically).
 5. **Clean** panel — **Shorten pauses** longer than a chosen length, **Noise
-   gate** (mutes stretches below a volume threshold), **Remove clicks/pops**,
-   and **Detect sections** (adds a marker after every real break in the
-   audio) / **Detect no-speech** (finds stretches at least 1.5s long that
-   don't sound like speech — a cough or clap counts too, not just silence).
-6. **Export WAV** or **Export MP3** when you're done, or **Revert to
-   original** to discard every edit and start over. Any operation that
-   takes real time (loading a file, Auto Enhance, denoising, Find similar,
-   exporting) shows a progress dialog and blocks other buttons until it's
-   done, so it's never unclear whether the app is still working.
+   gate** (mutes stretches below a volume threshold), and **Remove
+   clicks/pops**.
+6. **Matches** panel — **Find similar…** finds other places in the
+   recording that sound like your current selection (filler words, repeated
+   phrases), with a display filter (≥80–95% similarity) to narrow the
+   results, so you can review and remove every occurrence at once.
+7. **No speech** panel — **Detect no-speech** finds stretches at least
+   1.5s long that don't sound like speech — a cough or clap counts too, not
+   just silence (see the note on this below) — with the same kind of
+   display filter (≥1.5s/3.0s/4.5s/6.0s) to narrow which stretches are
+   worth reviewing.
+8. **Markers** panel — **Add marker** drops a labeled marker at the current
+   playhead (markers stay correctly positioned through cuts, trims, and
+   pastes, and are restored by undo/redo too); rename or delete any one.
+   Every marker "owns" the span from itself to the next marker (or the end
+   of the clip) — **Save** exports just that speaker's/section's span as
+   its own WAV file, and **Save Selected as Files** does it for every
+   checked marker at once (e.g. splitting a multi-speaker recording into
+   one file per turn, after dropping a marker each time someone starts
+   talking, whether you marked those live while recording or added them
+   here afterward).
+9. **AI** panel — an AI-assisted health check and cleanup, running on its
+   own isolated model stack (never shares state with Transcription
+   Studio's engine/quality settings):
+   - **🩺 Analyze Audio** checks noise floor, clipping, volume consistency,
+     long pauses, and (via a Whisper "base" transcription pass) filler
+     words and repeated phrases — with a live progress dialog showing a
+     continuously-refined time estimate and a **Cancel** button, since a
+     long recording's transcription pass can take a while.
+     **⚡ Quick Analysis** skips the transcription pass — noise/clipping/
+     volume/pauses only — finishing in well under a minute regardless of
+     length.
+   - Results show a **Recording Health** score and reviewable rows (with
+     Play/Jump) for anything flagged; **Long pauses** has its own display
+     filter, same idea as the No speech panel's. Denoise here runs a
+     separate ML model (NSNet2) from Enhance's manual noise reduction
+     above, and needs its own one-time download (Settings).
+   - **AI Preset** applies a curated effect chain (Podcast, Lecture,
+     Meeting, Interview, YouTube Voice, Audiobook, Phone Recording) in one
+     click.
+10. **Export WAV** or **Export MP3** when you're done, or **Revert to
+    original** to discard every edit and start over. Any operation that
+    takes real time (loading a file, Auto Enhance, denoising, Find similar,
+    Analyze Audio, exporting) shows a progress dialog so it's never unclear
+    whether the app is still working; searches and Analyze Audio can be
+    cancelled mid-run.
 
 Recordings, exports, and protected original copies (used by **Revert to
 original**) are saved under `output\Audio Studio` — see **Folder layout**
 below.
+
+**A note on "no speech detected":** both the No speech panel and the AI
+panel's long-pause detection work the same way — they flag any stretch
+that doesn't sound like speech, not literal silence. A quiet action like
+drinking water or writing on a whiteboard has no vocal content, so it gets
+flagged just like a pause; an incidental sound (a cup clink, a marker
+squeak, a cough) still isn't speech either, so it's flagged too.
 
 ## Edit & Export tab
 
@@ -287,7 +348,11 @@ Everything that isn't part of a day-to-day workflow lives here:
   (compares against the latest GitHub release; needs internet, does nothing
   otherwise), plus one-click buttons to open the log file and the models
   folder, and a **Reset all settings** button that restores every
-  preference to its default without touching models or transcripts.
+  preference (recording safeguard thresholds included) to its default
+  without touching models or transcripts.
+- **Recording Safeguards** — the Warn/Alert/Auto-stop thresholds mentioned
+  under the Record tab above (duration, free disk space, free RAM), each
+  independently editable.
 
 ## Folder layout
 
@@ -356,11 +421,11 @@ macOS `.app`.
   **Run workflow**. When it finishes, download `SOTA-windows` and
   `SOTA-macOS` from the run's **Artifacts** section.
 - **Automatically**: every push to `main` builds both platforms.
-- **Releases**: pushing a tag like `v2.0.0` also publishes a GitHub Release
+- **Releases**: pushing a tag like `v2.1.0` also publishes a GitHub Release
   with both zips attached:
   ```
-  git tag v2.0.0
-  git push origin v2.0.0
+  git tag v2.1.0
+  git push origin v2.1.0
   ```
 
 ### Running the unsigned macOS build

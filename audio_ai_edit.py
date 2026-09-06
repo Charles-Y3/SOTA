@@ -14,8 +14,17 @@ Whisper already have on disk) — just never its cached model instances.
 Speaker count is intentionally not reported anywhere here — that needs a
 diarization model, which is out of scope. Echo detection is also
 intentionally absent — no reliable low-cost detector exists among this
-app's current dependencies; the Edit tab surfaces this as "not checked in
-this version" rather than guessing or silently omitting the line.
+app's current dependencies, and there's no "not checked" placeholder line
+for it either (removed — it read as a permanent apology for a feature
+that was never promised).
+
+Fillers/repetitions need this module's own whisper "base" model; unlike
+NSNet2's is_downloaded()-gated checkbox, an earlier version of this module
+let faster_whisper attempt a silent network download on every Analyze and
+swallowed the failure, so those sections just never appeared with no
+explanation. whisper_base_is_downloaded() now lets the Edit tab tell that
+case apart from "checked, found none" and point the user at Settings —
+same pattern nsnet2_is_downloaded() already used for denoise.
 """
 
 import hashlib
@@ -119,10 +128,14 @@ def _energy_speech_segments(audio, sample_rate, frame_ms=30, threshold_rms=0.015
     return segments
 
 
-def _speech_segments_s(buffer, sample_rate):
-    """[(start_s, end_s), ...] speech spans in the ORIGINAL buffer's
-    coordinates, detected on a resampled 16kHz copy."""
-    audio16k = _resample(buffer, sample_rate, AI_EDIT_SAMPLE_RATE)
+def _speech_segments_s_16k(audio16k):
+    """[(start_s, end_s), ...] speech spans, in `audio16k`'s own
+    timeline. `audio16k` must already be at AI_EDIT_SAMPLE_RATE — the
+    caller (analyze()) resamples the buffer to 16kHz exactly once and
+    shares that same array with this and transcribe_words below, rather
+    than each phase resampling the whole recording for itself (the
+    previous shape here), which for a long recording meant paying for
+    the same full-buffer resample twice over."""
     vad = _get_vad_model()
     if vad is not None:
         res = vad.generate(input=audio16k, cache={})
@@ -131,33 +144,55 @@ def _speech_segments_s(buffer, sample_rate):
     return _energy_speech_segments(audio16k, AI_EDIT_SAMPLE_RATE)
 
 
-def long_pause_ranges(buffer, sample_rate, min_pause_s=DEFAULT_LONG_PAUSE_S):
-    """[(start_s, end_s), ...] gaps between detected speech (plus any
-    lead-in/tail) at least min_pause_s long."""
-    speech = _speech_segments_s(buffer, sample_rate)
-    duration = len(buffer) / sample_rate if sample_rate else 0.0
-    spans, prev_end = [], 0.0
+def _detect_speech_and_pauses(audio16k, duration_s, min_pause_s=DEFAULT_LONG_PAUSE_S):
+    """(speech_spans, long_pauses) from ONE VAD pass over `audio16k`.
+    `speech_spans` is every detected speech span verbatim — transcribe_words
+    uses it to skip transcribing silence entirely, so it needs every gap,
+    not just the "long" ones. `long_pauses` is the subset of gaps between
+    speech spans (plus lead-in/tail) at least min_pause_s long — a
+    coarser threshold used only for the "long pauses" problem the Edit
+    tab's AI panel reports/offers to remove, since an ordinary breath or
+    sentence pause shouldn't be flagged as an issue."""
+    speech = _speech_segments_s_16k(audio16k)
+    long_pauses, prev_end = [], 0.0
     for start, end in speech:
         if start - prev_end >= min_pause_s:
-            spans.append((prev_end, start))
+            long_pauses.append((prev_end, start))
         prev_end = max(prev_end, end)
-    if duration - prev_end >= min_pause_s:
-        spans.append((prev_end, duration))
-    return spans
+    if duration_s - prev_end >= min_pause_s:
+        long_pauses.append((prev_end, duration_s))
+    return speech, long_pauses
 
 
 # -- word-level transcription (own whisper instance) -------------------------
+
+def whisper_base_is_downloaded():
+    """Whether this module's fixed "base" whisper model is already cached
+    locally — checked before offering fillers/repetitions, same pattern as
+    nsnet2_is_downloaded() for the denoise fix, so the Edit tab can tell
+    the user to download it in Settings instead of silently finding
+    nothing."""
+    return transcriber.whisper_local_model_dir(AI_EDIT_WHISPER_SIZE) is not None
+
 
 def _get_whisper_model():
     if "model" in _whisper_cache:
         return _whisper_cache["model"]
     model = None
+    local_dir = transcriber.whisper_local_model_dir(AI_EDIT_WHISPER_SIZE)
+    if local_dir is None:
+        # Deliberately never falls back to the bare model alias here — that
+        # would let faster_whisper/huggingface_hub attempt a silent network
+        # download on every Analyze until it happened to succeed, with no
+        # progress or explanation shown anywhere. whisper_base_is_downloaded()
+        # is what callers check first and point the user at Settings for.
+        _whisper_cache["model"] = None
+        return None
     try:
         from faster_whisper import WhisperModel  # deferred: heavy import
 
-        local_dir = transcriber.whisper_local_model_dir(AI_EDIT_WHISPER_SIZE)
         model = WhisperModel(
-            local_dir or AI_EDIT_WHISPER_SIZE, device="cpu", compute_type="int8",
+            local_dir, device="cpu", compute_type="int8",
             cpu_threads=max(1, (os.cpu_count() or 4) - 1))
     except Exception:
         settings.log_exception("Audio Studio AI: failed to load the word-timing model:")
@@ -166,24 +201,102 @@ def _get_whisper_model():
     return model
 
 
-def transcribe_words(buffer, sample_rate):
-    """[{"word": str, "start": float, "end": float}, ...] word-level
-    timestamps from this module's own whisper "base" instance — never
-    TranscriberWorker's model, so the Transcribe tab's engine/quality
-    choice has no bearing here. Returns [] if the model can't be loaded
-    (e.g. fully offline with no cached copy of "base" yet)."""
+def _build_speech_only_audio(audio16k, speech_spans):
+    """(compact_audio, segments) — `compact_audio` is just the speech
+    spans of `audio16k` concatenated together, every gap between them
+    dropped. `segments` is [(concat_start_s, concat_end_s,
+    original_start_s), ...], sorted/non-overlapping, letting
+    _map_concat_to_original translate a timestamp measured against
+    compact_audio back to `audio16k`'s own (i.e. the real recording's)
+    timeline. Whisper (called on compact_audio, see transcribe_words)
+    never even sees the silence between speech spans, rather than
+    seeing it and spending full compute transcribing it anyway — the
+    previous behavior, and the main reason analyzing a long, pause-heavy
+    recording used to take as long as it did."""
+    pieces, segments = [], []
+    concat_t = 0.0
+    for start_s, end_s in speech_spans:
+        i0 = max(0, int(round(start_s * AI_EDIT_SAMPLE_RATE)))
+        i1 = min(len(audio16k), int(round(end_s * AI_EDIT_SAMPLE_RATE)))
+        if i1 <= i0:
+            continue
+        pieces.append(audio16k[i0:i1])
+        seg_dur = (i1 - i0) / AI_EDIT_SAMPLE_RATE
+        segments.append((concat_t, concat_t + seg_dur, start_s))
+        concat_t += seg_dur
+    compact = np.concatenate(pieces) if pieces else np.zeros(0, dtype=np.float32)
+    return compact, segments
+
+
+def _map_concat_to_original(t, segments):
+    """Translates `t` (a timestamp in the compact speech-only audio's own
+    timeline) back to the equivalent timestamp in the real recording.
+    `segments` is sorted and non-overlapping (see
+    _build_speech_only_audio) so a linear scan suffices — at most a few
+    hundred entries even for a multi-hour recording, negligible next to
+    whisper's own cost."""
+    for concat_start, concat_end, original_start in segments:
+        if t <= concat_end:
+            return original_start + max(0.0, t - concat_start)
+    if segments:  # past the last segment (can happen on a chunk's final word) — clamp to its end
+        concat_start, concat_end, original_start = segments[-1]
+        return original_start + (concat_end - concat_start)
+    return t
+
+
+def transcribe_words(audio16k, speech_spans, on_progress=None, cancel_cb=None):
+    """([{"word": str, "start": float, "end": float}, ...], cancelled) —
+    word-level timestamps from this module's own whisper "base" instance
+    — never TranscriberWorker's model, so the Transcribe tab's engine/
+    quality choice has no bearing here. Returns ([], False) if the model
+    isn't downloaded or fails to load — check whisper_base_is_downloaded()
+    first to tell that apart from a genuine empty result.
+
+    `audio16k` must already be resampled to AI_EDIT_SAMPLE_RATE (shared
+    with the VAD pass — see analyze()); `speech_spans` is that same VAD
+    pass's detected speech spans (_detect_speech_and_pauses's first
+    return value), used to build a speech-only compact copy of the audio
+    (see _build_speech_only_audio) so whisper only ever transcribes
+    audio that might actually contain words, not the recording's full
+    length including every silent stretch — a 140-minute recording with,
+    say, 40% pause time now costs roughly 40% less whisper compute than
+    it used to, rather than paying full price for silence it was always
+    going to throw away.
+
+    faster_whisper's own transcribe() returns `segments` as a GENERATOR
+    — nothing is actually computed until each one is iterated — which is
+    what makes `on_progress` (called with the fraction of the SPEECH-ONLY
+    audio covered after every finished chunk) and `cancel_cb` (checked at
+    the same points, breaking out of the loop rather than running to the
+    end) both possible with no other change to how whisper itself is
+    called. Every returned word's start/end is mapped back to the real
+    recording's own timeline before this returns, so callers never need
+    to know a compacted copy was involved at all."""
     model = _get_whisper_model()
     if model is None:
-        return []
-    audio16k = _resample(buffer, sample_rate, AI_EDIT_SAMPLE_RATE)
-    segments, _info = model.transcribe(audio16k, word_timestamps=True, vad_filter=False)
+        return [], False
+    compact_audio, segments = _build_speech_only_audio(audio16k, speech_spans)
+    if compact_audio.size == 0:
+        return [], False
+    compact_duration = len(compact_audio) / AI_EDIT_SAMPLE_RATE
+    whisper_segments, _info = model.transcribe(compact_audio, word_timestamps=True, vad_filter=False)
     words = []
-    for seg in segments:
+    cancelled = False
+    for seg in whisper_segments:
         for w in (seg.words or []):
             word = (w.word or "").strip()
             if word:
-                words.append({"word": word, "start": w.start, "end": w.end})
-    return words
+                words.append({
+                    "word": word,
+                    "start": _map_concat_to_original(w.start, segments),
+                    "end": _map_concat_to_original(w.end, segments),
+                })
+        if on_progress and compact_duration:
+            on_progress(seg.end / compact_duration)
+        if cancel_cb and cancel_cb():
+            cancelled = True
+            break
+    return words, cancelled
 
 
 def _normalize_word(word):
@@ -319,7 +432,8 @@ def compute_recording_health(noise_floor_db, clip_incidents, loudness_variance_d
 
 class AnalysisReport:
     def __init__(self, health, noise_floor_db, clip_incidents, loudness_variance_db,
-                 long_pauses, filler_words, repetitions, duration_s):
+                 long_pauses, filler_words, repetitions, duration_s, words_available,
+                 cancelled=False, quick=False):
         self.health = health
         self.noise_floor_db = noise_floor_db
         self.clip_incidents = clip_incidents
@@ -328,6 +442,16 @@ class AnalysisReport:
         self.filler_words = filler_words
         self.repetitions = repetitions
         self.duration_s = duration_s
+        self.words_available = words_available  # False => whisper "base" isn't
+                                                  # downloaded, so filler_words/
+                                                  # repetitions are [] because
+                                                  # nothing was checked, not
+                                                  # because none were found
+        self.cancelled = cancelled  # True => the user cancelled mid-transcription;
+                                     # fillers/repetitions only cover audio up to
+                                     # that point, everything else is unaffected
+        self.quick = quick  # True => fillers/repetitions were deliberately skipped
+                            # (Quick Analysis), not unavailable or cancelled
 
 
 # Rough thresholds for "is this worth flagging as a problem" — separate
@@ -337,26 +461,64 @@ NOISE_FLOOR_PROBLEM_DB = -40.0
 LOUDNESS_VARIANCE_PROBLEM_DB = 4.0
 
 
-def analyze(buffer, sample_rate):
-    """Single entry point: one VAD pass + one word-transcription pass,
-    every metric derived from those two."""
+def analyze(buffer, sample_rate, on_progress=None, cancel_cb=None, quick=False):
+    """Single entry point: one VAD pass + (unless quick=True) one word-
+    transcription pass, every metric derived from those two.
+    `on_progress` (called with a 0..1 fraction) and `cancel_cb` (polled
+    for whether the user has asked to stop) are both optional; see
+    transcribe_words's docstring for why word-level transcription is the
+    only phase of this that can actually report granular progress or be
+    cancelled mid-flight — the other phases are either near-instant (the
+    plain-numpy metrics) or a single non-chunked VAD call, so this only
+    checks cancel_cb between them, at whatever the current fraction
+    happens to be, rather than pretending to have finer-grained progress
+    it doesn't.
+
+    `quick=True` (Quick Analysis) skips transcription entirely — no
+    fillers/repetitions, and the VAD pass alone finishes in well under a
+    minute even for a multi-hour recording — for when only the health/
+    noise/clipping/loudness/pauses check is wanted. Everything computed
+    either way (health included) is completely unaffected by whether
+    transcription ran, since none of those numbers depend on it."""
+    def _progress(frac):
+        if on_progress:
+            on_progress(max(0.0, min(1.0, frac)))
+
     duration = len(buffer) / sample_rate if sample_rate else 0.0
     noise_floor_db = estimate_noise_floor_db(buffer, sample_rate)
     clip_incidents = detect_clipping_incidents(buffer)
     loudness_variance_db = measure_loudness_variance_db(buffer, sample_rate)
-    pauses = long_pause_ranges(buffer, sample_rate, min_pause_s=DEFAULT_LONG_PAUSE_S)
+    _progress(0.02)
+    cancelled = bool(cancel_cb and cancel_cb())
+
+    # Resampled to 16kHz exactly once here, then shared by the VAD pass
+    # below AND transcribe_words (see its docstring) — each used to
+    # resample the whole buffer separately, a second full-recording pass
+    # for no reason once both need the same 16kHz copy anyway.
+    audio16k = np.zeros(0, dtype=np.float32) if cancelled else _resample(
+        buffer, sample_rate, AI_EDIT_SAMPLE_RATE)
+    speech, pauses = ([], []) if cancelled else _detect_speech_and_pauses(
+        audio16k, duration, min_pause_s=DEFAULT_LONG_PAUSE_S)
     pause_time = sum(e - s for s, e in pauses)
     pause_ratio = (pause_time / duration) if duration else 0.0
-    words = transcribe_words(buffer, sample_rate)
+    _progress(0.3)
+    words_available = whisper_base_is_downloaded()
+    words = []
+    if not cancelled and words_available and not quick:
+        words, cancelled = transcribe_words(
+            audio16k, speech,
+            on_progress=lambda frac: _progress(0.3 + frac * 0.7), cancel_cb=cancel_cb)
     fillers = filler_word_ranges(words)
     filler_ratio = (len(fillers) / len(words)) if words else 0.0
     repetitions = repetition_ranges(words)
     health = compute_recording_health(
         noise_floor_db, clip_incidents, loudness_variance_db, pause_ratio, filler_ratio)
+    _progress(1.0)
     return AnalysisReport(
         health=health, noise_floor_db=noise_floor_db, clip_incidents=clip_incidents,
         loudness_variance_db=loudness_variance_db, long_pauses=pauses,
-        filler_words=fillers, repetitions=repetitions, duration_s=duration)
+        filler_words=fillers, repetitions=repetitions, duration_s=duration,
+        words_available=words_available, cancelled=cancelled, quick=quick)
 
 
 # -- NSNet2 (ML noise reduction, AI panel only) ------------------------

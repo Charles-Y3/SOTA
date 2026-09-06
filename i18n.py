@@ -243,6 +243,37 @@ STRINGS = {
         "settings_reset_confirm_title": "SOTA",
         "settings_reset_confirm": "Reset all settings to their defaults? Downloaded"
                                    " models and saved transcripts are not affected.",
+        "settings_section_safeguards": "Recording Safeguards",
+        "settings_safeguard_hint": "Escalating checks for a recording or transcription"
+                                   " left running unattended. Warn/Alert only show a"
+                                   " dismissible notice and never interrupt anything;"
+                                   " Auto-stop actually stops the recording.",
+        "settings_safeguard_col_warn": "Warn",
+        "settings_safeguard_col_alert": "Alert",
+        "settings_safeguard_col_stop": "Auto-stop",
+        "settings_safeguard_row_duration": "Recording duration (hours)",
+        "settings_safeguard_row_disk": "Free disk space (minutes left)",
+        "settings_safeguard_row_ram": "Free system RAM (GB)",
+        "safeguard_warn_duration": "A recording has been running for {hours}h"
+                                   " (warning threshold: {threshold}h). Still expected?",
+        "safeguard_alert_duration": "A recording has been running for {hours}h"
+                                    " (alert threshold: {threshold}h) — check it's still needed.",
+        "safeguard_stop_duration": "A recording ran past {threshold}h and was"
+                                   " automatically stopped and saved.",
+        "safeguard_warn_disk": "Low disk space: {free} GB free. The current"
+                              " recording/transcription may not have much room left.",
+        "safeguard_alert_disk": "Disk space is very low: {free} GB free —"
+                                " a recording could stop unexpectedly soon.",
+        "safeguard_stop_disk": "Disk space ran critically low ({free} GB free) —"
+                               " the recording was automatically stopped and saved"
+                               " to avoid a failed write.",
+        "safeguard_warn_ram": "Free memory is low ({free} GB) — SOTA or other"
+                             " apps may start slowing down.",
+        "safeguard_alert_ram": "Free memory is very low ({free} GB) — close some"
+                              " other apps if possible.",
+        "safeguard_stop_ram": "Free memory ran critically low ({free} GB) — any"
+                             " active recording was automatically stopped and"
+                             " saved to avoid a crash.",
         # --- Audio Studio (v2)
         "tab_group_audio_studio": "Audio Studio",
         "tab_group_transcription_studio": "Transcription Studio",
@@ -272,7 +303,14 @@ STRINGS = {
         "arec_pause": "Pause",
         "arec_resume": "Resume",
         "arec_stop_button": "Stop",
+        "arec_mark_button": "Mark",
+        "arec_tip_mark": "Drops a labeled marker at this point in the"
+                        " recording without stopping — e.g. one per"
+                        " speaker turn. Carried over when you send the"
+                        " recording to Edit, where each marker's span can"
+                        " be renamed and saved as its own file.",
         "arec_edit_button": "Open in Edit",
+        "arec_space_label": "This recording so far: {used}    ·    Free space on this drive: {free}",
         "arec_status_recording": "Recording…",
         "arec_status_paused": "Paused",
         "arec_status_saved": "Saved — {path}",
@@ -328,9 +366,6 @@ STRINGS = {
                             " it; right-click to delete it.",
         "aedit_marker_dialog_title": "Add marker",
         "aedit_marker_dialog_prompt": "Label for this marker:",
-        "aedit_section_label": "Section {n}",
-        "aedit_status_sections_found": "Found {count} section(s) — see the markers above the waveform.",
-        "aedit_status_sections_failed": "Section detection failed — see sota.log for details.",
         "aedit_tip_trim": "Keeps only the selected region and discards the"
                           " rest. Needs a selection — drag on the waveform first.",
         "aedit_tip_split": "Splits the clip in two at the playhead (click"
@@ -478,7 +513,6 @@ STRINGS = {
         "aenh_denoise_engine": "Engine used: {engine}",
         "aenh_busy_title": "Applying Auto Enhance…",
         "aenh_busy_title_denoise": "Reducing noise…",
-        "aenh_busy_title_sections": "Detecting sections…",
         "aenh_busy_title_silences": "Detecting no-speech…",
         "aenh_profile_engine": "noise profile",
         "aenh_profile_none": "No noise profile captured — using blind denoising above.",
@@ -508,15 +542,6 @@ STRINGS = {
                             " out — a spike-detection heuristic, not full"
                             " denoising, so it won't touch steady"
                             " background hiss or hum.",
-        "aclean_sections_button": "Detect sections",
-        "aclean_sections_tip": "Adds a marker after every real break in"
-                              " speech — a pause of {min_gap:.0f}s or"
-                              " longer — useful as chapter/section"
-                              " breakpoints. Shorter pauses (a breath, a"
-                              " sentence boundary) don't start a new one."
-                              " Re-running it replaces the previous"
-                              " auto-detected markers; markers you added"
-                              " yourself are left alone.",
         # -- Find similar segments panel
         "afind_toggle": "Matches",
         "afind_hint": "Select a region on the waveform, then click"
@@ -550,26 +575,66 @@ STRINGS = {
         "asilence_found": "{count} stretch(es) with no speech found,"
                          " {seconds}s total — review and choose which to"
                          " remove.",
+        "asilence_none_at_filter": "{count} stretch(es) found, but none at this"
+                                   " filter level — try a shorter minimum.",
+        "asilence_filter_tip": "Shows only no-speech stretches at or above this"
+                              " length — detection itself already only keeps"
+                              " ≥1.5s stretches, so this just narrows which of"
+                              " those are worth reviewing, without re-scanning.",
         # -- Markers panel
         "amark_toggle": "Markers",
-        "amark_none": "No markers yet — use Add marker, or Detect sections below.",
+        "amark_none": "No markers yet — use Add marker above.",
         "amark_found": "{count} marker(s).",
+        "amark_save_button": "Save",
+        "amark_tip_save": "Saves the audio from this marker up to the next"
+                          " one (or the end) as its own WAV file in the"
+                          " exports folder.",
+        "amark_save_selected_button": "Save Selected as Files",
+        "amark_tip_save_selected": "Saves the span after each checked"
+                                   " marker (up to the next marker, or the"
+                                   " end) as its own WAV file — e.g. one"
+                                   " file per speaker turn.",
+        "amark_status_saving": "Saving segment(s)…",
+        "amark_status_saved": "Saved {path}",
+        "amark_status_saved_multi": "Saved {count} file(s) to the exports folder.",
+        "amark_status_save_failed": "Save failed — see sota.log for details.",
         # -- AI panel
         "aai_toggle": "AI",
         "aai_hint": "Click Analyze Audio to check this recording for common problems.",
         "aai_analyze_button": "🩺 Analyze Audio",
+        "aai_quick_analyze_button": "⚡ Quick Analysis",
+        "aai_tip_full_analyze": "Full analysis: noise, clipping, volume"
+                                " consistency, long pauses, AND filler"
+                                " words/repeated phrases. The last part"
+                                " needs transcribing the whole recording"
+                                " with Whisper, so for a long recording"
+                                " this can take several minutes to tens"
+                                " of minutes (cancel anytime).",
+        "aai_tip_quick_analyze": "Quick analysis: noise, clipping, volume"
+                                 " consistency, and long pauses only —"
+                                 " skips filler word/repeated-phrase"
+                                 " detection (which needs transcribing the"
+                                 " recording), so it finishes in well under"
+                                 " a minute even for a very long recording.",
         "aai_health": "Recording Health: {pct}%",
         "aai_problem_noise": "⚠ Background noise detected (noise floor ~{db} dB)",
         "aai_problem_clipping": "⚠ Clipping detected ({count} samples) — consider re-recording with lower input gain",
         "aai_problem_loudness": "⚠ Inconsistent volume (variance {db} dB)",
-        "aai_problem_echo_not_checked": "Echo: not checked in this version",
+        "aai_problem_words_unavailable": "Filler words & repeated phrases: download the Whisper"
+                                        " \"base\" model in Settings to enable",
         "aai_fix_denoise": "Noise reduction (NSNet2)",
         "aai_fix_denoise_unavailable": "Noise reduction — download the NSNet2 model in Settings to enable",
         "aai_fix_loudness": "Loudness normalization",
         "aai_section_pauses": "Long pauses ({count}) — review each before removing",
+        "aai_section_pauses_none_at_filter": "{count} long pause(s) found, but none at"
+                                             " this filter level — try a shorter minimum.",
+        "aai_pause_filter_tip": "Shows only long pauses at or above this length —"
+                               " detection itself already only keeps ≥1.5s pauses,"
+                               " so this just narrows which of those are worth"
+                               " reviewing, without re-running detection.",
         "aai_section_fillers": "Filler words ({count}) — review each before removing",
         "aai_section_repetitions": "Repeated words/phrases ({count}) — review each before removing",
-        "aai_row_pause": "{time}",
+        "aai_row_pause": "{time}   ({dur}s)",
         "aai_row_filler": "\"{word}\"   {time}",
         "aai_row_repetition": "\"{word}\"   {time}",
         "aai_preset_label": "AI Preset:",
@@ -591,7 +656,24 @@ STRINGS = {
         "aai_preset_audiobook": "Audiobook",
         "aai_preset_phone": "Phone Recording",
         "aai_apply_button": "AI Enhance",
-        "aai_busy_analyzing": "Analyzing recording…",
+        "aai_analyzing_title": "Analyzing recording",
+        "aai_analyzing_status_initial": "Analyzing a {minutes}-minute recording…"
+                                        " estimating time remaining…",
+        "aai_analyzing_status_initial_quick": "Quick-analyzing a {minutes}-minute"
+                                              " recording (noise/clipping/volume/"
+                                              " pauses only)…",
+        "aai_analyzing_status": "Analyzing… {pct}% — {eta}",
+        "aai_analyzing_eta_estimating": "estimating time remaining…",
+        "aai_analyzing_eta_minutes": "about {minutes} min remaining",
+        "aai_analyzing_eta_seconds": "about {seconds}s remaining",
+        "aai_cancel_analyze": "Cancel",
+        "aai_status_cancelled": "Analysis cancelled — showing partial results.",
+        "aai_problem_cancelled_partial": "Analysis was cancelled partway through —"
+                                         " filler words/repetitions above only cover"
+                                         " audio up to where it stopped.",
+        "aai_problem_quick_mode": "Quick Analysis — filler words and repeated"
+                                 " phrases were skipped. Run the full Analyze"
+                                 " Audio to check for those too.",
         "aai_busy_applying": "Applying AI fixes…",
         "aai_status_applied": "Applied {count} fix(es).",
         "aai_status_preset_applied": "Preset applied.",
@@ -823,6 +905,33 @@ STRINGS = {
         "settings_reset_confirm_title": "SOTA",
         "settings_reset_confirm": "要將所有設定重設為預設值嗎？已下載的模型與"
                                    "已儲存的轉錄稿不受影響。",
+        "settings_section_safeguards": "錄音安全防護",
+        "settings_safeguard_hint": "針對錄音或轉錄無人看管、持續執行的情況所做的分級檢查。"
+                                   "「警告」與「提醒」只會顯示一則可關閉的通知，"
+                                   "絕不會中斷任何進行中的作業；「自動停止」則會真的停止錄音。",
+        "settings_safeguard_col_warn": "警告",
+        "settings_safeguard_col_alert": "提醒",
+        "settings_safeguard_col_stop": "自動停止",
+        "settings_safeguard_row_duration": "錄音時長（小時）",
+        "settings_safeguard_row_disk": "剩餘可用磁碟空間（分鐘）",
+        "settings_safeguard_row_ram": "剩餘系統記憶體（GB）",
+        "safeguard_warn_duration": "已錄音 {hours} 小時（警告門檻：{threshold} 小時）。"
+                                   "確定還需要繼續錄嗎？",
+        "safeguard_alert_duration": "已錄音 {hours} 小時（提醒門檻：{threshold} 小時）"
+                                    "——請確認是否仍需要這段錄音。",
+        "safeguard_stop_duration": "錄音已超過 {threshold} 小時，已自動停止並存檔。",
+        "safeguard_warn_disk": "磁碟空間不足：剩餘 {free} GB。目前的錄音／轉錄"
+                              "可能沒有太多空間了。",
+        "safeguard_alert_disk": "磁碟空間非常不足：剩餘 {free} GB"
+                                "——錄音可能很快就會意外中止。",
+        "safeguard_stop_disk": "磁碟空間已嚴重不足（剩餘 {free} GB）"
+                               "——已自動停止並存檔錄音，以避免寫入失敗。",
+        "safeguard_warn_ram": "可用記憶體偏低（{free} GB）"
+                             "——SOTA 或其他應用程式可能開始變慢。",
+        "safeguard_alert_ram": "可用記憶體非常不足（{free} GB）"
+                              "——如果可以，請關閉其他應用程式。",
+        "safeguard_stop_ram": "可用記憶體已嚴重不足（{free} GB）"
+                             "——目前進行中的錄音已自動停止並存檔，以避免當機。",
         # --- Audio Studio (v2)
         "tab_group_audio_studio": "音訊工作室",
         "tab_group_transcription_studio": "轉錄工作室",
@@ -852,7 +961,12 @@ STRINGS = {
         "arec_pause": "暫停",
         "arec_resume": "繼續",
         "arec_stop_button": "停止",
+        "arec_mark_button": "標記",
+        "arec_tip_mark": "在錄音目前位置加上一個帶標籤的標記，且不會中斷錄音"
+                        "（例如每次換人說話時標記一次）。傳送錄音至「編輯」時"
+                        "會一併帶過去，之後可為每個標記區段重新命名並個別存檔。",
         "arec_edit_button": "在編輯中開啟",
+        "arec_space_label": "此錄音目前大小：{used}    ·    此磁碟機可用空間：{free}",
         "arec_status_recording": "錄音中…",
         "arec_status_paused": "已暫停",
         "arec_status_saved": "已儲存 — {path}",
@@ -902,9 +1016,6 @@ STRINGS = {
                             "點擊標記旗幟可跳至該處；按右鍵可刪除。",
         "aedit_marker_dialog_title": "新增標記",
         "aedit_marker_dialog_prompt": "此標記的標籤：",
-        "aedit_section_label": "第 {n} 段",
-        "aedit_status_sections_found": "找到 {count} 個段落 — 請見波形圖上方的標記。",
-        "aedit_status_sections_failed": "段落偵測失敗 — 詳情請見 sota.log。",
         "aedit_tip_trim": "僅保留選取的範圍，其餘捨棄。需要先在波形圖上拖曳選取範圍。",
         "aedit_tip_split": "在播放位置（點擊波形圖以設定）將錄音分割成兩段："
                            "後半段會儲存為新檔案，前半段則繼續留在此處編輯。",
@@ -1022,7 +1133,6 @@ STRINGS = {
         "aenh_denoise_engine": "使用引擎：{engine}",
         "aenh_busy_title": "正在套用一鍵優化…",
         "aenh_busy_title_denoise": "正在降噪…",
-        "aenh_busy_title_sections": "正在偵測段落…",
         "aenh_busy_title_silences": "正在偵測無語音片段…",
         "aenh_profile_engine": "雜訊樣本",
         "aenh_profile_none": "尚未擷取雜訊樣本 — 上方降噪將使用一般模式。",
@@ -1047,12 +1157,6 @@ STRINGS = {
                             "（如麥克風碰撞聲、爆音），並將其平滑處理 — "
                             "屬於尖峰偵測的簡易演算法，並非完整降噪，"
                             "不會處理持續性的背景嘶聲或電流聲。",
-        "aclean_sections_button": "偵測段落",
-        "aclean_sections_tip": "在語音出現真正的停頓（{min_gap:.0f} 秒以上）"
-                              "之後加入標記 — 適合當作章節/段落分界點。"
-                              "較短的停頓（換氣、句子之間）不會產生新標記。"
-                              "再次執行會取代先前自動偵測的標記；"
-                              "您自行新增的標記不會受影響。",
         # -- Find similar segments panel
         "afind_toggle": "相似片段",
         "afind_hint": "先在波形圖上選取一段範圍，再點擊「尋找相似片段…」"
@@ -1081,26 +1185,56 @@ STRINGS = {
         "asilence_none_found": "找不到無語音的片段。",
         "asilence_found": "找到 {count} 個無語音片段，共 {seconds} 秒 — "
                          "請檢視並選擇要移除的項目。",
+        "asilence_none_at_filter": "找到 {count} 個片段，但在此篩選條件下沒有符合的"
+                                   "——請嘗試較短的最短長度。",
+        "asilence_filter_tip": "只顯示長度達到此門檻以上的無語音片段"
+                              "——偵測本身已只保留 ≥1.5 秒的片段，"
+                              "此篩選只是進一步縮小要檢視的範圍，不會重新掃描。",
         # -- Markers panel
         "amark_toggle": "標記",
-        "amark_none": "尚無標記 — 可使用「新增標記」，或使用下方的「偵測段落」。",
+        "amark_none": "尚無標記 — 可使用上方的「新增標記」。",
         "amark_found": "共 {count} 個標記。",
+        "amark_save_button": "存檔",
+        "amark_tip_save": "將此標記到下一個標記（或結尾）之間的音訊，"
+                          "另存為一個 WAV 檔至匯出資料夾。",
+        "amark_save_selected_button": "將已勾選的分別存檔",
+        "amark_tip_save_selected": "為每個已勾選的標記，將其到下一個標記"
+                                   "（或結尾）之間的音訊分別存成一個 WAV 檔"
+                                   "——例如每位發言者一個檔案。",
+        "amark_status_saving": "正在儲存區段…",
+        "amark_status_saved": "已儲存 {path}",
+        "amark_status_saved_multi": "已儲存 {count} 個檔案至匯出資料夾。",
+        "amark_status_save_failed": "儲存失敗 — 詳情請見 sota.log。",
         # -- AI panel
         "aai_toggle": "AI",
         "aai_hint": "點擊「分析音訊」以檢查這段錄音的常見問題。",
         "aai_analyze_button": "🩺 分析音訊",
+        "aai_quick_analyze_button": "⚡ 快速分析",
+        "aai_tip_full_analyze": "完整分析：噪音、削波、音量一致性、長停頓，"
+                                "以及贅字／重複詞句。最後一項需要用 Whisper"
+                                "轉錄整段錄音，因此錄音較長時可能需要數分鐘"
+                                "到數十分鐘（可隨時取消）。",
+        "aai_tip_quick_analyze": "快速分析：僅檢查噪音、削波、音量一致性與"
+                                 "長停頓——略過贅字／重複詞句偵測（需要轉錄"
+                                 "錄音），因此即使錄音很長，也能在一分鐘內"
+                                 "完成。",
         "aai_health": "錄音健康度：{pct}%",
         "aai_problem_noise": "⚠ 偵測到背景噪音（噪音基準約 {db} dB）",
         "aai_problem_clipping": "⚠ 偵測到削波（{count} 個樣本）— 建議降低輸入增益後重新錄製",
         "aai_problem_loudness": "⚠ 音量不穩定（變異量 {db} dB）",
-        "aai_problem_echo_not_checked": "回音：此版本尚未檢查",
+        "aai_problem_words_unavailable": "贅字與重複詞句 — 請至設定頁下載 Whisper「base」模型以啟用",
         "aai_fix_denoise": "降噪（NSNet2）",
         "aai_fix_denoise_unavailable": "降噪 — 請至設定頁下載 NSNet2 模型以啟用",
         "aai_fix_loudness": "音量標準化",
         "aai_section_pauses": "長停頓（{count}）— 移除前請逐一確認",
+        "aai_section_pauses_none_at_filter": "找到 {count} 個長停頓，但在此篩選條件下"
+                                             "沒有符合的 — 請嘗試較短的最短長度。",
+        "aai_pause_filter_tip": "只顯示長度達到此門檻以上的長停頓"
+                               "——偵測本身已只保留 ≥1.5 秒的停頓，"
+                               "此篩選只是進一步縮小要檢視的範圍，不會重新偵測。",
         "aai_section_fillers": "贅字（{count}）— 移除前請逐一確認",
         "aai_section_repetitions": "重複字詞／片語（{count}）— 移除前請逐一確認",
-        "aai_row_pause": "{time}",
+        "aai_row_pause": "{time}   （{dur}秒）",
         "aai_row_filler": "「{word}」   {time}",
         "aai_row_repetition": "「{word}」   {time}",
         "aai_preset_label": "AI 預設：",
@@ -1121,7 +1255,21 @@ STRINGS = {
         "aai_preset_audiobook": "有聲書",
         "aai_preset_phone": "電話錄音",
         "aai_apply_button": "AI 強化",
-        "aai_busy_analyzing": "正在分析錄音…",
+        "aai_analyzing_title": "正在分析錄音",
+        "aai_analyzing_status_initial": "正在分析一段 {minutes} 分鐘的錄音…"
+                                        "正在估算剩餘時間…",
+        "aai_analyzing_status_initial_quick": "正在快速分析一段 {minutes} 分鐘的錄音"
+                                              "（僅噪音／削波／音量／停頓）…",
+        "aai_analyzing_status": "分析中… {pct}% — {eta}",
+        "aai_analyzing_eta_estimating": "正在估算剩餘時間…",
+        "aai_analyzing_eta_minutes": "剩餘約 {minutes} 分鐘",
+        "aai_analyzing_eta_seconds": "剩餘約 {seconds} 秒",
+        "aai_cancel_analyze": "取消",
+        "aai_status_cancelled": "分析已取消 — 顯示部分結果。",
+        "aai_problem_cancelled_partial": "分析在中途被取消 — 以上的贅字／重複詞句"
+                                         "僅涵蓋到取消當下的音訊。",
+        "aai_problem_quick_mode": "快速分析 — 已略過贅字與重複詞句偵測。"
+                                 "如需檢查這些項目，請執行完整的「分析音訊」。",
         "aai_busy_applying": "正在套用 AI 修正…",
         "aai_status_applied": "已套用 {count} 項修正。",
         "aai_status_preset_applied": "已套用預設。",

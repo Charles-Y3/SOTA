@@ -19,6 +19,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 import webbrowser
 import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog
@@ -57,6 +58,21 @@ TICK_MS = 150
 def _fmt_time(seconds):
     seconds = int(max(0, seconds))
     return f"{seconds // 60:02d}:{seconds % 60:02d}"
+
+
+def _fmt_hms(seconds):
+    """HH:MM:SS, always — used for every Audio Studio time display
+    (waveform ruler, player/timer readouts, marker/match/silence/pause
+    rows, selection info). _fmt_time's plain MM:SS still works fine
+    numerically (Python doesn't cap minutes at 59), but reads oddly once
+    a recording runs past an hour — "142:30" for a 140-minute recording
+    — which Audio Studio's recordings routinely do; Transcription
+    Studio's own player (_fmt_time, unchanged) stays MM:SS since its
+    files are typically much shorter."""
+    seconds = int(max(0, seconds))
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h:02d}:{m:02d}:{s:02d}"
 
 
 def _open_path(path):
@@ -261,6 +277,13 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         self.audio_record_status_key = None
         self.audio_record_status_detail = None
         self._last_recording_path = None
+        # [{"time": seconds, "label": str}, ...] markers dropped live during
+        # a recording (e.g. one per speaker turn) — reset on every Start,
+        # carried over into the loaded AudioClip's own markers by
+        # _send_last_recording_to_edit so Edit's existing marker tools
+        # (rename, and the per-segment Save added alongside this) can cut
+        # and export each span without a separate live-recording pipeline.
+        self._arec_markers = []
         self.audio_player = Player(
             ready_callback=lambda: self.events.put(("audio_speed_ready",)),
             progress_callback=lambda speed, frac: None,
@@ -270,7 +293,13 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         self.audio_selection = None       # (start_s, end_s) or None
         self._find_cancel_event = None    # threading.Event for the in-progress Find Similar search, or None
         self._find_progress_dialog = None
+        self._ai_analyze_cancel_event = None  # same idea, for the in-progress Analyze Audio run
+        self._ai_analyze_dialog = None
+        self._ai_analyze_start_time = None    # time.monotonic() when the run began — for the live ETA
+        self._ai_analyze_quick = False         # whether the in-progress run is Quick Analysis
         self._find_min_score = 0.80        # Matches panel's display filter — persists across searches, not reset per-search
+        self._silence_min_duration = 1.5   # No speech panel's own display filter, same idea
+        self._ai_pause_min_duration = 1.5  # AI panel's Long pauses section, same idea again
         self._busy_dialog = None          # generic "please wait" modal (see _show_busy_dialog) — None when not showing
         self._busy_bar = None
         self.aenh_configs = audio_profiles.load_profiles()  # user-saved Enhance configurations (see audio_profiles.py)
@@ -380,6 +409,7 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(POLL_MS, self._poll_events)
         self.after(TICK_MS, self._tick_player)
+        self.after(self.SAFEGUARD_CHECK_MS, self._check_recording_safeguards)
         self.after(0, self._maximize_on_startup)
 
     def _maximize_on_startup(self):
@@ -522,6 +552,19 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         self.content.grid_columnconfigure(0, weight=1)
         self.content.grid_rowconfigure(0, weight=1)
 
+        # --- recording/transcription safeguard notices: a fixed-height
+        # strip below the content area (row 2 above stays the only
+        # expanding row), hidden entirely whenever nothing needs saying.
+        # Deliberately not a modal dialog — per-tier warnings must never
+        # interrupt an in-progress recording or transcription, only sit
+        # here, visible regardless of which tab is active, until the user
+        # dismisses them. See _check_recording_safeguards.
+        self.safeguard_banner_row = ctk.CTkFrame(self, fg_color="transparent")
+        self.safeguard_banner_row.grid(row=3, column=0, sticky="ew", padx=12, pady=(0, 8))
+        self.safeguard_banner_row.grid_columnconfigure(0, weight=1)
+        self.safeguard_banner_row.grid_remove()
+        self._safeguard_notices = {}  # key -> {"tier", "text", "widget"}
+
         self.audio_record_frame = ctk.CTkFrame(self.content, fg_color="transparent")
         self.audio_edit_frame = ctk.CTkFrame(self.content, fg_color="transparent")
         self.transcribe_frame = ctk.CTkFrame(self.content, fg_color="transparent")
@@ -652,6 +695,17 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         self.arec_format_menu.set("WAV")
         self.arec_format_menu.grid(row=1, column=7, sticky="w", padx=(0, 12), pady=(2, 10))
 
+        # Space used so far by the CURRENT recording (0 when idle — the
+        # format menus above decide bytes/sec, so this changes whenever
+        # they do even before Start is pressed) and free space on the
+        # drive recordings are saved to. Same _fmt_size/free_disk_gb
+        # building blocks the low-disk-space guard in _start_audio_record
+        # and Settings' model-storage view already use.
+        self.arec_space_label = ctk.CTkLabel(
+            format_card, text="", text_color=self.MUTED_TEXT, anchor="w")
+        self.arec_space_label.grid(row=2, column=0, columnspan=8, sticky="w", padx=12, pady=(0, 10))
+        self._arec_space_tick_counter = 0
+
         filename_row = ctk.CTkFrame(parent, fg_color="transparent")
         filename_row.grid(row=1, column=0, sticky="ew", padx=12)
         self.arec_filename_label = ctk.CTkLabel(filename_row, text="")
@@ -678,6 +732,18 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
             controls, text="", height=40, width=110, fg_color="#8a3535",
             hover_color="#a04040", state="disabled", command=self._stop_audio_record)
         self.arec_stop_button.grid(row=0, column=2)
+        # Drops a timestamped marker at the current recording position —
+        # e.g. one per speaker turn — without stopping. Carried into Edit's
+        # marker list once the file is sent there (see
+        # _send_last_recording_to_edit), so each turn can be reviewed,
+        # renamed, and saved as its own file with the tools already built
+        # for markers there.
+        self.arec_mark_button = ctk.CTkButton(
+            controls, text="", height=40, width=110, fg_color="transparent",
+            text_color=self.OUTLINE_BUTTON_TEXT, border_width=1,
+            state="disabled", command=self._add_live_recording_marker)
+        self.arec_mark_button.grid(row=0, column=3, padx=(8, 0))
+        self._add_tooltip(self.arec_mark_button, lambda: i18n.t(self.ui_lang, "arec_tip_mark"))
 
         # Live waveform — grows as the recording proceeds, drawn from
         # AudioRecorder.peaks_snapshot() (updated by _tick_player while
@@ -779,6 +845,18 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         sample_rate = int(self.arec_rate_menu.get())
         return sample_rate * (bit_depth // 8) * channels
 
+    def _update_arec_space_label(self):
+        """0 bytes used while idle (no recording in progress yet) — still
+        shown so the free-space half is visible before Start is ever
+        pressed, not only once a recording exists."""
+        used_bytes = 0.0
+        if self.audio_recorder is not None:
+            used_bytes = self.audio_recorder.elapsed_seconds * self._arec_bytes_per_second()
+        free_gb = sysinfo.free_disk_gb(settings.audio_recordings_folder())
+        free_str = _fmt_size(free_gb * 1024 ** 3) if free_gb is not None else "?"
+        self.arec_space_label.configure(text=i18n.t(
+            self.ui_lang, "arec_space_label", used=_fmt_size(used_bytes), free=free_str))
+
     def _start_audio_record(self):
         self._stop_mic_test()
         self._on_arec_pref_change()
@@ -806,9 +884,11 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         self.arec_span = self.DEFAULT_LIVE_SPAN_S
         self.arec_vzoom = 1.0
         self.arec_clip_label.configure(text="")
+        self._arec_markers = []
         self.arec_start_button.configure(state="disabled")
         self.arec_pause_button.configure(state="normal", text=i18n.t(self.ui_lang, "arec_pause"))
         self.arec_stop_button.configure(state="normal")
+        self.arec_mark_button.configure(state="normal")
         self.arec_test_mic_button.configure(state="disabled")
         for w in (self.arec_mic_menu, self.arec_rate_menu, self.arec_channels_menu,
                   self.arec_bitdepth_menu, self.arec_format_menu, self.arec_filename_entry):
@@ -833,6 +913,29 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
             self.audio_recorder.stop()
         self.arec_stop_button.configure(state="disabled")
         self.arec_pause_button.configure(state="disabled")
+        self.arec_mark_button.configure(state="disabled")
+
+    def _add_live_recording_marker(self):
+        """Prompts for a short label (e.g. a speaker's name) and records
+        a marker at the current elapsed recording time — same dialog
+        Edit's own Add Marker uses. Blocking the UI thread briefly for the
+        dialog doesn't drop any audio: capture runs on AudioRecorder's own
+        thread, independent of this one."""
+        if not self.audio_recorder:
+            return
+        time_s = self.audio_recorder.elapsed_seconds
+        label = simpledialog.askstring(
+            i18n.t(self.ui_lang, "aedit_marker_dialog_title"),
+            i18n.t(self.ui_lang, "aedit_marker_dialog_prompt"),
+            parent=self)
+        if not label:
+            return
+        self._arec_markers.append({"time": time_s, "label": label})
+        # Force-redraw now rather than waiting for the next tick's cache-
+        # key check (_redraw_record_waveform only re-runs this when the
+        # visible window itself moves) — otherwise a marker added while
+        # the view isn't currently scrolling wouldn't appear until it did.
+        self._redraw_arec_timeline()
 
     def _on_audio_record_event(self, kind, *rest):
         if kind == "record_stopped":
@@ -840,6 +943,7 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
             clipped = self.audio_recorder.clipped if self.audio_recorder else False
             self.audio_recording = False
             self.audio_recorder = None
+            self._clear_safeguard_notices_with_prefix("audio_record_")
             self.arec_start_button.configure(state="normal")
             self.arec_test_mic_button.configure(state="normal")
             for w in (self.arec_mic_menu, self.arec_rate_menu, self.arec_channels_menu,
@@ -924,7 +1028,7 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         path = self._last_recording_path
         if not path or not os.path.isfile(path):
             return
-        self._open_audio_clip(path)
+        self._open_audio_clip(path, extra_markers=self._arec_markers)
         self._show_tab(self.LEAF_AUDIO_EDIT)
 
     # How many seconds are visible by default while following the live
@@ -1067,9 +1171,26 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         while t <= end + 1e-9:
             x = (t - start) / span * width
             canvas.create_line(x, height - 6, x, height, fill=text_color)
-            canvas.create_text(x + 3, 1, anchor="nw", text=_fmt_time(t),
+            canvas.create_text(x + 3, 1, anchor="nw", text=_fmt_hms(t),
                                fill=text_color, font=("Segoe UI", 9))
             t += interval
+
+        # Live markers (see _add_live_recording_marker) drawn as small
+        # numbered flags — same flag+guide-line visual as the Edit tab's
+        # marker lane (_redraw_marker_lane), just sharing this thin ruler
+        # rather than a dedicated row of its own (Record has no spare
+        # vertical space for one), and a plain index number rather than
+        # the full label — this strip is too short for real text without
+        # colliding with the time ticks above it.
+        marker_color = self.EFFECT_PANEL_ACCENT
+        for i, m in enumerate(self._arec_markers):
+            if not (start <= m["time"] <= end):
+                continue
+            x = (m["time"] - start) / span * width
+            canvas.create_line(x, 9, x, height, fill=marker_color)
+            canvas.create_polygon(x, 9, x + 6, 12, x, 15, fill=marker_color, outline=marker_color)
+            canvas.create_text(x + 8, 9, anchor="nw", text=str(i + 1),
+                               fill=marker_color, font=("Segoe UI", 8))
 
     def _redraw_arec_db_axis(self, height):
         """Same amplitude-axis convention as the Edit tab's
@@ -1555,13 +1676,16 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         if path:
             self._open_audio_clip(path)
 
-    def _open_audio_clip(self, path):
+    def _open_audio_clip(self, path, extra_markers=None):
         """Decoding runs on a background thread behind the modal "please
         wait" dialog — a several-minute MP3 can take a noticeable moment
         to decode/resample, which used to just freeze the window (or, in
         an earlier version, disable one button and change a status label
         that was easy to miss) with no clear feedback that it was still
-        working."""
+        working. `extra_markers` (used by _send_last_recording_to_edit)
+        are [{"time", "label"}, ...] added to the freshly-loaded clip —
+        e.g. live markers dropped during recording, carried over now that
+        Edit's marker tools (rename, per-segment Save) are available."""
         def work():
             return audio_clip.AudioClip.load(path, settings.audio_originals_folder())
 
@@ -1571,6 +1695,8 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
                 return
             self.audio_clip = clip
             self.audio_clip_path = path
+            for m in (extra_markers or []):
+                clip.add_marker(m["time"], m["label"], auto=False)
             self.audio_selection = None
             self.audio_clipboard = None
             self.audio_preview = None
@@ -1600,9 +1726,9 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
                      "aedit_cut_button", "aedit_copy_button", "aedit_trim_button",
                      "aedit_split_button", "aedit_silence_button", "aedit_find_button",
                      "aedit_detect_silence_button",
-                     "aedit_marker_button", "amark_sections_button",
+                     "aedit_marker_button",
                      "aedit_save_wav_button", "aedit_save_mp3_button", "aedit_revert_button",
-                     "aai_analyze_button", "aai_preset_apply_button"):
+                     "aai_analyze_button", "aai_quick_analyze_button", "aai_preset_apply_button"):
             getattr(self, attr).configure(state=state)
         can_paste = enabled and self.audio_clipboard is not None
         self.aedit_paste_button.configure(state="normal" if can_paste else "disabled")
@@ -1765,7 +1891,7 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
             s, e = self.audio_selection
             self.aedit_selection_label.configure(text=i18n.t(
                 self.ui_lang, "aedit_selection_info",
-                start=_fmt_time(s), end=_fmt_time(e), dur=f"{e - s:.1f}"))
+                start=_fmt_hms(s), end=_fmt_hms(e), dur=f"{e - s:.1f}"))
         else:
             self.aedit_selection_label.configure(
                 text=i18n.t(self.ui_lang, "aedit_no_selection") if self.audio_clip is not None else "")
@@ -1781,7 +1907,7 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         name = os.path.basename(self.audio_clip_path or "")
         self.aedit_file_label.configure(text=i18n.t(
             self.ui_lang, "aedit_file_status", name=name,
-            duration=_fmt_time(self.audio_clip.duration)))
+            duration=_fmt_hms(self.audio_clip.duration)))
         self.aedit_dirty_label.configure(
             text=i18n.t(self.ui_lang, "aedit_dirty") if self.audio_clip.dirty else "")
 
@@ -1911,7 +2037,7 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         # Every currently-checked detected-silence span, in purple — same
         # always-visible treatment as matches above, in a different color
         # so the two review lists stay visually distinct on the waveform.
-        for (s_start, s_end), var in zip(self._silence_spans, self._silence_vars):
+        for (s_start, s_end), var in zip(self._silence_visible_spans, self._silence_vars):
             if not var.get():
                 continue
             x0 = (max(start, s_start) - start) / (end - start) * width
@@ -1964,7 +2090,7 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         while t <= end + 1e-9:
             x = (t - start) / span * width
             canvas.create_line(x, height - 6, x, height, fill=text_color)
-            canvas.create_text(x + 3, 1, anchor="nw", text=_fmt_time(t),
+            canvas.create_text(x + 3, 1, anchor="nw", text=_fmt_hms(t),
                                fill=text_color, font=("Segoe UI", 9))
             t += interval
 
@@ -2125,8 +2251,8 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         frac = max(0.0, min(1.0, seconds / self.audio_clip.duration))
         self.audio_player.seek_fraction(frac)
         self.aedit_time_label.configure(
-            text=f"{_fmt_time(self.audio_player.get_time())} / "
-                 f"{_fmt_time(self.audio_player.duration)}")
+            text=f"{_fmt_hms(self.audio_player.get_time())} / "
+                 f"{_fmt_hms(self.audio_player.duration)}")
 
     def _on_wave_press(self, event):
         if self.audio_clip is None:
@@ -3165,38 +3291,6 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
     def _apply_denoise(self):
         self._run_denoise_async(self._apply_audio_effect)
 
-    def _detect_sections(self):
-        """Auto-labeled markers ("Section 1", "Section 2", …) — one at
-        the start of the recording's speech, and one after every real
-        break (a pause of at least audio_clean.DEFAULT_SECTION_GAP_S)
-        since speech last stopped. Reuses the same VAD detection
-        audio_clean.detect_silences/remove_long_pauses already run, not a
-        second pass — see audio_clean.speech_sections for why it merges
-        across short pauses instead of marking every one. Replaces only
-        the previous auto set; user-added markers are untouched (see
-        AudioClip.replace_auto_markers). Runs on a background thread
-        behind the busy modal — VAD inference on a long recording is
-        real work, not instant."""
-        if self.audio_clip is None:
-            return
-        buffer, sample_rate = self.audio_clip.buffer, self.audio_clip.sample_rate
-
-        def work():
-            return audio_clean.speech_sections(buffer, sample_rate)
-
-        def done(starts, error):
-            if error is not None:  # already logged by _run_busy itself
-                self._set_audio_edit_status("aedit_status_sections_failed")
-                return
-            labels = [(start, i18n.t(self.ui_lang, "aedit_section_label", n=i + 1))
-                     for i, start in enumerate(starts)]
-            self.audio_clip.replace_auto_markers(labels)
-            self._redraw_waveform()
-            self._render_markers_panel()
-            self._set_audio_edit_status("aedit_status_sections_found", {"count": len(labels)})
-
-        self._run_busy("aenh_busy_title_sections", work, done)
-
     # -- user-added markers -------------------------------------------------
 
     def _add_marker_at_playhead(self):
@@ -3317,6 +3411,15 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
     # found; the tighter presets just narrow which of those already-
     # found matches are worth reviewing, without re-running the search.
     FIND_FILTER_VALUES = {"≥80%": 0.80, "≥85%": 0.85, "≥90%": 0.90, "≥95%": 0.95}
+
+    # Same idea as FIND_FILTER_VALUES above, for any panel whose rows are
+    # spans of a given length rather than a match score — the No speech
+    # panel (_silence_min_duration) and the AI panel's Long pauses section
+    # (_ai_pause_min_duration) both narrow which already-detected spans are
+    # SHOWN, without re-running detection; "≥1.5s" is the floor either
+    # detector already applies itself (audio_clean.DEFAULT_MIN_SILENCE_S /
+    # audio_ai_edit.DEFAULT_LONG_PAUSE_S), so it shows everything found.
+    SPAN_FILTER_VALUES = {"≥1.5s": 1.5, "≥3.0s": 3.0, "≥4.5s": 4.5, "≥6.0s": 6.0}
 
     def _build_find_panel(self, parent):
         top = ctk.CTkFrame(parent, fg_color="transparent")
@@ -3506,7 +3609,7 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
                 row=0, column=0, padx=(8, 6), pady=6)
             ctk.CTkLabel(
                 row, anchor="w",
-                text=f"{_fmt_time(start)} – {_fmt_time(end)}   ({score * 100:.0f}%)",
+                text=f"{_fmt_hms(start)} – {_fmt_hms(end)}   ({score * 100:.0f}%)",
             ).grid(row=0, column=1, sticky="ew", pady=6)
             play_btn = ctk.CTkButton(
                 row, text=i18n.t(self.ui_lang, "afind_play"), width=60, height=24,
@@ -3600,24 +3703,20 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
     # the ones you want, Play/Jump/Rename any one, or delete a batch.
 
     def _build_markers_panel(self, parent):
-        # "Detect sections" lives here (not in Clean, where it used to
-        # be) because what it actually does is add markers — it just
-        # happens to reuse Clean's own VAD detection to decide where.
-        # Same row as the hint label (far right of it), not its own row —
-        # the hint text already has the height, so a whole extra row just
-        # for one button would be pure wasted space.
+        # Detect Sections (auto-labeled markers from long pauses) has
+        # been removed for now — audio_clean.DEFAULT_SECTION_GAP_S's 3s
+        # gap threshold produced far too many sections on a long
+        # recording (e.g. 72 for a 140-minute one), since a normal
+        # breath/thinking pause easily clears 3s. See
+        # audio_clean.speech_sections's docstring if this comes back —
+        # it needs either a much longer gap threshold, a minimum section
+        # length, or both, before it's worth re-adding.
         top = ctk.CTkFrame(parent, fg_color="transparent")
         top.grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 8))
         top.grid_columnconfigure(0, weight=1)
         self.amark_hint_label = ctk.CTkLabel(
             top, text="", anchor="w", text_color=self.MUTED_TEXT, wraplength=700, justify="left")
         self.amark_hint_label.grid(row=0, column=0, sticky="w")
-        self.amark_sections_button = ctk.CTkButton(
-            top, text="", width=160, height=28, fg_color="transparent",
-            text_color=self.OUTLINE_BUTTON_TEXT, border_width=1, command=self._detect_sections)
-        self.amark_sections_button.grid(row=0, column=1, sticky="e", padx=(8, 0))
-        self._add_tooltip(self.amark_sections_button, lambda: i18n.t(
-            self.ui_lang, "aclean_sections_tip", min_gap=audio_clean.DEFAULT_SECTION_GAP_S))
 
         self.amark_rows_frame = ctk.CTkScrollableFrame(parent, fg_color="transparent")
         self.amark_rows_frame.grid(row=1, column=0, sticky="nsew", padx=4, pady=(0, 8))
@@ -3638,6 +3737,12 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         self.amark_delete_button = ctk.CTkButton(
             bottom, text="", height=30, state="disabled", command=self._delete_checked_markers)
         self.amark_delete_button.grid(row=0, column=2, padx=(0, 8))
+        self.amark_save_selected_button = ctk.CTkButton(
+            bottom, text="", height=30, fg_color="transparent",
+            text_color=self.OUTLINE_BUTTON_TEXT, border_width=1, state="disabled",
+            command=self._save_checked_marker_segments)
+        self.amark_save_selected_button.grid(row=0, column=3, padx=(0, 8))
+        self._add_tooltip(self.amark_save_selected_button, lambda: i18n.t(self.ui_lang, "amark_tip_save_selected"))
 
         self._marker_vars = []  # one BooleanVar per audio_clip.markers entry, parallel to it
         self._render_markers_panel()
@@ -3650,7 +3755,7 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         if not markers:
             self.amark_hint_label.configure(text=i18n.t(self.ui_lang, "amark_none"))
             for btn in (self.amark_select_all_button, self.amark_select_none_button,
-                       self.amark_delete_button):
+                       self.amark_delete_button, self.amark_save_selected_button):
                 btn.configure(state="disabled")
             self._update_rows_scrollbar(self.amark_rows_frame)
             return
@@ -3663,7 +3768,7 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
             row.grid_columnconfigure(1, weight=1)
             ctk.CTkCheckBox(row, text="", variable=var, width=20).grid(
                 row=0, column=0, padx=(8, 6), pady=6)
-            ctk.CTkLabel(row, anchor="w", text=f"{_fmt_time(m['time'])}   {m['label']}").grid(
+            ctk.CTkLabel(row, anchor="w", text=f"{_fmt_hms(m['time'])}   {m['label']}").grid(
                 row=0, column=1, sticky="ew", pady=6)
             ctk.CTkButton(
                 row, text=i18n.t(self.ui_lang, "afind_play"), width=56, height=24,
@@ -3679,8 +3784,15 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
                 row, text=i18n.t(self.ui_lang, "aedit_marker_rename"), width=70, height=24,
                 fg_color="transparent", text_color=self.OUTLINE_BUTTON_TEXT, border_width=1,
                 command=lambda idx=i: self._rename_marker(idx),
-            ).grid(row=0, column=4, padx=(6, 8), pady=6)
-        for btn in (self.amark_select_all_button, self.amark_select_none_button, self.amark_delete_button):
+            ).grid(row=0, column=4, padx=(6, 0), pady=6)
+            save_btn = ctk.CTkButton(
+                row, text=i18n.t(self.ui_lang, "amark_save_button"), width=60, height=24,
+                fg_color="transparent", text_color=self.OUTLINE_BUTTON_TEXT, border_width=1,
+                command=lambda idx=i: self._save_marker_segment(idx))
+            save_btn.grid(row=0, column=5, padx=(6, 8), pady=6)
+            self._add_tooltip(save_btn, lambda: i18n.t(self.ui_lang, "amark_tip_save"))
+        for btn in (self.amark_select_all_button, self.amark_select_none_button,
+                   self.amark_delete_button, self.amark_save_selected_button):
             btn.configure(state="normal")
         self._update_rows_scrollbar(self.amark_rows_frame)
 
@@ -3696,6 +3808,93 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
             self.audio_clip.remove_marker_at(i)
         self._render_markers_panel()
         self._redraw_waveform()
+
+    def _marker_segment_bounds(self, idx):
+        """(start_s, end_s) for the span a marker "owns": from its own
+        time up to the next marker, or the end of the clip if it's the
+        last one — the natural reading of a marker as "a new segment
+        starts here" (e.g. a speaker turn)."""
+        markers = self.audio_clip.markers
+        start = markers[idx]["time"]
+        end = markers[idx + 1]["time"] if idx + 1 < len(markers) else self.audio_clip.duration
+        return start, end
+
+    def _sanitize_segment_filename(self, label):
+        """A marker label is free text (e.g. from a live-recording
+        dialog), not validated as a filename the way the Record tab's own
+        filename field is — this replaces whatever's unsafe rather than
+        rejecting, since there's no field here to report an error back
+        into."""
+        cleaned = "".join(
+            "_" if (c in _WINDOWS_ILLEGAL_FILENAME_CHARS or c in ". ") else c for c in label
+        ).strip("_")
+        return cleaned[:_LIVE_FILENAME_MAX_LEN] or "segment"
+
+    def _save_marker_segment(self, idx):
+        """Saves the span this one marker owns (see
+        _marker_segment_bounds) as its own WAV file in the exports
+        folder — reuses copy_region/write_wav, the same building blocks
+        Cut/Copy and Save-as-WAV already use, rather than a new export
+        path."""
+        if self.audio_clip is None:
+            return
+        start, end = self._marker_segment_bounds(idx)
+        label = self.audio_clip.markers[idx]["label"]
+        buffer = self.audio_clip.copy_region(start, end)
+        sample_rate = self.audio_clip.sample_rate
+        stem = self._sanitize_segment_filename(label)
+        path = transcriber.unique_path(os.path.join(settings.audio_exports_folder(), f"{stem}.wav"))
+
+        def work():
+            audio_clip.write_wav(path, buffer, sample_rate)
+            return path
+
+        def done(_result, error):
+            if error is not None:
+                self._set_audio_edit_status("amark_status_save_failed", {})
+                return
+            self._set_audio_edit_status("amark_status_saved", {"path": os.path.basename(path)})
+
+        self._run_busy("amark_status_saving", work, done)
+
+    def _save_checked_marker_segments(self):
+        """Same as _save_marker_segment, once per checked marker — e.g.
+        every speaker-turn marker at once, each becoming its own file."""
+        if self.audio_clip is None:
+            return
+        indices = [i for i, v in enumerate(self._marker_vars) if v.get()]
+        if not indices:
+            return
+        markers = self.audio_clip.markers
+        sample_rate = self.audio_clip.sample_rate
+        folder = settings.audio_exports_folder()
+        # (stem, buffer) only — the actual path is resolved one at a time
+        # inside work(), immediately before writing each file. Two markers
+        # can share a label (e.g. the same speaker's name used twice), and
+        # resolving every path up front would have unique_path see neither
+        # file on disk yet and hand both jobs the identical name; resolving
+        # just-in-time lets each write land before the next path is picked,
+        # so unique_path's own on-disk check actually sees the first file.
+        jobs = []
+        for i in indices:
+            start, end = self._marker_segment_bounds(i)
+            buffer = self.audio_clip.copy_region(start, end)
+            stem = self._sanitize_segment_filename(markers[i]["label"])
+            jobs.append((stem, buffer))
+
+        def work():
+            for stem, buffer in jobs:
+                path = transcriber.unique_path(os.path.join(folder, f"{stem}.wav"))
+                audio_clip.write_wav(path, buffer, sample_rate)
+            return len(jobs)
+
+        def done(count, error):
+            if error is not None:
+                self._set_audio_edit_status("amark_status_save_failed", {})
+                return
+            self._set_audio_edit_status("amark_status_saved_multi", {"count": count})
+
+        self._run_busy("amark_status_saving", work, done)
 
     def _jump_to_marker(self, index):
         if self.audio_clip is None or not (0 <= index < len(self.audio_clip.markers)):
@@ -3736,9 +3935,18 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
     # gave nothing to actually act on.
 
     def _build_silence_panel(self, parent):
+        top = ctk.CTkFrame(parent, fg_color="transparent")
+        top.grid(row=0, column=0, sticky="ew", padx=8, pady=(4, 8))
+        top.grid_columnconfigure(0, weight=1)
         self.asilence_hint_label = ctk.CTkLabel(
-            parent, text="", anchor="w", text_color=self.MUTED_TEXT, wraplength=900, justify="left")
-        self.asilence_hint_label.grid(row=0, column=0, sticky="w", padx=8, pady=(4, 8))
+            top, text="", anchor="w", text_color=self.MUTED_TEXT, wraplength=700, justify="left")
+        self.asilence_hint_label.grid(row=0, column=0, sticky="w")
+        self.asilence_filter_menu = ctk.CTkOptionMenu(
+            top, width=100, values=list(self.SPAN_FILTER_VALUES.keys()),
+            command=self._on_silence_filter_change)
+        self.asilence_filter_menu.set("≥1.5s")
+        self.asilence_filter_menu.grid(row=0, column=1, sticky="e", padx=(8, 0))
+        self._add_tooltip(self.asilence_filter_menu, lambda: i18n.t(self.ui_lang, "asilence_filter_tip"))
 
         self.asilence_rows_frame = ctk.CTkScrollableFrame(parent, fg_color="transparent")
         self.asilence_rows_frame.grid(row=1, column=0, sticky="nsew", padx=4, pady=(0, 8))
@@ -3760,8 +3968,11 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
             bottom, text="", height=30, state="disabled", command=self._delete_checked_silences)
         self.asilence_delete_button.grid(row=0, column=2, padx=(0, 8))
 
-        # _silence_spans: [(start_s, end_s), ...] from the last detection.
-        # _silence_vars: one BooleanVar per span, parallel to it.
+        # _silence_spans: [(start_s, end_s), ...] from the last detection,
+        # unfiltered. _silence_visible_spans: the subset of those at least
+        # self._silence_min_duration long (the filter menu above) — what's
+        # actually shown. _silence_vars: one BooleanVar per VISIBLE span,
+        # parallel to _silence_visible_spans, not _silence_spans.
         self._clear_silence_results()
 
     def _detect_silences(self):
@@ -3789,10 +4000,17 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
 
         self._run_busy("aenh_busy_title_silences", work, done)
 
+    def _on_silence_filter_change(self, value):
+        self._silence_min_duration = self.SPAN_FILTER_VALUES.get(value, 1.5)
+        self._render_silence_results()
+        self._redraw_waveform()  # checked-span overlay needs to drop whatever just got filtered out
+
     def _render_silence_results(self):
         for w in self.asilence_rows_frame.winfo_children():
             w.destroy()
         self._silence_vars = []
+        self._silence_visible_spans = [
+            (s, e) for s, e in self._silence_spans if (e - s) >= self._silence_min_duration]
         if not self._silence_spans:
             key = "asilence_none_found" if self._silence_has_searched else "asilence_hint"
             self.asilence_hint_label.configure(text=i18n.t(self.ui_lang, key))
@@ -3801,10 +4019,18 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
             self.asilence_select_none_button.configure(state="disabled")
             self._update_rows_scrollbar(self.asilence_rows_frame)
             return
-        total = sum(e - s for s, e in self._silence_spans)
+        if not self._silence_visible_spans:
+            self.asilence_hint_label.configure(text=i18n.t(
+                self.ui_lang, "asilence_none_at_filter", count=len(self._silence_spans)))
+            self.asilence_delete_button.configure(state="disabled")
+            self.asilence_select_all_button.configure(state="disabled")
+            self.asilence_select_none_button.configure(state="disabled")
+            self._update_rows_scrollbar(self.asilence_rows_frame)
+            return
+        total = sum(e - s for s, e in self._silence_visible_spans)
         self.asilence_hint_label.configure(text=i18n.t(
-            self.ui_lang, "asilence_found", count=len(self._silence_spans), seconds=f"{total:.1f}"))
-        for i, (start, end) in enumerate(self._silence_spans):
+            self.ui_lang, "asilence_found", count=len(self._silence_visible_spans), seconds=f"{total:.1f}"))
+        for i, (start, end) in enumerate(self._silence_visible_spans):
             var = ctk.BooleanVar(value=False)
             self._silence_vars.append(var)
             row = ctk.CTkFrame(self.asilence_rows_frame, fg_color=("gray95", "gray24"))
@@ -3815,7 +4041,7 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
                 row=0, column=0, padx=(8, 6), pady=6)
             ctk.CTkLabel(
                 row, anchor="w",
-                text=f"{_fmt_time(start)} – {_fmt_time(end)}   ({end - start:.1f}s)",
+                text=f"{_fmt_hms(start)} – {_fmt_hms(end)}   ({end - start:.1f}s)",
             ).grid(row=0, column=1, sticky="ew", pady=6)
             play_btn = ctk.CTkButton(
                 row, text=i18n.t(self.ui_lang, "afind_play"), width=60, height=24,
@@ -3840,7 +4066,7 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
     def _delete_checked_silences(self):
         if self.audio_clip is None:
             return
-        ranges = [s for s, v in zip(self._silence_spans, self._silence_vars) if v.get()]
+        ranges = [s for s, v in zip(self._silence_visible_spans, self._silence_vars) if v.get()]
         if not ranges:
             return
         self.audio_clip.remove_ranges(ranges)
@@ -3850,6 +4076,7 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
 
     def _clear_silence_results(self):
         self._silence_spans = []
+        self._silence_visible_spans = []
         self._silence_vars = []
         self._silence_has_searched = False
         if hasattr(self, "asilence_hint_label"):  # not yet built during initial clip-less state
@@ -3869,26 +4096,33 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         # its own underneath.
         top = ctk.CTkFrame(parent, fg_color="transparent")
         top.grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 4))
-        top.grid_columnconfigure(2, weight=1)
+        top.grid_columnconfigure(3, weight=1)
         self.aai_analyze_button = ctk.CTkButton(
             top, text="", width=150, height=30, command=self._analyze_audio)
         self.aai_analyze_button.grid(row=0, column=0, padx=(0, 8))
+        self._add_tooltip(self.aai_analyze_button, lambda: i18n.t(self.ui_lang, "aai_tip_full_analyze"))
+        self.aai_quick_analyze_button = ctk.CTkButton(
+            top, text="", width=130, height=30, fg_color="transparent",
+            text_color=self.OUTLINE_BUTTON_TEXT, border_width=1,
+            command=self._analyze_audio_quick)
+        self.aai_quick_analyze_button.grid(row=0, column=1, padx=(0, 8))
+        self._add_tooltip(self.aai_quick_analyze_button, lambda: i18n.t(self.ui_lang, "aai_tip_quick_analyze"))
         self.aai_filler_words_button = ctk.CTkButton(
             top, text="", width=130, height=28, fg_color="transparent",
             text_color=self.OUTLINE_BUTTON_TEXT, border_width=1,
             command=self._open_filler_words_dialog)
-        self.aai_filler_words_button.grid(row=0, column=1, padx=(0, 10))
+        self.aai_filler_words_button.grid(row=0, column=2, padx=(0, 10))
         self.aai_health_label = ctk.CTkLabel(top, text="", anchor="w", wraplength=420, justify="left")
-        self.aai_health_label.grid(row=0, column=2, sticky="w")
+        self.aai_health_label.grid(row=0, column=3, sticky="w")
         self.aai_preset_label = ctk.CTkLabel(top, text="")
-        self.aai_preset_label.grid(row=0, column=3, padx=(10, 8))
+        self.aai_preset_label.grid(row=0, column=4, padx=(10, 8))
         self.aai_preset_menu = ctk.CTkOptionMenu(
             top, width=170,
             values=[i18n.t(self.ui_lang, f"aai_preset_{key}") for key in audio_ai_edit.AI_PRESET_ORDER])
-        self.aai_preset_menu.grid(row=0, column=4, padx=(0, 8))
+        self.aai_preset_menu.grid(row=0, column=5, padx=(0, 8))
         self.aai_preset_apply_button = ctk.CTkButton(
             top, text="", width=130, height=28, command=self._apply_ai_preset)
-        self.aai_preset_apply_button.grid(row=0, column=5)
+        self.aai_preset_apply_button.grid(row=0, column=6)
 
         self.aai_rows_frame = ctk.CTkScrollableFrame(parent, fg_color="transparent")
         self.aai_rows_frame.grid(row=1, column=0, sticky="nsew", padx=4, pady=(0, 8))
@@ -3914,24 +4148,139 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         # _ai_fix_vars: {fix_key: BooleanVar}, parallel to the checked rows.
         self._clear_ai_results()
 
-    def _analyze_audio(self):
-        """Runs audio_ai_edit.analyze on a background thread (its own
-        whisper/VAD models are a noticeably heavier first-run load than
-        Enhance/Clean's plain-DSP effects) and shows the results here."""
+    def _analyze_audio(self, quick=False):
+        """Runs audio_ai_edit.analyze on a background thread behind a
+        cancelable progress dialog — same shape as Find Similar's own
+        (_show_find_progress_dialog), for the same reason: word-level
+        transcription (the dominant cost past a few minutes — see
+        transcribe_words's docstring) is naturally chunkable, so unlike
+        Enhance/Clean's plain-DSP effects this doesn't need a plain
+        indeterminate spinner with no way out. `quick=True` (Quick
+        Analysis, see the AI panel's second button) skips transcription
+        entirely — see audio_ai_edit.analyze's own docstring."""
         if self.audio_clip is None:
             return
         buffer, sample_rate = self.audio_clip.buffer, self.audio_clip.sample_rate
+        cancel_event = threading.Event()
+        self._ai_analyze_cancel_event = cancel_event
+
+        def progress_cb(frac):
+            self.events.put(("ai_analyze", "progress", frac))
+
+        def cancel_cb():
+            return cancel_event.is_set()
 
         def work():
-            return audio_ai_edit.analyze(buffer, sample_rate)
+            try:
+                report = audio_ai_edit.analyze(
+                    buffer, sample_rate, on_progress=progress_cb, cancel_cb=cancel_cb, quick=quick)
+                self.events.put(("ai_analyze", "done", report))
+            except Exception:
+                settings.log_exception("Audio Studio: Analyze Audio failed:")
+                self.events.put(("ai_analyze", "error", None))
 
-        def done(report, error):
-            self._ai_report = None if error is not None else report
-            self.active_effects_panel = "ai"
-            self._show_active_effects_panel()
-            self._render_ai_results()
+        self._show_ai_analyze_progress_dialog(sample_rate, len(buffer), quick)
+        threading.Thread(target=work, daemon=True).start()
 
-        self._run_busy("aai_busy_analyzing", work, done)
+    def _analyze_audio_quick(self):
+        self._analyze_audio(quick=True)
+
+    def _show_ai_analyze_progress_dialog(self, sample_rate, buffer_len, quick):
+        """A rough upfront estimate (this recording's own length — the
+        one thing known before any work has run) followed by a real,
+        continuously-refined ETA once progress starts arriving: word-level
+        transcription throughput varies enormously by CPU, so a fixed
+        guess would often be badly wrong where "elapsed so far ÷ fraction
+        done" is actually measuring this specific run on this specific
+        machine. Quick Analysis has no such variance to worry about — it's
+        VAD-only, done in well under a minute regardless of length — so
+        its initial label just says so instead of promising an ETA that
+        would barely have time to appear before the dialog closes."""
+        duration_s = buffer_len / sample_rate if sample_rate else 0.0
+        self._ai_analyze_start_time = time.monotonic()
+        self._ai_analyze_quick = quick
+        dlg = ctk.CTkToplevel(self)
+        dlg.title(i18n.t(self.ui_lang, "aai_analyzing_title"))
+        dlg.resizable(False, False)
+        dlg.transient(self)
+        dlg.protocol("WM_DELETE_WINDOW", lambda: None)  # Cancel (below) is the only way out
+        initial_key = "aai_analyzing_status_initial_quick" if quick else "aai_analyzing_status_initial"
+        self._ai_analyze_label = ctk.CTkLabel(
+            dlg, text=i18n.t(self.ui_lang, initial_key, minutes=f"{duration_s / 60:.0f}"))
+        self._ai_analyze_label.pack(padx=24, pady=(22, 10))
+        # Quick Analysis is VAD-only — done in a couple of chunky jumps
+        # (0% -> ~2% -> ~30% -> 100%, see analyze()'s own progress calls)
+        # that finish in well under a second for most recordings, so a
+        # determinate bar/percentage here would flash past too fast to
+        # read (and briefly look broken, jumping straight to 100%) rather
+        # than convey real progress. An indeterminate spinner reads as
+        # "working" without implying it's tracking anything measurable.
+        self._ai_analyze_bar = ctk.CTkProgressBar(
+            dlg, width=300, mode="indeterminate" if quick else "determinate")
+        self._ai_analyze_bar.set(0)
+        if quick:
+            self._ai_analyze_bar.start()
+        self._ai_analyze_bar.pack(padx=24, pady=(0, 16))
+        self._ai_analyze_cancel_btn = ctk.CTkButton(
+            dlg, text=i18n.t(self.ui_lang, "aai_cancel_analyze"),
+            command=self._cancel_analyze_audio)
+        self._ai_analyze_cancel_btn.pack(pady=(0, 18))
+        dlg.update_idletasks()
+        x = self.winfo_rootx() + (self.winfo_width() - dlg.winfo_width()) // 2
+        y = self.winfo_rooty() + (self.winfo_height() - dlg.winfo_height()) // 2
+        dlg.geometry(f"+{max(0, x)}+{max(0, y)}")
+        dlg.grab_set()  # modal, same reasoning as every other busy dialog in Audio Studio
+        self._ai_analyze_dialog = dlg
+
+    def _update_ai_analyze_progress_dialog(self, frac):
+        if self._ai_analyze_dialog is None:
+            return
+        if self._ai_analyze_quick:
+            return  # indeterminate bar animates on its own — see _show_ai_analyze_progress_dialog
+        self._ai_analyze_bar.set(frac)
+        elapsed = time.monotonic() - self._ai_analyze_start_time
+        if frac > 0.02:  # too little signal yet to trust elapsed/frac as a rate
+            remaining_s = elapsed * (1.0 - frac) / frac
+            eta_text = i18n.t(self.ui_lang, "aai_analyzing_eta_minutes", minutes=f"{remaining_s / 60:.1f}") \
+                if remaining_s >= 60 else i18n.t(
+                    self.ui_lang, "aai_analyzing_eta_seconds", seconds=f"{remaining_s:.0f}")
+        else:
+            eta_text = i18n.t(self.ui_lang, "aai_analyzing_eta_estimating")
+        self._ai_analyze_label.configure(text=i18n.t(
+            self.ui_lang, "aai_analyzing_status", pct=int(frac * 100), eta=eta_text))
+
+    def _cancel_analyze_audio(self):
+        if self._ai_analyze_cancel_event is not None:
+            self._ai_analyze_cancel_event.set()
+        if self._ai_analyze_cancel_btn is not None:
+            self._ai_analyze_cancel_btn.configure(
+                state="disabled", text=i18n.t(self.ui_lang, "afind_cancelling"))
+
+    def _close_ai_analyze_progress_dialog(self):
+        if self._ai_analyze_dialog is not None:
+            if self._ai_analyze_quick:
+                self._ai_analyze_bar.stop()
+            self._ai_analyze_dialog.grab_release()
+            self._ai_analyze_dialog.destroy()
+        self._ai_analyze_dialog = None
+        self._ai_analyze_cancel_event = None
+        self._ai_analyze_start_time = None
+        self._ai_analyze_quick = False
+
+    def _on_ai_analyze_event(self, status, payload):
+        if status == "progress":
+            self._update_ai_analyze_progress_dialog(payload)
+            return
+        self._close_ai_analyze_progress_dialog()
+        report = payload if status == "done" else None
+        self._ai_report = report
+        self.active_effects_panel = "ai"
+        self._show_active_effects_panel()
+        self._render_ai_results()
+        if status == "error":
+            self._set_audio_edit_status("aai_status_failed", {})
+        elif report is not None and report.cancelled:
+            self._set_audio_edit_status("aai_status_cancelled", {})
 
     # Range-based fix categories: report attribute -> (row-label i18n key,
     # section-header i18n key, waveform highlight color). Each entry in
@@ -3951,6 +4300,16 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
             w.destroy()
         self._ai_fix_vars = {}     # {"denoise"/"loudness": BooleanVar} — whole-buffer transforms
         self._ai_range_vars = {}   # {"pauses"/"fillers"/"repetitions": [BooleanVar, ...]}
+        self._ai_range_items = {}  # same keys, the exact (possibly filtered) items each
+                                    # var_list was built from — _apply_ai_selected zips
+                                    # against THIS, never self._ai_report's own attributes
+                                    # directly, since the Long pauses filter can mean
+                                    # fewer/differently-ordered items were actually shown
+                                    # than the report holds; zipping against the report's
+                                    # own full unfiltered list paired the wrong checkbox
+                                    # with the wrong pause and silently removed the wrong
+                                    # ranges (found via a real "still shows long pauses
+                                    # after AI Enhance" report).
         report = self._ai_report
         if report is None:
             self.aai_health_label.configure(text=i18n.t(self.ui_lang, "aai_hint"))
@@ -3990,17 +4349,40 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
             ).grid(row=0, column=1, sticky="ew", pady=6)
             row_i += 1
 
-        def add_range_rows(cat_key, items):
+        def add_range_rows(cat_key, items, total_count=None, with_filter=False):
             """One row per detected item — checkbox, time+label, Play,
             Jump — same shape as _render_silence_results's rows, so
             reviewing an AI-flagged pause/filler/repetition works exactly
-            like reviewing a detected silence span."""
+            like reviewing a detected silence span. `with_filter=True`
+            (Long pauses only) adds a duration filter menu to the header
+            row, same "≥1.5s/3.0s/4.5s/6.0s" presets and same far-right
+            placement as the Matches/No speech panels' own filters —
+            `items` is already the FILTERED list by the time this is
+            called, `total_count` is the unfiltered one, needed only to
+            tell "nothing detected at all" apart from "some were
+            detected, just none at this filter level"."""
             nonlocal row_i
             label_key, header_key, _color = self._AI_RANGE_CATEGORIES[cat_key]
+            total_count = len(items) if total_count is None else total_count
+            header_row = ctk.CTkFrame(self.aai_rows_frame, fg_color="transparent")
+            header_row.grid(row=row_i, column=0, sticky="ew", padx=8, pady=(8, 2))
+            header_row.grid_columnconfigure(0, weight=1)
+            header_text = (i18n.t(self.ui_lang, "aai_section_pauses_none_at_filter", count=total_count)
+                          if with_filter and total_count and not items
+                          else i18n.t(self.ui_lang, header_key, count=len(items)))
             ctk.CTkLabel(
-                self.aai_rows_frame, anchor="w", font=ctk.CTkFont(weight="bold"),
-                text=i18n.t(self.ui_lang, header_key, count=len(items))
-            ).grid(row=row_i, column=0, sticky="ew", padx=8, pady=(8, 2))
+                header_row, anchor="w", font=ctk.CTkFont(weight="bold"), text=header_text,
+            ).grid(row=0, column=0, sticky="ew")
+            if with_filter:
+                filter_menu = ctk.CTkOptionMenu(
+                    header_row, width=100, values=list(self.SPAN_FILTER_VALUES.keys()),
+                    command=self._on_ai_pause_filter_change)
+                current_label = next(
+                    (k for k, v in self.SPAN_FILTER_VALUES.items() if v == self._ai_pause_min_duration),
+                    "≥1.5s")
+                filter_menu.set(current_label)
+                filter_menu.grid(row=0, column=1, sticky="e", padx=(8, 0))
+                self._add_tooltip(filter_menu, lambda: i18n.t(self.ui_lang, "aai_pause_filter_tip"))
             row_i += 1
             var_list = []
             for item in items:
@@ -4012,7 +4394,7 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
                 row.grid_columnconfigure(1, weight=1)
                 ctk.CTkCheckBox(row, text="", variable=var, width=20,
                                command=self._redraw_waveform).grid(row=0, column=0, padx=(8, 6), pady=6)
-                label_kw = {"time": f"{_fmt_time(start)} – {_fmt_time(end)}"}
+                label_kw = {"time": f"{_fmt_hms(start)} – {_fmt_hms(end)}", "dur": f"{end - start:.1f}"}
                 if "word" in item:
                     label_kw["word"] = item["word"]
                 ctk.CTkLabel(row, anchor="w", text=i18n.t(self.ui_lang, label_key, **label_kw)).grid(
@@ -4029,6 +4411,7 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
                 jump_btn.grid(row=0, column=3, padx=(6, 8), pady=6)
                 row_i += 1
             self._ai_range_vars[cat_key] = var_list
+            self._ai_range_items[cat_key] = items
 
         if report.noise_floor_db > audio_ai_edit.NOISE_FLOOR_PROBLEM_DB:
             add_info("aai_problem_noise", db=f"{report.noise_floor_db:.0f}")
@@ -4036,7 +4419,19 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
             add_info("aai_problem_clipping", count=report.clip_incidents)
         if report.loudness_variance_db > audio_ai_edit.LOUDNESS_VARIANCE_PROBLEM_DB:
             add_info("aai_problem_loudness", db=f"{report.loudness_variance_db:.1f}")
-        add_info("aai_problem_echo_not_checked")
+        if report.quick:
+            # Quick Analysis deliberately never touched Whisper at all —
+            # distinct from words_available being False (model missing)
+            # or cancelled (started, then stopped partway).
+            add_info("aai_problem_quick_mode")
+        elif not report.words_available:
+            add_info("aai_problem_words_unavailable")
+        elif report.cancelled:
+            # Cancelled mid-transcription — noise/clip/loudness/pauses
+            # above are still complete (none of them depend on
+            # transcription), but fillers/repetitions below only cover
+            # audio up to wherever the cancel landed.
+            add_info("aai_problem_cancelled_partial")
 
         nsnet2_ready = audio_ai_edit.nsnet2_is_downloaded()
         add_fix("denoise", "aai_fix_denoise" if nsnet2_ready else "aai_fix_denoise_unavailable",
@@ -4044,9 +4439,16 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         add_fix("loudness", "aai_fix_loudness",
                 report.loudness_variance_db > audio_ai_edit.LOUDNESS_VARIANCE_PROBLEM_DB)
         # long_pauses is [(start, end), ...] (no word text) — wrap to the
-        # same {"start", "end"} shape filler/repetition rows use.
+        # same {"start", "end"} shape filler/repetition rows use, then
+        # apply the same display-only duration filter the No speech panel
+        # uses (self._ai_pause_min_duration) — narrows which already-
+        # detected pauses are SHOWN, without re-running VAD.
         if report.long_pauses:
-            add_range_rows("pauses", [{"start": s, "end": e} for s, e in report.long_pauses])
+            filtered_pauses = [
+                (s, e) for s, e in report.long_pauses if (e - s) >= self._ai_pause_min_duration]
+            add_range_rows(
+                "pauses", [{"start": s, "end": e} for s, e in filtered_pauses],
+                total_count=len(report.long_pauses), with_filter=True)
         if report.filler_words:
             add_range_rows("fillers", report.filler_words)
         if report.repetitions:
@@ -4059,6 +4461,10 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         self.aai_select_none_button.configure(state=state)
         self._update_rows_scrollbar(self.aai_rows_frame)
         self._redraw_waveform()
+
+    def _on_ai_pause_filter_change(self, value):
+        self._ai_pause_min_duration = self.SPAN_FILTER_VALUES.get(value, 1.5)
+        self._render_ai_results()
 
     def _set_all_ai_checks(self, checked):
         for var in self._ai_fix_vars.values():
@@ -4078,10 +4484,17 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         if self.audio_clip is None or not self._ai_report:
             return
         whole_checked = {key for key, var in self._ai_fix_vars.items() if var.get()}
+        # Zips against self._ai_range_items[cat] — the EXACT items each
+        # var_list was built from (see _render_ai_results/add_range_rows)
+        # — never self._ai_report's own long_pauses/filler_words/
+        # repetitions directly. Long pauses can be shown filtered (the
+        # Long-pauses-section duration filter), so the report's own full
+        # unfiltered list is a different length/order than what's on
+        # screen; zipping against it paired each checkbox with whatever
+        # pause happened to share its position in the FULL list, not the
+        # one actually next to that checkbox.
         range_selections = {
-            cat: [item for item, var in zip(getattr(self._ai_report, {
-                "pauses": "long_pauses", "fillers": "filler_words", "repetitions": "repetitions",
-            }[cat]), var_list) if var.get()]
+            cat: [item for item, var in zip(self._ai_range_items.get(cat, []), var_list) if var.get()]
             for cat, var_list in self._ai_range_vars.items()
         }
         total_checked = len(whole_checked) + sum(len(v) for v in range_selections.values())
@@ -4099,12 +4512,9 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
             if "loudness" in whole_checked:
                 result = audio_dsp.normalize_lufs(result, sample_rate)
             ranges = []
-            for pause in range_selections.get("pauses", []):
-                ranges.append((pause["start"], pause["end"]) if isinstance(pause, dict) else pause)
-            for item in range_selections.get("fillers", []):
-                ranges.append((item["start"], item["end"]))
-            for item in range_selections.get("repetitions", []):
-                ranges.append((item["start"], item["end"]))
+            for cat in ("pauses", "fillers", "repetitions"):
+                for item in range_selections.get(cat, []):
+                    ranges.append((item["start"], item["end"]))
             return result, ranges
 
         def done(outcome, error):
@@ -4259,6 +4669,7 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         self._ai_report = None
         self._ai_fix_vars = {}
         self._ai_range_vars = {}
+        self._ai_range_items = {}
         if hasattr(self, "aai_health_label"):  # not yet built during initial clip-less state
             self._render_ai_results()
 
@@ -4283,6 +4694,8 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         self.arec_pause_button.configure(text=t(
             "arec_resume" if (self.audio_recorder and self.audio_recorder.is_paused) else "arec_pause"))
         self.arec_stop_button.configure(text=t("arec_stop_button"))
+        self.arec_mark_button.configure(text=t("arec_mark_button"))
+        self._update_arec_space_label()
         self.arec_edit_button.configure(text=t("arec_edit_button"))
         self.arec_open_folder_button.configure(text=t("open_output_folder"))
         self._refresh_audio_record_mic_menu()
@@ -4349,8 +4762,6 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         self.aenh_clear_profile_button.configure(text=t("aenh_clear_profile_button"))
         self._update_noise_profile_label()
 
-        self.amark_sections_button.configure(text=t("aclean_sections_button"))
-
         self.afind_select_all_button.configure(text=t("afind_select_all"))
         self.afind_select_none_button.configure(text=t("afind_select_none"))
         self.afind_delete_button.configure(text=t("afind_delete_button"))
@@ -4364,9 +4775,11 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         self.amark_select_all_button.configure(text=t("afind_select_all"))
         self.amark_select_none_button.configure(text=t("afind_select_none"))
         self.amark_delete_button.configure(text=t("afind_delete_button"))
+        self.amark_save_selected_button.configure(text=t("amark_save_selected_button"))
         self._render_markers_panel()  # re-renders the hint text and any marker rows/buttons
 
         self.aai_analyze_button.configure(text=t("aai_analyze_button"))
+        self.aai_quick_analyze_button.configure(text=t("aai_quick_analyze_button"))
         self.aai_preset_label.configure(text=t("aai_preset_label"))
         preset_values = [t(f"aai_preset_{key}") for key in audio_ai_edit.AI_PRESET_ORDER]
         current_preset = self.aai_preset_menu.get()
@@ -4994,6 +5407,51 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
             command=self._reset_all_settings)
         self.reset_settings_button.grid(row=0, column=2)
 
+        # --- Recording safeguards — see _check_recording_safeguards. A
+        # 3 (warn/alert/stop) x 3 (duration/disk/RAM) grid of plain
+        # number entries rather than nine separate rows — the tier
+        # structure (same three severities, same three dimensions) reads
+        # directly off the layout instead of needing nine labels spelling
+        # it out.
+        safeguard_card = ctk.CTkFrame(scroll)
+        safeguard_card.grid(row=3, column=0, sticky="ew", padx=4, pady=(0, 8))
+        for col in (1, 2, 3):
+            safeguard_card.grid_columnconfigure(col, weight=1)
+        self.settings_safeguard_title = ctk.CTkLabel(
+            safeguard_card, text="", font=section_font, anchor="w")
+        self.settings_safeguard_title.grid(
+            row=0, column=0, columnspan=4, sticky="w", padx=12, pady=(10, 2))
+        self.settings_safeguard_hint = ctk.CTkLabel(
+            safeguard_card, text="", anchor="w", justify="left",
+            text_color=self.MUTED_TEXT, wraplength=640)
+        self.settings_safeguard_hint.grid(
+            row=1, column=0, columnspan=4, sticky="ew", padx=12, pady=(0, 8))
+
+        self.settings_safeguard_col_warn = ctk.CTkLabel(safeguard_card, text="", anchor="center")
+        self.settings_safeguard_col_warn.grid(row=2, column=1, padx=6, pady=(0, 4))
+        self.settings_safeguard_col_alert = ctk.CTkLabel(safeguard_card, text="", anchor="center")
+        self.settings_safeguard_col_alert.grid(row=2, column=2, padx=6, pady=(0, 4))
+        self.settings_safeguard_col_stop = ctk.CTkLabel(safeguard_card, text="", anchor="center")
+        self.settings_safeguard_col_stop.grid(row=2, column=3, padx=6, pady=(0, 4))
+
+        self._safeguard_row_labels = {}
+        self._safeguard_entries = {}
+        for row, (dim, pref_prefix) in enumerate([
+            ("duration", "safeguard_{}_hours"),
+            ("disk", "safeguard_{}_disk_minutes"),
+            ("ram", "safeguard_{}_ram_gb"),
+        ], start=3):
+            label = ctk.CTkLabel(safeguard_card, text="", anchor="w")
+            label.grid(row=row, column=0, sticky="w", padx=(12, 6), pady=4)
+            self._safeguard_row_labels[dim] = label
+            for col, tier in ((1, "warn"), (2, "alert"), (3, "stop")):
+                pref_key = pref_prefix.format(tier)
+                entry = ctk.CTkEntry(safeguard_card, width=80, justify="center")
+                entry.grid(row=row, column=col, padx=6, pady=4)
+                entry.bind("<FocusOut>", lambda _e, k=pref_key, w=entry: self._on_safeguard_entry_change(k, w))
+                entry.bind("<Return>", lambda _e, k=pref_key, w=entry: self._on_safeguard_entry_change(k, w))
+                self._safeguard_entries[pref_key] = entry
+
     def _retranslate_settings_tab(self):
         t = lambda key, **kw: i18n.t(self.ui_lang, key, **kw)  # noqa: E731
         self.settings_prefs_title.configure(text=t("settings_section_prefs"))
@@ -5015,9 +5473,37 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         self._render_update_status()
         self._refresh_model_rows()
 
+        self.settings_safeguard_title.configure(text=t("settings_section_safeguards"))
+        self.settings_safeguard_hint.configure(text=t("settings_safeguard_hint"))
+        self.settings_safeguard_col_warn.configure(text=t("settings_safeguard_col_warn"))
+        self.settings_safeguard_col_alert.configure(text=t("settings_safeguard_col_alert"))
+        self.settings_safeguard_col_stop.configure(text=t("settings_safeguard_col_stop"))
+        for dim, label in self._safeguard_row_labels.items():
+            label.configure(text=t(f"settings_safeguard_row_{dim}"))
+        self._refresh_safeguard_entries()
+
     def _refresh_settings_tab(self):
         self.output_folder_value.configure(text=settings.output_base())
         self._refresh_model_rows()
+        self._refresh_safeguard_entries()
+
+    def _refresh_safeguard_entries(self):
+        for pref_key, entry in self._safeguard_entries.items():
+            entry.delete(0, "end")
+            entry.insert(0, f"{self.prefs[pref_key]:g}")
+
+    def _on_safeguard_entry_change(self, pref_key, entry):
+        text = entry.get().strip()
+        try:
+            value = float(text)
+            if value < 0:
+                raise ValueError
+        except ValueError:
+            value = self.prefs[pref_key]  # invalid/negative entry — revert, don't save garbage
+        self.prefs[pref_key] = value
+        entry.delete(0, "end")
+        entry.insert(0, f"{value:g}")
+        settings.save(self.prefs)
 
     def _refresh_models_if_visible(self):
         """The Settings tab's model list is only built on tab entry — a
@@ -5937,6 +6423,200 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         self._style_tab_buttons()
         self._ensure_active_tab_visible()
 
+    # -- recording/transcription safeguards ---------------------------------
+    # Three escalating tiers — warn / alert / stop — checked periodically
+    # (SAFEGUARD_CHECK_MS) across whatever's actually running right now:
+    # elapsed time for anything that's an open-ended RECORDING (Audio
+    # Studio's Record tab, Live Transcription — both could otherwise run
+    # forever if someone simply forgets), and free disk/RAM for anything
+    # that's writing to disk at all (those two plus a batch Transcription
+    # Studio job). Only "stop" ever takes an action (auto-stops whichever
+    # recording tripped it); warn/alert only ever show a dismissible
+    # notice — see _show_safeguard_notice's own docstring for why this is
+    # never a blocking dialog. Thresholds are user-editable (Settings —
+    # settings.DEFAULTS' safeguard_* keys).
+    SAFEGUARD_CHECK_MS = 15_000
+
+    def _check_recording_safeguards(self):
+        audio_active = self.audio_recording and self.audio_recorder is not None
+        live_active = self.live_running and self.live_worker is not None
+        transcribe_active = self.running and self.worker is not None
+
+        # -- duration: only genuine open-ended recordings, never a batch
+        # transcription job (that one's bounded by its input files, not by
+        # someone forgetting to press Stop).
+        if audio_active:
+            self._check_safeguard_duration(
+                "audio_record", self.audio_recorder.elapsed_seconds,
+                stop_fn=self._stop_audio_record)
+        if live_active:
+            self._check_safeguard_duration(
+                "live", self.live_worker.elapsed_seconds,
+                stop_fn=self._stop_live_recording)
+
+        # -- disk space: every activity currently writing output, each
+        # checked against its OWN destination folder (they can differ
+        # under a custom output path) and its own bytes/sec where known.
+        if audio_active:
+            self._check_safeguard_disk(
+                "audio_record", settings.audio_recordings_folder(),
+                self._arec_bytes_per_second(), stop_fn=self._stop_audio_record)
+        if live_active:
+            # Fixed mono 16kHz int16 PCM — see live_transcription.SAMPLE_RATE.
+            self._check_safeguard_disk(
+                "live", settings.live_recordings_folder(),
+                live_transcription.SAMPLE_RATE * 2, stop_fn=self._stop_live_recording)
+        if transcribe_active:
+            # No per-second rate here (it writes finished transcripts, not
+            # a continuously-growing stream) — just the absolute floor
+            # (safeguard_stop_disk_minutes is re-read as a fixed low-space
+            # check; _check_safeguard_disk treats a None bytes_per_second
+            # as "skip the warn/alert minutes-remaining math, only the
+            # hard floor matters").
+            self._check_safeguard_disk(
+                "transcribe", settings.transcriptions_folder(), None, stop_fn=None)
+
+        # -- free RAM: global to the machine, not tied to any one
+        # activity — armed only while at least one of the three is
+        # running, and re-armed (its notices cleared) once none are.
+        if audio_active or live_active or transcribe_active:
+            self._check_safeguard_ram()
+        else:
+            self._clear_safeguard_notices_with_prefix("resource_ram_")
+
+        self.after(self.SAFEGUARD_CHECK_MS, self._check_recording_safeguards)
+
+    def _check_safeguard_duration(self, key_prefix, elapsed_s, stop_fn):
+        prefs = self.prefs
+        hours = elapsed_s / 3600.0
+        tiers = [
+            ("stop", prefs["safeguard_stop_hours"], "safeguard_stop_duration"),
+            ("alert", prefs["safeguard_alert_hours"], "safeguard_alert_duration"),
+            ("warn", prefs["safeguard_warn_hours"], "safeguard_warn_duration"),
+        ]
+        for tier, threshold, text_key in tiers:
+            if hours < threshold:
+                continue
+            notice_key = f"{key_prefix}_duration_{tier}"
+            if notice_key in self._safeguard_notices:
+                return  # already showing (or already dismissed) this tier
+            if tier == "stop" and stop_fn is not None:
+                stop_fn()
+            self._show_safeguard_notice(notice_key, tier, i18n.t(
+                self.ui_lang, text_key, hours=f"{hours:.1f}", threshold=f"{threshold:g}"))
+            return  # highest-crossed tier only — no point stacking all three
+
+    def _check_safeguard_disk(self, key_prefix, folder, bytes_per_second, stop_fn):
+        prefs = self.prefs
+        free_gb = sysinfo.free_disk_gb(folder)
+        if free_gb is None:
+            return
+        tiers = [
+            ("stop", prefs["safeguard_stop_disk_minutes"], "safeguard_stop_disk"),
+            ("alert", prefs["safeguard_alert_disk_minutes"], "safeguard_alert_disk"),
+            ("warn", prefs["safeguard_warn_disk_minutes"], "safeguard_warn_disk"),
+        ]
+        for tier, threshold_minutes, text_key in tiers:
+            if bytes_per_second:
+                minutes_left = (free_gb * 1024 ** 3) / bytes_per_second / 60.0
+                crossed = minutes_left <= threshold_minutes
+            else:
+                # No per-second rate to convert "minutes" into a byte
+                # count (the batch-transcription case — it writes
+                # finished transcript files, not a continuously-growing
+                # stream): read the same setting as an absolute low-space
+                # floor instead, at a fixed 50MB per "minute" — comfortably
+                # above any single transcript file, so it only trips on a
+                # genuinely almost-full drive.
+                crossed = free_gb * 1024 <= threshold_minutes * 50
+            if not crossed:
+                continue
+            notice_key = f"{key_prefix}_disk_{tier}"
+            if notice_key in self._safeguard_notices:
+                return
+            if tier == "stop" and stop_fn is not None:
+                stop_fn()
+            self._show_safeguard_notice(notice_key, tier, i18n.t(
+                self.ui_lang, text_key, free=f"{free_gb:.1f}"))
+            return
+
+    def _check_safeguard_ram(self):
+        prefs = self.prefs
+        free_gb = sysinfo.free_ram_gb()
+        if free_gb is None:
+            return
+        tiers = [
+            ("stop", prefs["safeguard_stop_ram_gb"], "safeguard_stop_ram"),
+            ("alert", prefs["safeguard_alert_ram_gb"], "safeguard_alert_ram"),
+            ("warn", prefs["safeguard_warn_ram_gb"], "safeguard_warn_ram"),
+        ]
+        for tier, threshold, text_key in tiers:
+            if free_gb > threshold:
+                continue
+            notice_key = f"resource_ram_{tier}"
+            if notice_key in self._safeguard_notices:
+                return
+            if tier == "stop":
+                # Stopping recordings can't free RAM some OTHER process is
+                # using, but it at least stops adding to the problem, and
+                # gives whatever's already running (transcription, the
+                # rest of the OS) more headroom before something actually
+                # crashes for lack of memory.
+                if self.audio_recording:
+                    self._stop_audio_record()
+                if self.live_running:
+                    self._stop_live_recording()
+            self._show_safeguard_notice(notice_key, tier, i18n.t(
+                self.ui_lang, text_key, free=f"{free_gb:.2f}"))
+            return
+
+    def _show_safeguard_notice(self, key, tier, text):
+        """Adds a dismissible banner to the fixed strip below the main
+        content area — never a messagebox/modal. Per the product decision
+        behind this whole feature: none of the three tiers may interrupt
+        an in-progress recording or transcription, they only ever inform,
+        and stay up regardless of which tab is active until the user
+        dismisses them (or the app is restarted). Calling this again with
+        a `key` already showing is a no-op — a threshold that's already
+        been shown (or already dismissed) doesn't get re-shown on every
+        15-second re-check just because the condition persists."""
+        if key in self._safeguard_notices:
+            return
+        color = {"warn": "#8a7a2a", "alert": "#8a5a20", "stop": "#8a3535"}[tier]
+        row = ctk.CTkFrame(self.safeguard_banner_row, fg_color=color)
+        row.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(
+            row, text=text, anchor="w", text_color="white", justify="left", wraplength=900,
+        ).grid(row=0, column=0, sticky="ew", padx=(12, 6), pady=8)
+        ctk.CTkButton(
+            row, text="✕", width=28, height=28, fg_color="transparent", hover_color=color,
+            text_color="white", command=lambda k=key: self._dismiss_safeguard_notice(k),
+        ).grid(row=0, column=1, padx=(0, 8), pady=6)
+        self._safeguard_notices[key] = {"tier": tier, "text": text, "widget": row}
+        self._relayout_safeguard_notices()
+        self.safeguard_banner_row.grid()
+
+    def _relayout_safeguard_notices(self):
+        for i, entry in enumerate(self._safeguard_notices.values()):
+            entry["widget"].grid(row=i, column=0, sticky="ew", pady=(0, 4))
+
+    def _dismiss_safeguard_notice(self, key):
+        entry = self._safeguard_notices.pop(key, None)
+        if entry is not None:
+            entry["widget"].destroy()
+        if self._safeguard_notices:
+            self._relayout_safeguard_notices()
+        else:
+            self.safeguard_banner_row.grid_remove()
+
+    def _clear_safeguard_notices_with_prefix(self, prefix):
+        """Called when a session ends (naturally or via a "stop" tier) so
+        its warn/alert notices don't linger forever and its thresholds can
+        fire again next time — see the call sites in _stop_audio_record /
+        _stop_live_recording / _check_recording_safeguards' RAM branch."""
+        for key in [k for k in self._safeguard_notices if k.startswith(prefix)]:
+            self._dismiss_safeguard_notice(key)
+
     # Recording-badge tints for the Live Transcription subtab (and, while
     # Transcription Studio isn't the active group, its outer tab button
     # too) — a color change only, never text, so the badge can't affect
@@ -6433,6 +7113,7 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         elif kind == "finished":
             self._set_running(False)
             self.worker = None
+            self._clear_safeguard_notices_with_prefix("transcribe_")
             self._refresh_models_if_visible()
             done = sum(1 for r in self.rows if r["status_key"].startswith("done"))
             self.progress_bar.set(1 if done == len(self.rows) and done
@@ -6452,6 +7133,8 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
             self._on_audio_reloaded(event[1])
         elif kind == "find_similar":
             self._on_find_similar_event(event[1], event[2])
+        elif kind == "ai_analyze":
+            self._on_ai_analyze_event(event[1], event[2])
         elif kind == "busy_done":
             _, on_done, result, error = event
             self._close_busy_dialog()
@@ -6880,6 +7563,7 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         self.live_running = False
         self.live_tab_idle = False
         self.live_worker = None
+        self._clear_safeguard_notices_with_prefix("live_")
         state = "normal" if self.sensevoice_available else "disabled"
         self.live_language_menu.configure(state=state)
         self.live_mic_menu.configure(state=state)
@@ -7126,11 +7810,21 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
                 self._render_play_button()
         if self.current_tab == self.LEAF_AUDIO_RECORD and self.audio_recorder is not None:
             self.arec_timer_label.configure(
-                text=_fmt_time(self.audio_recorder.elapsed_seconds))
+                text=_fmt_hms(self.audio_recorder.elapsed_seconds))
             self.arec_level_bar.set(min(1.0, self.audio_recorder.level * 12))
             if self.audio_recorder.clipped:
                 self.arec_clip_label.configure(text=i18n.t(self.ui_lang, "arec_clip_warning"))
             self._redraw_record_waveform()
+        if self.current_tab == self.LEAF_AUDIO_RECORD:
+            # Free-space can change from outside the app at any moment,
+            # and used-space grows continuously while recording — but a
+            # disk_usage() syscall every 150ms is pure waste for a number
+            # only meant to be a rough running total, so this only
+            # actually refreshes about once a second (TICK_MS-many ticks).
+            self._arec_space_tick_counter += 1
+            if self._arec_space_tick_counter >= max(1, round(1000 / TICK_MS)):
+                self._arec_space_tick_counter = 0
+                self._update_arec_space_label()
         if self.current_tab == self.LEAF_AUDIO_RECORD and getattr(self, "mic_tester", None) is not None:
             if not self.mic_tester.is_alive():
                 self._stop_mic_test()
@@ -7152,8 +7846,8 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
             elif self.audio_player.is_playing:
                 offset = self._preview_offset_s if self.audio_preview is not None else 0.0
                 self.aedit_time_label.configure(
-                    text=f"{_fmt_time(offset + self.audio_player.get_time())} / "
-                         f"{_fmt_time(self.audio_clip.duration)}")
+                    text=f"{_fmt_hms(offset + self.audio_player.get_time())} / "
+                         f"{_fmt_hms(self.audio_clip.duration)}")
                 self._update_playhead_line()
             elif self.aedit_play_button.cget("text") == i18n.t(self.ui_lang, "player_pause"):
                 # Playback ended on its own. A Preview deliberately stays
@@ -7496,6 +8190,17 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
             # would otherwise be killed mid-write).
             self.live_worker.stop()
             self.live_worker.join(timeout=5.0)
+        if self.audio_recording and self.audio_recorder:
+            # Same reasoning as live_worker just above — this used to be
+            # missing entirely, so closing SOTA mid-recording in Audio
+            # Studio just os._exit()'d out from under the recorder thread
+            # with no stop()/join() at all. The WAV header is patched on
+            # every flush (see audio_record.py), so the file was usually
+            # still playable up to the last flush either way, but this
+            # guarantees the last pending chunk is written and the header
+            # closed out cleanly instead of leaving that to chance.
+            self.audio_recorder.stop()
+            self.audio_recorder.join(timeout=5.0)
         try:
             self.player.stop()
         except Exception:
