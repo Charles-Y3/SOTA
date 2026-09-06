@@ -147,6 +147,69 @@ transcription. Every time shown anywhere in Audio Studio (the waveform
 ruler, player readouts, marker/pause/match rows) is **HH:MM:SS**, since a
 recording here can easily run well past an hour.
 
+## Edit & Export tab
+
+After transcribing (recorded or live), open the **Edit & Export** tab to
+proof-read against the audio:
+
+1. Pick a file from the dropdown (or **Open a file…** to load any audio; its
+   transcript is found automatically if one exists). The file dialog opens
+   in the `output\Transcriptions` folder by default, since that's usually
+   where the file you want is.
+2. **Play / Pause / Stop**, scrub with the slider, and change **Speed**
+   (0.5×–2×) — uses WSOLA time-stretching (searches for the best-aligned
+   splice point instead of blindly gluing fixed-size chunks together), so
+   both pitch and intelligibility stay natural even at 0.5×.
+   Each paragraph starts with a blue **[mm:ss] timestamp — click it and
+   playback jumps straight to that moment**, so finding the spot you want
+   to re-listen to takes one click instead of scrubbing. The
+   **Timestamps** button above the editor hides/shows the markers; when
+   hidden, saved copies contain clean text only (the times are kept in a
+   small `.times.json` file next to the transcript either way, so nothing
+   is lost by toggling). Timestamps exist for transcripts made from
+   v1.2.0 onward — older transcripts simply show none.
+3. Edit the text — use the **A- / A+** buttons above the editor to resize
+   the text — then **Save copy**. If Microsoft Word is installed the copy is
+   saved as a `.docx`; otherwise as a `.txt`. Copies are saved in
+   `output\Transcriptions` as `<name> (edited).docx/.txt`, leaving the
+   original intact. Reopening the file later (including in the AI Summary
+   tab) picks up this edited copy rather than the original transcript.
+4. Need punctuation that's awkward to type directly (， 。 「」 《》 etc.)?
+   Click **Punctuation** next to the font-size buttons to reveal a row of
+   full-width Chinese punctuation marks above the editor — click one to
+   insert it at the cursor. Toggle it off again when you don't need it.
+
+## AI Summary & Translate tab
+
+Runs a local AI model (no account, no API key, nothing to configure) over a
+transcript — fully offline after a one-time model download:
+
+1. Pick a transcribed file from the dropdown, or **Open a file…** (accepts
+   `.txt`/`.docx` transcripts directly, or an audio file whose transcript
+   exists in `output\Transcriptions`).
+2. Choose the mode: **Summarize**, **Translate** (pick a target language from
+   ~20 options), or **Both** (a summary written in the target language).
+3. Pick a quality: Fast / Balanced / Accurate — the first use of each level
+   downloads its AI model (~1.8 / 2.5 / 4.7 GB, one time). SOTA recommends a
+   quality tier based on both your total and currently-free RAM (and checks
+   there's enough free disk space to fit the download): **Accurate** if your
+   free RAM already covers it, or your PC has at least 16 GB installed;
+   **Balanced** for any PC with at least 8 GB (with a note to close other
+   apps first if RAM is tight for it right now); otherwise **Fast**.
+4. Click **Generate** and watch the output stream into the right panel. A
+   copy is **saved automatically** the moment generation finishes (same
+   `.docx`/`.txt` rule as everywhere else) — no extra click needed. You can
+   still edit the text afterward and click **Save copy** again to save an
+   updated version alongside the original.
+
+Each panel (Transcription / AI output) has its own **A- / A+** font size
+buttons, right-aligned on its title row, so you can size them independently.
+Drag the divider between the two panels to resize them to your liking — the
+split is remembered for next time.
+
+Long transcripts are handled automatically (processed in parts); a Cancel
+button stops generation at any point.
+
 ### Record tab
 
 1. Pick a **microphone** (same device picker as Live Transcription) and set
@@ -265,69 +328,6 @@ that doesn't sound like speech, not literal silence. A quiet action like
 drinking water or writing on a whiteboard has no vocal content, so it gets
 flagged just like a pause; an incidental sound (a cup clink, a marker
 squeak, a cough) still isn't speech either, so it's flagged too.
-
-## Edit & Export tab
-
-After transcribing (recorded or live), open the **Edit & Export** tab to
-proof-read against the audio:
-
-1. Pick a file from the dropdown (or **Open a file…** to load any audio; its
-   transcript is found automatically if one exists). The file dialog opens
-   in the `output\Transcriptions` folder by default, since that's usually
-   where the file you want is.
-2. **Play / Pause / Stop**, scrub with the slider, and change **Speed**
-   (0.5×–2×) — uses WSOLA time-stretching (searches for the best-aligned
-   splice point instead of blindly gluing fixed-size chunks together), so
-   both pitch and intelligibility stay natural even at 0.5×.
-   Each paragraph starts with a blue **[mm:ss] timestamp — click it and
-   playback jumps straight to that moment**, so finding the spot you want
-   to re-listen to takes one click instead of scrubbing. The
-   **Timestamps** button above the editor hides/shows the markers; when
-   hidden, saved copies contain clean text only (the times are kept in a
-   small `.times.json` file next to the transcript either way, so nothing
-   is lost by toggling). Timestamps exist for transcripts made from
-   v1.2.0 onward — older transcripts simply show none.
-3. Edit the text — use the **A- / A+** buttons above the editor to resize
-   the text — then **Save copy**. If Microsoft Word is installed the copy is
-   saved as a `.docx`; otherwise as a `.txt`. Copies are saved in
-   `output\Transcriptions` as `<name> (edited).docx/.txt`, leaving the
-   original intact. Reopening the file later (including in the AI Summary
-   tab) picks up this edited copy rather than the original transcript.
-4. Need punctuation that's awkward to type directly (， 。 「」 《》 etc.)?
-   Click **Punctuation** next to the font-size buttons to reveal a row of
-   full-width Chinese punctuation marks above the editor — click one to
-   insert it at the cursor. Toggle it off again when you don't need it.
-
-## AI Summary & Translate tab
-
-Runs a local AI model (no account, no API key, nothing to configure) over a
-transcript — fully offline after a one-time model download:
-
-1. Pick a transcribed file from the dropdown, or **Open a file…** (accepts
-   `.txt`/`.docx` transcripts directly, or an audio file whose transcript
-   exists in `output\Transcriptions`).
-2. Choose the mode: **Summarize**, **Translate** (pick a target language from
-   ~20 options), or **Both** (a summary written in the target language).
-3. Pick a quality: Fast / Balanced / Accurate — the first use of each level
-   downloads its AI model (~1.8 / 2.5 / 4.7 GB, one time). SOTA recommends a
-   quality tier based on both your total and currently-free RAM (and checks
-   there's enough free disk space to fit the download): **Accurate** if your
-   free RAM already covers it, or your PC has at least 16 GB installed;
-   **Balanced** for any PC with at least 8 GB (with a note to close other
-   apps first if RAM is tight for it right now); otherwise **Fast**.
-4. Click **Generate** and watch the output stream into the right panel. A
-   copy is **saved automatically** the moment generation finishes (same
-   `.docx`/`.txt` rule as everywhere else) — no extra click needed. You can
-   still edit the text afterward and click **Save copy** again to save an
-   updated version alongside the original.
-
-Each panel (Transcription / AI output) has its own **A- / A+** font size
-buttons, right-aligned on its title row, so you can size them independently.
-Drag the divider between the two panels to resize them to your liking — the
-split is remembered for next time.
-
-Long transcripts are handled automatically (processed in parts); a Cancel
-button stops generation at any point.
 
 ## Settings tab
 
