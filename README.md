@@ -21,9 +21,7 @@ needed and no audio ever leaves your machine.
   fix its transcript, or run a local LLM over a transcript to
   summarize/translate it.
 
-## The tabs
-
-**Audio Studio**
+## Audio Studio
 
 1. **Record** — capture audio straight from the microphone, with live
    markers, a disk-space readout, and safeguards against a recording left
@@ -152,7 +150,7 @@ drinking water or writing on a whiteboard has no vocal content, so it gets
 flagged just like a pause; an incidental sound (a cup clink, a marker
 squeak, a cough) still isn't speech either, so it's flagged too.
 
-**Transcription Studio**
+## Transcription Studio
 
 1. **Transcribe** — drop audio files in, get a transcript for each.
 2. **Live Transcription** — dictate from the microphone; auto-saves when you stop.
@@ -161,7 +159,7 @@ squeak, a cough) still isn't speech either, so it's flagged too.
 4. **AI Summary & Translate** — summarize and/or translate a transcript with a local AI model.
 5. **Settings** — manage downloaded models, pick the output folder, check for updates.
 
-## Transcribe tab
+### Transcribe tab
 
 1. Drag & drop audio files into the window (or click the drop zone to browse).
    Supported: mp3, wav, m4a, flac, ogg, opus, wma, aac and common video files
@@ -192,7 +190,7 @@ Simplified. This applies to both the Transcribe and Live Transcription tabs
 and can be turned off in the Settings tab. Other languages (including
 Japanese) are never touched.
 
-## Live Transcription tab
+### Live Transcription tab
 
 Dictate straight from your microphone instead of recording a file first:
 
@@ -254,7 +252,7 @@ The recording is written to its `.wav` file continuously while you speak
 without eating RAM — and even if the app or the PC dies mid-session,
 everything captured up to that moment is already on disk and playable.
 
-## Edit & Export tab
+### Edit & Export tab
 
 After transcribing (recorded or live), open the **Edit & Export** tab to
 proof-read against the audio:
@@ -286,7 +284,7 @@ proof-read against the audio:
    full-width Chinese punctuation marks above the editor — click one to
    insert it at the cursor. Toggle it off again when you don't need it.
 
-## AI Summary & Translate tab
+### AI Summary & Translate tab
 
 Runs a local AI model (no account, no API key, nothing to configure) over a
 transcript — fully offline after a one-time model download:
@@ -342,7 +340,7 @@ Everything that isn't part of a day-to-day workflow lives here:
   under the Record tab above (duration, free disk space, free RAM), each
   independently editable.
 
-### Interface language
+## Interface language
 
 A toggle in the top-right corner switches the whole app between **English**
 and **Traditional Chinese (繁體中文)**. Your choice is remembered.
