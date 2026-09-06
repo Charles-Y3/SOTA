@@ -85,34 +85,56 @@ def output_base():
     return _output_base
 
 
-# Recorded-file transcripts (Transcribe/Edit/AI tabs) and live-dictation
-# recordings land in separate subfolders — they're different kinds of output
-# and mixing them made the folder confusing to browse once both were in use.
+# Named to match Transcription Studio's own tab-group name (parallel to
+# audio_studio_folder()'s "Audio Studio" below) rather than "Transcriptions"
+# — this is that whole studio's output folder, transcripts included, not
+# a narrower "just transcripts" folder that happens to also hold audio.
 def transcriptions_folder():
-    return os.path.join(_output_base, "Transcriptions")
+    return os.path.join(_output_base, "Transcription Studio")
 
 
 def live_recordings_folder():
-    return os.path.join(_output_base, "Live Recordings")
+    """Live Transcription's own raw audio — nested under
+    transcriptions_folder() (not a sibling of it) since it's always the
+    audio behind one of the transcripts living right alongside it, not a
+    separate kind of output in its own right. Named "Transcription
+    Audio" rather than "Live Recordings" for the same reason: from
+    inside the Transcription Studio folder, "Live Recordings" reads as
+    an unrelated category, while "Transcription Audio" reads as exactly
+    what it is — the audio for these transcripts."""
+    return os.path.join(transcriptions_folder(), "Transcription Audio")
 
 
 # Audio Studio's own recordings/originals live under one "Audio Studio"
-# subfolder, parallel to Transcriptions/Live Recordings above — a
-# different kind of output again (raw/edited audio, not transcripts).
+# subfolder, parallel to Transcription Studio above — a different kind of
+# output again (raw/edited audio, not transcripts).
 def audio_studio_folder():
     return os.path.join(_output_base, "Audio Studio")
 
 
-def audio_recordings_folder():
-    return os.path.join(audio_studio_folder(), "Recordings")
-
-
 def audio_originals_folder():
-    """Protected copies of whatever's opened into Audio Studio's Edit
-    subtab — never overwritten once written, so "Revert to Original"
-    always works no matter how much editing has happened since. See
-    audio_clip.AudioClip.load."""
+    """Where the Record tab saves every recording, AND where Audio
+    Studio's Edit subtab keeps its protected "never overwritten" copies
+    (see audio_clip.AudioClip.load) — deliberately the SAME folder, not
+    two. A freshly recorded file sent straight to Edit ("Open in Edit")
+    used to get copied a second time into a separate Originals folder
+    purely because Edit always makes a protected copy on first open; now
+    that a recording already lands in this exact folder, AudioClip.load's
+    own dedup check (_same_file) recognizes the destination as the same
+    file and skips the copy entirely — no more duplicate storage for the
+    common record-then-edit path. Anything opened into Edit from
+    somewhere else on disk still gets its own protected copy here, same
+    as before."""
     return os.path.join(audio_studio_folder(), "Originals")
+
+
+def audio_recordings_folder():
+    """Same folder as audio_originals_folder() — kept as its own name
+    only because "the Record tab's own output folder" and "Edit's
+    protected-copy folder" are different concepts that happen to share
+    one location now; callers keep asking for whichever concept applies
+    to them."""
+    return audio_originals_folder()
 
 
 def audio_exports_folder():

@@ -31,6 +31,10 @@ needed and no audio ever leaves your machine.
    Markers/AI aren't separate subtabs — they're collapsible panels inside
    Edit, so they always act on the waveform already on screen.
 
+Every time shown anywhere in Audio Studio (the waveform ruler, player
+readouts, marker/pause/match rows) is **HH:MM:SS**, since a recording here
+can easily run well past an hour.
+
 ### Record tab
 
 1. Pick a **microphone** (same device picker as Live Transcription) and set
@@ -141,7 +145,9 @@ batch Transcribe jobs too.
 
 Recordings, exports, and protected original copies (used by **Revert to
 original**) are saved under `output\Audio Studio` — see **Folder layout**
-below.
+below. Recordings and protected originals share one folder: a recording
+opened straight into Edit doesn't get copied a second time, since it's
+already sitting in exactly the folder Edit would otherwise copy it into.
 
 **A note on "no speech detected":** both the No speech panel and the AI
 panel's long-pause detection work the same way — they flag any stretch
@@ -174,7 +180,7 @@ squeak, a cough) still isn't speech either, so it's flagged too.
      else still uses the Fast/Balanced/Accurate model above. The **ⓘ**
      button next to it explains the Whisper/SenseVoice split in plain
      language.
-   - Transcripts always save into `output\Transcriptions` next to the app.
+   - Transcripts always save into `output\Transcription Studio` next to the app.
 3. Click **Transcribe All**. Each file shows its own progress and any file
    that fails won't stop the rest.
 
@@ -215,11 +221,11 @@ Dictate straight from your microphone instead of recording a file first:
    you — if it stays empty while you talk, the wrong (or a muted) device is
    selected.
 3. Click **Stop**. The session is auto-saved: the transcript goes to
-   `output\Transcriptions` (right alongside recorded-file transcripts), and
-   the raw audio recording is saved as a `.wav` in
-   `output\Live Recordings`. The recording is also added to the **Edit &
-   Export** tab's file list automatically, so you can play it back and
-   correct the text right away.
+   `output\Transcription Studio` (right alongside recorded-file transcripts),
+   and the raw audio recording is saved as a `.wav` in
+   `output\Transcription Studio\Transcription Audio`. The recording is also
+   added to the **Edit & Export** tab's file list automatically, so you can
+   play it back and correct the text right away.
 
 During a long session you don't have to wait for Stop: switching to another
 tab no longer stops the recording — it keeps dictating in the background
@@ -259,7 +265,7 @@ proof-read against the audio:
 
 1. Pick a file from the dropdown (or **Open a file…** to load any audio; its
    transcript is found automatically if one exists). The file dialog opens
-   in the `output\Transcriptions` folder by default, since that's usually
+   in the `output\Transcription Studio` folder by default, since that's usually
    where the file you want is.
 2. **Play / Pause / Stop**, scrub with the slider, and change **Speed**
    (0.5×–2×) — uses WSOLA time-stretching (searches for the best-aligned
@@ -276,7 +282,7 @@ proof-read against the audio:
 3. Edit the text — use the **A- / A+** buttons above the editor to resize
    the text — then **Save copy**. If Microsoft Word is installed the copy is
    saved as a `.docx`; otherwise as a `.txt`. Copies are saved in
-   `output\Transcriptions` as `<name> (edited).docx/.txt`, leaving the
+   `output\Transcription Studio` as `<name> (edited).docx/.txt`, leaving the
    original intact. Reopening the file later (including in the AI Summary
    tab) picks up this edited copy rather than the original transcript.
 4. Need punctuation that's awkward to type directly (， 。 「」 《》 etc.)?
@@ -291,7 +297,7 @@ transcript — fully offline after a one-time model download:
 
 1. Pick a transcribed file from the dropdown, or **Open a file…** (accepts
    `.txt`/`.docx` transcripts directly, or an audio file whose transcript
-   exists in `output\Transcriptions`).
+   exists in `output\Transcription Studio`).
 2. Choose the mode: **Summarize**, **Translate** (pick a target language from
    ~20 options), or **Both** (a summary written in the target language).
 3. Pick a quality: Fast / Balanced / Accurate — the first use of each level
@@ -358,14 +364,17 @@ SOTA\
   models\             every downloaded model — whisper, SenseVoice + its
                        voice-activity model, and the local AI (LLM) models
   output\
-    Transcriptions\    every transcript: recorded-file, live-dictation,
+    Transcription Studio\  every transcript: recorded-file, live-dictation,
                        edited copies, and AI summaries/translations
-    Live Recordings\   the raw audio (.wav) captured by the Live
-                       Transcription tab
+      Transcription Audio\  the raw audio (.wav) captured by the Live
+                       Transcription tab — nested here since it's always
+                       the audio behind one of the transcripts alongside it
     Audio Studio\      Audio Studio's own files
-      Recordings\      audio captured by the Record tab
-      Originals\       protected original copies, so "Revert to original"
-                       always works no matter how much editing has happened
+      Originals\       every Record-tab recording, AND Edit's protected
+                       original copies (so "Revert to original" always
+                       works) — one shared folder: a recording opened
+                       straight into Edit is already sitting where its
+                       protected copy would go, so none gets made
       Exports\         WAV/MP3 files exported from the Edit tab
 ```
 

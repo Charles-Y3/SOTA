@@ -125,13 +125,17 @@ class AudioClip:
 
     def revert_to_original(self):
         """Discards every edit made so far, restoring the buffer exactly
-        as it was when first loaded — including clearing markers, since
-        the original recording never had any. Still undoable — this is
-        itself just another buffer replacement on the same stack."""
+        as it was when first loaded. Markers are left untouched —
+        they're time annotations independent of the audio content, not
+        an edit to discard, and can already be present at load time
+        (e.g. live markers dropped while recording, carried straight
+        into this clip — see app.py's _open_audio_clip), so clearing
+        them here would delete exactly the markers most worth keeping.
+        Still undoable — this is itself just another buffer replacement
+        on the same stack."""
         if not self.original_path or not os.path.isfile(self.original_path):
             return False
         before = self._markers_copy()
-        self.markers = []
         self.apply(decode_to_buffer(self.original_path, self.sample_rate), markers_before=before)
         return True
 

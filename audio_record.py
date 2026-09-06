@@ -34,6 +34,46 @@ def _rms(audio):
     return float(np.sqrt(np.mean(audio.astype("float64") ** 2)))
 
 
+def extract_wav_segment(src_path, start_s, end_s, dest_path):
+    """Copies [start_s, end_s) of src_path's audio into a brand-new WAV
+    file at dest_path, same channels/sample width/rate — a raw frame-
+    range copy, no decode or resample involved (unlike audio_clip's own
+    load path, which always decodes to mono float32 at CLIP_SAMPLE_RATE).
+
+    Works directly on a WAV a recorder thread is STILL actively
+    appending to (Partial Save, in app.py) — safe because it only ever
+    reads up to `end_s`, and by construction that's always audio from
+    strictly before "now" (both endpoints come from markers already
+    dropped in the past), so it's already been through a flush by the
+    time this runs; a plain read-mode file handle doesn't conflict with
+    the writer thread's separate handle. `end_s` is clamped to whatever
+    the file's own header currently declares — itself patched on every
+    flush (see AudioRecorder's class docstring) — so this can never try
+    to read past what's actually been written."""
+    import wave
+
+    with wave.open(src_path, "rb") as src:
+        framerate = src.getframerate()
+        channels = src.getnchannels()
+        sampwidth = src.getsampwidth()
+        total_frames = src.getnframes()
+        start_frame = max(0, min(total_frames, int(round(start_s * framerate))))
+        end_frame = max(0, min(total_frames, int(round(end_s * framerate))))
+        if end_frame <= start_frame:
+            raise ValueError("Empty or out-of-range segment")
+        src.setpos(start_frame)
+        frames = src.readframes(end_frame - start_frame)
+
+    folder = os.path.dirname(dest_path)
+    if folder:
+        os.makedirs(folder, exist_ok=True)
+    with wave.open(dest_path, "wb") as dst:
+        dst.setnchannels(channels)
+        dst.setsampwidth(sampwidth)
+        dst.setframerate(framerate)
+        dst.writeframes(frames)
+
+
 def _pack_pcm24(audio):
     """Packs a float32 array (range ~[-1, 1]) as little-endian signed
     24-bit PCM bytes. numpy has no native int24 dtype, so scale into the
@@ -195,6 +235,16 @@ class AudioRecorder(threading.Thread):
         with self._lock:
             samples = self._recorded_samples
         return samples / self.sample_rate if self.sample_rate else 0.0
+
+    @property
+    def audio_path(self):
+        """The WAV file this recorder is writing to, or None before
+        _open_wav has run. Assigned once early in run() (before
+        "record_started" is even emitted) and never reassigned after, so
+        reading it from the UI thread needs no lock — used by Partial
+        Save to read back already-flushed audio while recording keeps
+        going, without touching this recorder object at all."""
+        return self._audio_path
 
     def _emit(self, *event):
         self.events.put(event)

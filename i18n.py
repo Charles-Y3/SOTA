@@ -309,6 +309,23 @@ STRINGS = {
                         " speaker turn. Carried over when you send the"
                         " recording to Edit, where each marker's span can"
                         " be renamed and saved as its own file.",
+        "arec_partial_save_button": "Partial Save",
+        "arec_tip_partial_save": "Exports the audio between two markers as"
+                                 " its own file, right now — while this"
+                                 " recording keeps going uninterrupted."
+                                 " Needs at least 2 markers dropped first.",
+        "arec_partial_save_title": "Partial Save",
+        "arec_partial_save_hint": "Pick two markers — everything between"
+                                  " them is saved as its own file, opened"
+                                  " in Edit right after. The main recording"
+                                  " is not paused or interrupted.",
+        "arec_partial_save_from": "From:",
+        "arec_partial_save_to": "To:",
+        "arec_partial_save_same_marker": "\"From\" and \"To\" can't be the same marker.",
+        "arec_partial_save_bad_range": "\"To\" must come after \"From\" — pick a different pair.",
+        "arec_partial_save_saving": "Saving segment…",
+        "arec_partial_save_saved": "Saved {path} — opening in Edit…",
+        "arec_partial_save_failed": "Partial save failed — see sota.log for details.",
         "arec_edit_button": "Open in Edit",
         "arec_space_label": "This recording so far: {used}    ·    Free space on this drive: {free}",
         "arec_status_recording": "Recording…",
@@ -349,6 +366,23 @@ STRINGS = {
         "aedit_file_status": "{name} · {duration}",
         "aedit_open_dialog": "Open an audio file to edit",
         "aedit_open_button": "Open a file…",
+        "aedit_shortcuts_button": "⌨ Keyboard Shortcuts",
+        "aedit_shortcuts_title": "Keyboard Shortcuts",
+        "aedit_shortcuts_hint": "Audio Studio's Edit tab only — these don't do"
+                               " anything while a text field elsewhere has focus.",
+        "aedit_shortcut_play": "Play / Pause",
+        "aedit_shortcut_undo": "Undo",
+        "aedit_shortcut_redo": "Redo",
+        "aedit_shortcut_cut": "Cut the current selection",
+        "aedit_shortcut_copy": "Copy the current selection",
+        "aedit_shortcut_paste": "Paste at the selection start, or the playhead",
+        "aedit_shortcut_delete": "Delete (cut without copying) the current selection",
+        "aedit_shortcut_zoom_out": "Zoom out",
+        "aedit_shortcut_zoom_in": "Zoom in",
+        "aedit_shortcut_find": "Find similar… (needs a selection)",
+        "aedit_shortcut_home": "Jump to the start",
+        "aedit_shortcut_end": "Jump to the end",
+        "aedit_shortcut_save": "Export as WAV",
         "aedit_no_file": "No audio file open.",
         "aedit_zoom_fit": "Fit",
         "aedit_cut_button": "Cut",
@@ -965,6 +999,21 @@ STRINGS = {
         "arec_tip_mark": "在錄音目前位置加上一個帶標籤的標記，且不會中斷錄音"
                         "（例如每次換人說話時標記一次）。傳送錄音至「編輯」時"
                         "會一併帶過去，之後可為每個標記區段重新命名並個別存檔。",
+        "arec_partial_save_button": "部分存檔",
+        "arec_tip_partial_save": "將兩個標記之間的音訊立即另存為一個檔案"
+                                 "——同時本次錄音會持續進行、不受影響。"
+                                 "需要先加入至少 2 個標記。",
+        "arec_partial_save_title": "部分存檔",
+        "arec_partial_save_hint": "選擇兩個標記——兩者之間的所有音訊將另存為"
+                                  "一個檔案，儲存後立即在「編輯」中開啟。"
+                                  "主錄音不會暫停或中斷。",
+        "arec_partial_save_from": "從：",
+        "arec_partial_save_to": "到：",
+        "arec_partial_save_same_marker": "「從」與「到」不能是同一個標記。",
+        "arec_partial_save_bad_range": "「到」必須晚於「從」——請選擇另一組標記。",
+        "arec_partial_save_saving": "正在儲存區段…",
+        "arec_partial_save_saved": "已儲存 {path} — 正在於編輯中開啟…",
+        "arec_partial_save_failed": "部分存檔失敗 — 詳情請見 sota.log。",
         "arec_edit_button": "在編輯中開啟",
         "arec_space_label": "此錄音目前大小：{used}    ·    此磁碟機可用空間：{free}",
         "arec_status_recording": "錄音中…",
@@ -1000,6 +1049,23 @@ STRINGS = {
         "aedit_file_status": "{name} · {duration}",
         "aedit_open_dialog": "開啟音訊檔案以進行編輯",
         "aedit_open_button": "開啟檔案…",
+        "aedit_shortcuts_button": "⌨ 鍵盤快捷鍵",
+        "aedit_shortcuts_title": "鍵盤快捷鍵",
+        "aedit_shortcuts_hint": "僅適用於「音訊工作室」的編輯分頁"
+                               "——當其他文字欄位取得焦點時不會作用。",
+        "aedit_shortcut_play": "播放／暫停",
+        "aedit_shortcut_undo": "復原",
+        "aedit_shortcut_redo": "重做",
+        "aedit_shortcut_cut": "剪下目前選取範圍",
+        "aedit_shortcut_copy": "複製目前選取範圍",
+        "aedit_shortcut_paste": "貼到選取範圍起點，或播放位置",
+        "aedit_shortcut_delete": "刪除（剪下但不複製）目前選取範圍",
+        "aedit_shortcut_zoom_out": "縮小",
+        "aedit_shortcut_zoom_in": "放大",
+        "aedit_shortcut_find": "尋找相似片段…（需要先選取範圍）",
+        "aedit_shortcut_home": "跳至開頭",
+        "aedit_shortcut_end": "跳至結尾",
+        "aedit_shortcut_save": "匯出為 WAV",
         "aedit_no_file": "尚未開啟音訊檔案。",
         "aedit_zoom_fit": "符合視窗",
         "aedit_cut_button": "剪下",

@@ -47,10 +47,13 @@ llm.py already use:
     ("live_stopped",)                         -> recording has fully wound down
 
 The raw recording (WAV) and its transcript (.docx/.txt) are saved to
-different folders — settings.live_recordings_folder() and
-settings.transcriptions_folder() respectively — so every transcript, whether
-from a recorded file or a live session, lives in one place, while the
-Live tab's actual audio recordings get their own.
+different folders — settings.live_recordings_folder() (a "Transcription
+Audio" subfolder nested under settings.transcriptions_folder(), since
+it's always the audio behind one of the transcripts sitting right next
+to it) and settings.transcriptions_folder() itself respectively — so
+every transcript, whether from a recorded file or a live session, lives
+in one place, with its own audio right alongside it rather than in an
+unrelated top-level folder.
 """
 
 import datetime

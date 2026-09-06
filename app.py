@@ -263,8 +263,10 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         # waveform/timeline is double-clicked (_reset_arec_zoom).
         self.arec_following = True
         self.arec_span = self.DEFAULT_LIVE_SPAN_S
+        self._arec_span_manual = False  # True once the user zooms — see _arec_visible_window
         self.arec_window = (0.0, 0.0)
         self.arec_vzoom = 1.0
+        self._arec_last_used_bytes = 0.0  # see _update_arec_space_label
         # Persistent canvas item ids for the waveform (reused via
         # canvas.coords()/itemconfigure() across redraws instead of
         # delete+recreate every tick — see _redraw_record_waveform) and
@@ -744,6 +746,20 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
             state="disabled", command=self._add_live_recording_marker)
         self.arec_mark_button.grid(row=0, column=3, padx=(8, 0))
         self._add_tooltip(self.arec_mark_button, lambda: i18n.t(self.ui_lang, "arec_tip_mark"))
+        # Exports the span between two markers as its own file WHILE the
+        # recording keeps going, uninterrupted — reads back from the
+        # WAV this recorder is still actively appending to (see
+        # audio_record.extract_wav_segment), never touching the
+        # AudioRecorder object itself. Needs at least 2 markers to
+        # define a span, so it starts disabled and toggles alongside
+        # _add_live_recording_marker/_start_audio_record/_stop_audio_record.
+        self.arec_partial_save_button = ctk.CTkButton(
+            controls, text="", height=40, width=130, fg_color="transparent",
+            text_color=self.OUTLINE_BUTTON_TEXT, border_width=1,
+            state="disabled", command=self._show_partial_save_dialog)
+        self.arec_partial_save_button.grid(row=0, column=4, padx=(8, 0))
+        self._add_tooltip(
+            self.arec_partial_save_button, lambda: i18n.t(self.ui_lang, "arec_tip_partial_save"))
 
         # Live waveform — grows as the recording proceeds, drawn from
         # AudioRecorder.peaks_snapshot() (updated by _tick_player while
@@ -846,12 +862,18 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         return sample_rate * (bit_depth // 8) * channels
 
     def _update_arec_space_label(self):
-        """0 bytes used while idle (no recording in progress yet) — still
-        shown so the free-space half is visible before Start is ever
-        pressed, not only once a recording exists."""
-        used_bytes = 0.0
+        """Shows the LAST known used-bytes figure even after the
+        recorder itself is gone (self.audio_recorder is None once
+        stopped) — self._arec_last_used_bytes is only ever reset to 0 by
+        _start_audio_record, a fresh recording actually starting.
+        Without this, stopping reset the figure straight back to 0 MB
+        even though the just-finished recording (and its waveform) is
+        still sitting right there on screen — it hadn't actually shrunk,
+        the label was just re-deriving "used so far" from a recorder
+        object that no longer existed to ask."""
         if self.audio_recorder is not None:
-            used_bytes = self.audio_recorder.elapsed_seconds * self._arec_bytes_per_second()
+            self._arec_last_used_bytes = self.audio_recorder.elapsed_seconds * self._arec_bytes_per_second()
+        used_bytes = self._arec_last_used_bytes
         free_gb = sysinfo.free_disk_gb(settings.audio_recordings_folder())
         free_str = _fmt_size(free_gb * 1024 ** 3) if free_gb is not None else "?"
         self.arec_space_label.configure(text=i18n.t(
@@ -882,13 +904,16 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         self.audio_recording = True
         self.arec_following = True     # fresh recording — back to the live edge
         self.arec_span = self.DEFAULT_LIVE_SPAN_S
+        self._arec_span_manual = False  # fresh recording — auto-fit (0, now) again by default
         self.arec_vzoom = 1.0
+        self._arec_last_used_bytes = 0.0  # a new recording starts over at 0, not the last one's total
         self.arec_clip_label.configure(text="")
         self._arec_markers = []
         self.arec_start_button.configure(state="disabled")
         self.arec_pause_button.configure(state="normal", text=i18n.t(self.ui_lang, "arec_pause"))
         self.arec_stop_button.configure(state="normal")
         self.arec_mark_button.configure(state="normal")
+        self.arec_partial_save_button.configure(state="disabled")  # needs 2+ markers first
         self.arec_test_mic_button.configure(state="disabled")
         for w in (self.arec_mic_menu, self.arec_rate_menu, self.arec_channels_menu,
                   self.arec_bitdepth_menu, self.arec_format_menu, self.arec_filename_entry):
@@ -914,6 +939,15 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         self.arec_stop_button.configure(state="disabled")
         self.arec_pause_button.configure(state="disabled")
         self.arec_mark_button.configure(state="disabled")
+        # Only briefly disabled — the recorder is about to close its file
+        # (and possibly re-encode to MP3), so there's a short async gap
+        # with no safe path to read yet. _finish_audio_record_save
+        # re-enables it once the finished file is confirmed, using THAT
+        # file as Partial Save's source from then on — Partial Save isn't
+        # tied to the recording being active, only to having 2+ markers
+        # and a real file to read from (live, paused, or already stopped
+        # all count).
+        self.arec_partial_save_button.configure(state="disabled")
 
     def _add_live_recording_marker(self):
         """Prompts for a short label (e.g. a speaker's name) and records
@@ -936,6 +970,146 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         # visible window itself moves) — otherwise a marker added while
         # the view isn't currently scrolling wouldn't appear until it did.
         self._redraw_arec_timeline()
+        if len(self._arec_markers) >= 2:
+            self.arec_partial_save_button.configure(state="normal")
+
+    def _arec_partial_save_source_path(self):
+        """The file Partial Save should read from right now: the live
+        in-progress WAV while a recording is active OR paused (pausing
+        doesn't close the file, so it stays just as valid a source), or
+        the finished file from THIS session's just-stopped recording
+        once _finish_audio_record_save has confirmed it. Deliberately
+        checks the live recorder FIRST — during a fresh recording,
+        self._last_recording_path may still hold a stale path from a
+        PREVIOUS session until this one has its own 2+ markers and gets
+        stopped, and that stale file must never be read from instead."""
+        if self.audio_recorder is not None and self.audio_recorder.audio_path:
+            return self.audio_recorder.audio_path
+        return self._last_recording_path
+
+    def _show_partial_save_dialog(self):
+        """Lets the user pick any two of the markers dropped so far and
+        export just the span between them as its own file — without
+        pausing or stopping the recording (see _do_partial_save). Works
+        equally while recording, paused, or already stopped, as long as
+        there's a real file to read from and at least 2 markers. Defaults
+        to the most recently dropped pair, since "the turn that just
+        finished" is the most likely thing to want right now.
+
+        Options are prefixed with their own 1-based position ("1. …",
+        "2. …") rather than matched back to a marker by their displayed
+        text — two markers can otherwise show identically (same second,
+        same label), which would make a plain text-to-index lookup
+        silently resolve to whichever one happened to come first,
+        regardless of which entry was actually picked."""
+        if not self._arec_partial_save_source_path() or len(self._arec_markers) < 2:
+            return
+        markers = list(self._arec_markers)
+        options = [f"{i + 1}. {_fmt_hms(m['time'])} – {m['label']}" for i, m in enumerate(markers)]
+        t = lambda k, **kw: i18n.t(self.ui_lang, k, **kw)  # noqa: E731
+
+        def option_index(value):
+            return int(value.split(".", 1)[0]) - 1
+
+        dlg = ctk.CTkToplevel(self)
+        dlg.title(t("arec_partial_save_title"))
+        dlg.resizable(False, False)
+        dlg.transient(self)
+        ctk.CTkLabel(
+            dlg, text=t("arec_partial_save_hint"), anchor="w", text_color=self.MUTED_TEXT,
+            wraplength=380, justify="left",
+        ).grid(row=0, column=0, columnspan=2, sticky="ew", padx=20, pady=(18, 10))
+        ctk.CTkLabel(dlg, text=t("arec_partial_save_from")).grid(
+            row=1, column=0, sticky="w", padx=(20, 8), pady=6)
+        from_menu = ctk.CTkOptionMenu(dlg, width=260, values=options)
+        from_menu.set(options[-2])
+        from_menu.grid(row=1, column=1, sticky="w", padx=(0, 20), pady=6)
+        ctk.CTkLabel(dlg, text=t("arec_partial_save_to")).grid(
+            row=2, column=0, sticky="w", padx=(20, 8), pady=6)
+        to_menu = ctk.CTkOptionMenu(dlg, width=260, values=options)
+        to_menu.set(options[-1])
+        to_menu.grid(row=2, column=1, sticky="w", padx=(0, 20), pady=6)
+        status_label = ctk.CTkLabel(
+            dlg, text="", text_color="#e05a5a", wraplength=380, justify="left")
+        status_label.grid(row=3, column=0, columnspan=2, sticky="ew", padx=20, pady=(4, 0))
+
+        def do_save():
+            from_idx = option_index(from_menu.get())
+            to_idx = option_index(to_menu.get())
+            if from_idx == to_idx:
+                status_label.configure(text=t("arec_partial_save_same_marker"))
+                return
+            start_t, end_t = markers[from_idx]["time"], markers[to_idx]["time"]
+            if end_t <= start_t:
+                status_label.configure(text=t("arec_partial_save_bad_range"))
+                return
+            dlg.destroy()
+            self._do_partial_save(start_t, end_t, markers[from_idx]["label"], markers[to_idx]["label"])
+
+        btn_row = ctk.CTkFrame(dlg, fg_color="transparent")
+        btn_row.grid(row=4, column=0, columnspan=2, pady=(14, 18))
+        ctk.CTkButton(btn_row, text=t("arec_partial_save_button"), command=do_save).grid(
+            row=0, column=0, padx=(0, 8))
+        ctk.CTkButton(
+            btn_row, text=t("aai_filler_words_close_button"), fg_color="transparent",
+            text_color=self.OUTLINE_BUTTON_TEXT, border_width=1, command=dlg.destroy,
+        ).grid(row=0, column=1)
+        dlg.update_idletasks()
+        x = self.winfo_rootx() + (self.winfo_width() - dlg.winfo_width()) // 2
+        y = self.winfo_rooty() + (self.winfo_height() - dlg.winfo_height()) // 2
+        dlg.geometry(f"+{max(0, x)}+{max(0, y)}")
+        dlg.grab_set()
+
+    def _do_partial_save(self, start_s, end_s, from_label, to_label):
+        """Exports [start_s, end_s) as a brand-new file, reading from
+        whatever _arec_partial_save_source_path returns — the recorder's
+        own in-progress WAV (recording or paused) or the just-finished
+        file (already stopped) — never touching the AudioRecorder object
+        or its mic stream, so an ongoing recording is completely
+        unaffected and keeps running regardless of which case this is.
+
+        Takes the fast, no-decode path (audio_record.extract_wav_segment,
+        a raw frame-range copy) when the source is itself a WAV — true
+        for every in-progress or WAV-format-finished recording. Falls
+        back to decoding (audio_clip.decode_to_buffer, same as opening
+        any file into the Edit tab normally does) only when the finished
+        recording was saved as MP3, since wave can't read that directly —
+        the exported segment then lands at the Edit tab's own standard
+        44.1kHz, same as any other opened file, rather than trying to
+        preserve MP3's own encoded rate exactly.
+
+        Opens the result straight into the Edit tab once saved, same as
+        "Open in Edit" does for a finished recording — switching tabs
+        doesn't stop the recording either (see _show_tab's own
+        docstring)."""
+        src_path = self._arec_partial_save_source_path()
+        if not src_path:
+            return
+        stem = (f"{self._sanitize_segment_filename(from_label)}"
+               f" - {self._sanitize_segment_filename(to_label)}")
+        dest_path = transcriber.unique_path(os.path.join(settings.audio_exports_folder(), f"{stem}.wav"))
+        is_wav = os.path.splitext(src_path)[1].lower() == ".wav"
+
+        def work():
+            if is_wav:
+                audio_record.extract_wav_segment(src_path, start_s, end_s, dest_path)
+            else:
+                buffer = audio_clip.decode_to_buffer(src_path)
+                i0 = max(0, int(round(start_s * audio_clip.CLIP_SAMPLE_RATE)))
+                i1 = min(len(buffer), int(round(end_s * audio_clip.CLIP_SAMPLE_RATE)))
+                audio_clip.write_wav(dest_path, buffer[i0:i1])
+            return dest_path
+
+        def done(result, error):
+            if error is not None:  # already logged by _run_busy itself
+                self._set_audio_record_status("arec_partial_save_failed", {})
+                return
+            self._set_audio_record_status(
+                "arec_partial_save_saved", {"path": os.path.basename(result)})
+            self._open_audio_clip(result)
+            self._show_tab(self.LEAF_AUDIO_EDIT)
+
+        self._run_busy("arec_partial_save_saving", work, done)
 
     def _on_audio_record_event(self, kind, *rest):
         if kind == "record_stopped":
@@ -989,6 +1163,13 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
     def _finish_audio_record_save(self, path, clipped):
         self._last_recording_path = path
         self.arec_edit_button.configure(state="normal")
+        if len(self._arec_markers) >= 2:
+            # Re-enables Partial Save now that there's a real finished
+            # file to read from again (see _stop_audio_record's comment
+            # on why it was briefly disabled) — markers survive Stop
+            # untouched, so a still-≥2 set from the just-finished
+            # recording keeps working exactly as it did while recording.
+            self.arec_partial_save_button.configure(state="normal")
         status_key = "arec_status_saved_clipped" if clipped else "arec_status_saved"
         self._set_audio_record_status(status_key, {"path": os.path.basename(path)})
 
@@ -1045,15 +1226,23 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         return len(mins) * audio_record.AudioRecorder.PEAK_WINDOW_S
 
     def _arec_visible_window(self):
-        """(start_s, end_s) currently on screen. Following: a FIXED
-        arec_span seconds wide, end pinned to "now" — the live edge
-        scrolls the window forward at a constant scale, rather than
-        rescaling everything drawn so far the way an always-"0..now" auto
-        -fit would (that reads as the waveform continuously shrinking/
-        resizing, not how a live meter/strip-chart recorder looks). Not
+        """(start_s, end_s) currently on screen. Following AND the user
+        hasn't manually zoomed yet (_arec_span_manual False, the default
+        for a fresh recording): always (0, now) — the beginning stays on
+        screen no matter how long the recording runs, rescaling as it
+        grows, same as the Edit tab's own "zoom to fit" view of a
+        finished clip. Following WITH a manual zoom: a fixed arec_span-
+        wide window, end pinned to "now" — the live edge scrolls forward
+        at that chosen scale (this is what used to be the only behavior,
+        and why the start used to scroll out of view and stay gone —
+        losing the beginning is a reasonable trade a user makes by
+        explicitly zooming in for more temporal detail near the live
+        edge, but wasn't reasonable as the unrequested default). Not
         following: the explicit frozen arec_window from the last pan."""
         full = self._arec_full_duration()
         if self.arec_following:
+            if not self._arec_span_manual:
+                return 0.0, full
             end = full
             return max(0.0, end - self.arec_span), end
         start, end = self.arec_window
@@ -1088,6 +1277,7 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         span = max(0.05, (end - start) * factor)
         span = min(span, full) if full else span
         self.arec_span = span
+        self._arec_span_manual = True  # a deliberate zoom — see _arec_visible_window
         if self.arec_following:
             self._redraw_record_waveform()
             return
@@ -1176,20 +1366,22 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
             t += interval
 
         # Live markers (see _add_live_recording_marker) drawn as small
-        # numbered flags — same flag+guide-line visual as the Edit tab's
-        # marker lane (_redraw_marker_lane), just sharing this thin ruler
-        # rather than a dedicated row of its own (Record has no spare
-        # vertical space for one), and a plain index number rather than
-        # the full label — this strip is too short for real text without
-        # colliding with the time ticks above it.
+        # flags with their actual label — same flag+guide-line+label
+        # visual as the Edit tab's marker lane (_redraw_marker_lane),
+        # just sharing this thin ruler rather than a dedicated row of its
+        # own (Record has no spare vertical space for one). Labels can
+        # visually collide with the time ticks above them at a crowded
+        # zoom level — an accepted trade-off, since a plain index number
+        # (an earlier version of this) meant you couldn't tell markers
+        # apart at a glance the way Edit's own marker lane lets you.
         marker_color = self.EFFECT_PANEL_ACCENT
-        for i, m in enumerate(self._arec_markers):
+        for m in self._arec_markers:
             if not (start <= m["time"] <= end):
                 continue
             x = (m["time"] - start) / span * width
             canvas.create_line(x, 9, x, height, fill=marker_color)
             canvas.create_polygon(x, 9, x + 6, 12, x, 15, fill=marker_color, outline=marker_color)
-            canvas.create_text(x + 8, 9, anchor="nw", text=str(i + 1),
+            canvas.create_text(x + 8, 9, anchor="nw", text=m["label"],
                                fill=marker_color, font=("Segoe UI", 8))
 
     def _redraw_arec_db_axis(self, height):
@@ -1358,6 +1550,11 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         # row instead of costing its own strip of height.
         self.aedit_dirty_label = ctk.CTkLabel(picker, text="", anchor="w", text_color="#e05a5a")
         self.aedit_dirty_label.grid(row=0, column=2, sticky="w", pady=10)
+        self.aedit_shortcuts_button = ctk.CTkButton(
+            picker, text="", width=150, fg_color="transparent",
+            text_color=self.OUTLINE_BUTTON_TEXT, border_width=1,
+            command=self._show_shortcuts_dialog)
+        self.aedit_shortcuts_button.grid(row=0, column=3, sticky="e", padx=(0, 10), pady=10)
 
         transport = ctk.CTkFrame(parent)
         transport.grid(row=1, column=0, sticky="ew", padx=12, pady=6)
@@ -1667,6 +1864,61 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
             accent.configure(fg_color=self.EFFECT_PANEL_ACCENT if active else "transparent")
 
     # -- clip loading -------------------------------------------------------
+
+    # (key label, i18n key describing what it does) — every shortcut
+    # actually bound for the Audio Studio Edit subtab (see the
+    # bind_all(...) list in __init__); kept as one list so the popup and
+    # the real bindings can't quietly drift apart from each other.
+    AEDIT_SHORTCUTS = [
+        ("Space", "aedit_shortcut_play"),
+        ("Ctrl+Z", "aedit_shortcut_undo"),
+        ("Ctrl+Y", "aedit_shortcut_redo"),
+        ("Ctrl+X", "aedit_shortcut_cut"),
+        ("Ctrl+C", "aedit_shortcut_copy"),
+        ("Ctrl+V", "aedit_shortcut_paste"),
+        ("Delete / Backspace", "aedit_shortcut_delete"),
+        ("[", "aedit_shortcut_zoom_out"),
+        ("]", "aedit_shortcut_zoom_in"),
+        ("Ctrl+F", "aedit_shortcut_find"),
+        ("Home", "aedit_shortcut_home"),
+        ("End", "aedit_shortcut_end"),
+        ("Ctrl+S", "aedit_shortcut_save"),
+    ]
+
+    def _show_shortcuts_dialog(self):
+        t = lambda k, **kw: i18n.t(self.ui_lang, k, **kw)  # noqa: E731
+        dlg = ctk.CTkToplevel(self)
+        dlg.title(t("aedit_shortcuts_title"))
+        dlg.resizable(False, False)
+        dlg.transient(self)
+        ctk.CTkLabel(
+            dlg, text=t("aedit_shortcuts_title"), font=ctk.CTkFont(size=15, weight="bold")
+        ).grid(row=0, column=0, columnspan=2, sticky="w", padx=20, pady=(18, 4))
+        ctk.CTkLabel(
+            dlg, text=t("aedit_shortcuts_hint"), anchor="w", text_color=self.MUTED_TEXT,
+            wraplength=420, justify="left",
+        ).grid(row=1, column=0, columnspan=2, sticky="ew", padx=20, pady=(0, 12))
+        for i, (keys, desc_key) in enumerate(self.AEDIT_SHORTCUTS, start=2):
+            ctk.CTkLabel(
+                dlg, text=keys, anchor="w", font=ctk.CTkFont(weight="bold"), width=150,
+            ).grid(row=i, column=0, sticky="w", padx=(20, 10), pady=3)
+            ctk.CTkLabel(
+                dlg, text=t(desc_key), anchor="w", justify="left", wraplength=280,
+            ).grid(row=i, column=1, sticky="w", padx=(0, 20), pady=3)
+        close_row = len(self.AEDIT_SHORTCUTS) + 2
+        ctk.CTkButton(
+            dlg, text=t("aai_filler_words_close_button"), command=dlg.destroy,
+        ).grid(row=close_row, column=0, columnspan=2, pady=(14, 18))
+        dlg.update_idletasks()
+        # Centered on the SCREEN, not the app window (every other dialog
+        # in Audio Studio centers on the window instead) — this one's
+        # reachable from anywhere and long enough to want the actual
+        # middle of the display, regardless of where the app window
+        # itself happens to be sitting or how large it currently is.
+        x = (dlg.winfo_screenwidth() - dlg.winfo_width()) // 2
+        y = (dlg.winfo_screenheight() - dlg.winfo_height()) // 2
+        dlg.geometry(f"+{max(0, x)}+{max(0, y)}")
+        dlg.grab_set()
 
     def _open_audio_clip_dialog(self):
         path = filedialog.askopenfilename(
@@ -2336,9 +2588,17 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         self._set_audio_edit_controls_enabled(True)
 
     def _audio_edit_paste(self):
+        """Pastes at the current SELECTION's start if there is one, else
+        at the playhead — never at the clip's end. A plain click (not a
+        drag) on the waveform clears audio_selection and moves the
+        playhead instead (see _on_wave_release), which used to fall
+        through to "paste at the very end" here — so clicking anywhere
+        to choose where to paste, rather than dragging a fresh selection,
+        always sent the paste to the end regardless of where you clicked.
+        Matches _audio_edit_insert_silence's own fallback."""
         if not self.audio_clip or self.audio_clipboard is None:
             return
-        at = self.audio_selection[0] if self.audio_selection else self.audio_clip.duration
+        at = self.audio_selection[0] if self.audio_selection else self.audio_player.get_time()
         self.audio_clip.paste(at, self.audio_clipboard)
         self._after_audio_edit()
 
@@ -2408,6 +2668,15 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         if self.audio_clip is None:
             return
         base = os.path.splitext(os.path.basename(self.audio_clip_path or "clip"))[0]
+        if self.audio_clip.dirty:
+            # dirty means "differs from what was last exported (or from
+            # the source, if never exported)" — i.e. real edits have been
+            # applied since. An untouched file exported as-is (just a
+            # format conversion, say) keeps its original name; only audio
+            # that's actually been changed gets flagged as such in the
+            # filename, so it's never confused with the original in the
+            # Exports folder.
+            base += "_edited"
         folder = settings.audio_exports_folder()
         path = transcriber.unique_path(os.path.join(folder, f"{base}.{fmt}"))
         buffer, sample_rate = self.audio_clip.buffer, self.audio_clip.sample_rate
@@ -4695,6 +4964,7 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
             "arec_resume" if (self.audio_recorder and self.audio_recorder.is_paused) else "arec_pause"))
         self.arec_stop_button.configure(text=t("arec_stop_button"))
         self.arec_mark_button.configure(text=t("arec_mark_button"))
+        self.arec_partial_save_button.configure(text=t("arec_partial_save_button"))
         self._update_arec_space_label()
         self.arec_edit_button.configure(text=t("arec_edit_button"))
         self.arec_open_folder_button.configure(text=t("open_output_folder"))
@@ -4704,6 +4974,7 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
                 text=t(self.audio_record_status_key, **(self.audio_record_status_detail or {})))
 
         self.aedit_open_button.configure(text=t("aedit_open_button"))
+        self.aedit_shortcuts_button.configure(text=t("aedit_shortcuts_button"))
         if self.audio_clip is None:
             self.aedit_file_label.configure(text=t("aedit_no_file"))
         self._render_audio_edit_play_button()
@@ -7661,9 +7932,9 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         self._load_edit_entry(entry)
 
     def _open_dialog_initialdir(self):
-        """Start 'Open file' dialogs in the Transcriptions folder — transcripts
-        and exported copies all end up there, so it's usually where the file
-        the user wants to reopen already is."""
+        """Start 'Open file' dialogs in the Transcription Studio folder —
+        transcripts and exported copies all end up there, so it's usually
+        where the file the user wants to reopen already is."""
         folder = settings.transcriptions_folder()
         return folder if os.path.isdir(folder) else None
 
