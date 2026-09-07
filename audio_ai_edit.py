@@ -44,14 +44,20 @@ AI_EDIT_WHISPER_SIZE = "base"
 # "sort of") — filler_word_ranges below matches the longest configured
 # phrase first at each position, so a 2-word entry like "you know" isn't
 # missed just because "you" alone happens to also be a match target
-# elsewhere. English-only for now (matches the detector's word-level
-# transcription, which is English-only itself). This is only the
-# fallback if prefs somehow has no list at all (shouldn't normally
-# happen — settings.DEFAULTS carries the same list) — the list a user
-# actually edits via the AI panel's "Filler Words…" button lives in
-# settings (key "ai_filler_words"), read fresh by current_filler_words()
-# on every analysis rather than cached, so an edit takes effect on the
-# very next Analyze without needing to reload anything.
+# elsewhere. These defaults are English, but the detector itself isn't
+# English-only — AI_EDIT_WHISPER_SIZE ("base") is faster_whisper's
+# multilingual checkpoint, not "base.en", so it transcribes (and
+# repetition_ranges already flags repeats in) whatever language was
+# actually spoken. A user who adds filler words/phrases in another
+# language via the AI panel's "Filler Words…" button gets them detected
+# exactly the same way — it's plain text matching against the
+# transcript, with no English-specific logic anywhere in this module.
+# This particular list is only the fallback if prefs somehow has no list
+# at all (shouldn't normally happen — settings.DEFAULTS carries the same
+# list) — the list a user actually edits lives in settings (key
+# "ai_filler_words"), read fresh by current_filler_words() on every
+# analysis rather than cached, so an edit takes effect on the very next
+# Analyze without needing to reload anything.
 DEFAULT_FILLER_WORDS = ["um", "uh", "erm", "hmm", "uhh", "umm", "mm", "ah", "aah", "er",
                        "you know", "i mean", "sort of", "kind of"]
 

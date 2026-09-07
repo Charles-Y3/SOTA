@@ -405,6 +405,8 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
             ("<Home>", lambda: self._seek_audio_edit_to(0.0)),
             ("<End>", lambda: self._seek_audio_edit_to(
                 self.audio_clip.duration if self.audio_clip else 0.0)),
+            ("<Control-Right>", self._jump_to_next_marker),
+            ("<Control-Left>", self._jump_to_previous_marker),
             ("<Control-s>", lambda: self._export_audio_clip("wav")),
         ]:
             self.bind_all(_seq, self._guarded_shortcut(_handler))
@@ -694,7 +696,7 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         self.arec_format_label = ctk.CTkLabel(format_card, text="")
         self.arec_format_label.grid(row=1, column=6, sticky="w", padx=(0, 6), pady=(2, 10))
         self.arec_format_menu = ctk.CTkOptionMenu(format_card, width=80, values=["WAV", "MP3"])
-        self.arec_format_menu.set("WAV")
+        self.arec_format_menu.set("MP3")
         self.arec_format_menu.grid(row=1, column=7, sticky="w", padx=(0, 12), pady=(2, 10))
 
         # Space used so far by the CURRENT recording (0 when idle — the
@@ -1033,7 +1035,7 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
             dlg, text="", text_color="#e05a5a", wraplength=380, justify="left")
         status_label.grid(row=3, column=0, columnspan=2, sticky="ew", padx=20, pady=(4, 0))
 
-        def do_save():
+        def do_save(open_in_edit):
             from_idx = option_index(from_menu.get())
             to_idx = option_index(to_menu.get())
             if from_idx == to_idx:
@@ -1044,23 +1046,39 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
                 status_label.configure(text=t("arec_partial_save_bad_range"))
                 return
             dlg.destroy()
-            self._do_partial_save(start_t, end_t, markers[from_idx]["label"], markers[to_idx]["label"])
+            self._do_partial_save(
+                start_t, end_t, markers[from_idx]["label"], markers[to_idx]["label"],
+                open_in_edit=open_in_edit)
 
         btn_row = ctk.CTkFrame(dlg, fg_color="transparent")
         btn_row.grid(row=4, column=0, columnspan=2, pady=(14, 18))
-        ctk.CTkButton(btn_row, text=t("arec_partial_save_button"), command=do_save).grid(
-            row=0, column=0, padx=(0, 8))
+        # Two separate actions rather than one button that always jumps
+        # to Edit: switching tabs the moment you save pulls your
+        # attention off the Record tab (level meter, clip warning, timer)
+        # even though the recording itself keeps running underneath
+        # either way — sometimes that's exactly what you want (you're
+        # about to start editing that segment right now), sometimes it's
+        # not (you just want a quick save while staying put to keep
+        # watching the recording).
+        ctk.CTkButton(
+            btn_row, text=t("arec_partial_save_button"), fg_color="transparent",
+            text_color=self.OUTLINE_BUTTON_TEXT, border_width=1,
+            command=lambda: do_save(False),
+        ).grid(row=0, column=0, padx=(0, 8))
+        ctk.CTkButton(
+            btn_row, text=t("arec_partial_save_edit_button"), command=lambda: do_save(True),
+        ).grid(row=0, column=1, padx=(0, 8))
         ctk.CTkButton(
             btn_row, text=t("aai_filler_words_close_button"), fg_color="transparent",
             text_color=self.OUTLINE_BUTTON_TEXT, border_width=1, command=dlg.destroy,
-        ).grid(row=0, column=1)
+        ).grid(row=0, column=2)
         dlg.update_idletasks()
         x = self.winfo_rootx() + (self.winfo_width() - dlg.winfo_width()) // 2
         y = self.winfo_rooty() + (self.winfo_height() - dlg.winfo_height()) // 2
         dlg.geometry(f"+{max(0, x)}+{max(0, y)}")
         dlg.grab_set()
 
-    def _do_partial_save(self, start_s, end_s, from_label, to_label):
+    def _do_partial_save(self, start_s, end_s, from_label, to_label, open_in_edit):
         """Exports [start_s, end_s) as a brand-new file, reading from
         whatever _arec_partial_save_source_path returns — the recorder's
         own in-progress WAV (recording or paused) or the just-finished
@@ -1078,26 +1096,55 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         44.1kHz, same as any other opened file, rather than trying to
         preserve MP3's own encoded rate exactly.
 
-        Opens the result straight into the Edit tab once saved, same as
-        "Open in Edit" does for a finished recording — switching tabs
-        doesn't stop the recording either (see _show_tab's own
-        docstring)."""
+        The output format follows the Record tab's own Format menu (same
+        WAV/MP3 choice the recording itself uses), not just whatever the
+        source happens to be — matches "Open in Edit" and every other
+        export in the app already respecting the current format setting.
+        When MP3 is selected, the segment is written to WAV first (either
+        path above always produces one) then encoded via
+        audio_export.export_wav_as_mp3, the same conversion Stop already
+        runs when MP3 is the recording format — the intermediate WAV is
+        removed once that succeeds.
+
+        `open_in_edit` (the dialog's own choice of button) decides
+        whether this also opens the result and switches to the Edit tab
+        afterward — plain "Partial Save" stays put on the Record tab
+        (so it doesn't pull your attention off the level meter/clip
+        warning/timer while the recording keeps going), "Partial Save &
+        Edit" does switch, same as "Open in Edit" does for a finished
+        recording. Switching tabs doesn't stop the recording either way
+        (see _show_tab's own docstring) — this only changes what you see,
+        never what's still being captured underneath."""
         src_path = self._arec_partial_save_source_path()
         if not src_path:
             return
-        stem = (f"{self._sanitize_segment_filename(from_label)}"
+        # Named after the recording it came from AND the two markers, not
+        # just the markers alone — several partial saves off the same
+        # recording (or off two different recordings that happen to
+        # share marker labels, e.g. "Alice"/"Bob" in a recurring
+        # interview) would otherwise all collide on the same generic
+        # name, relying on unique_path's "(2)" suffix to tell them apart
+        # after the fact instead of the filename saying so up front.
+        original_base = os.path.splitext(os.path.basename(src_path))[0]
+        stem = (f"{original_base} - {self._sanitize_segment_filename(from_label)}"
                f" - {self._sanitize_segment_filename(to_label)}")
-        dest_path = transcriber.unique_path(os.path.join(settings.audio_exports_folder(), f"{stem}.wav"))
+        want_mp3 = self.arec_format_menu.get() == "MP3"
+        ext = "mp3" if want_mp3 else "wav"
+        dest_path = transcriber.unique_path(os.path.join(settings.audio_exports_folder(), f"{stem}.{ext}"))
         is_wav = os.path.splitext(src_path)[1].lower() == ".wav"
 
         def work():
+            wav_path = os.path.splitext(dest_path)[0] + ".tmp.wav" if want_mp3 else dest_path
             if is_wav:
-                audio_record.extract_wav_segment(src_path, start_s, end_s, dest_path)
+                audio_record.extract_wav_segment(src_path, start_s, end_s, wav_path)
             else:
                 buffer = audio_clip.decode_to_buffer(src_path)
                 i0 = max(0, int(round(start_s * audio_clip.CLIP_SAMPLE_RATE)))
                 i1 = min(len(buffer), int(round(end_s * audio_clip.CLIP_SAMPLE_RATE)))
-                audio_clip.write_wav(dest_path, buffer[i0:i1])
+                audio_clip.write_wav(wav_path, buffer[i0:i1])
+            if want_mp3:
+                audio_export.export_wav_as_mp3(wav_path, dest_path)
+                os.remove(wav_path)
             return dest_path
 
         def done(result, error):
@@ -1106,8 +1153,9 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
                 return
             self._set_audio_record_status(
                 "arec_partial_save_saved", {"path": os.path.basename(result)})
-            self._open_audio_clip(result)
-            self._show_tab(self.LEAF_AUDIO_EDIT)
+            if open_in_edit:
+                self._open_audio_clip(result)
+                self._show_tab(self.LEAF_AUDIO_EDIT)
 
         self._run_busy("arec_partial_save_saving", work, done)
 
@@ -1162,6 +1210,15 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
 
     def _finish_audio_record_save(self, path, clipped):
         self._last_recording_path = path
+        # Writes a sidecar (audio_clip.save_markers) next to the finished
+        # file so any later re-open of it — via "Open in Edit" right now,
+        # "Open a file…" from the file dialog, a different session
+        # entirely, whatever — picks these markers back up automatically
+        # (AudioClip.load reads the same sidecar). Markers used to only
+        # ever reach a clip through _open_audio_clip's own extra_markers
+        # parameter, which only "Open in Edit" ever passed — reopening
+        # the identical file any other way showed no markers at all.
+        audio_clip.save_markers(path, self._arec_markers)
         self.arec_edit_button.configure(state="normal")
         if len(self._arec_markers) >= 2:
             # Re-enables Partial Save now that there's a real finished
@@ -1209,7 +1266,11 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         path = self._last_recording_path
         if not path or not os.path.isfile(path):
             return
-        self._open_audio_clip(path, extra_markers=self._arec_markers)
+        # No extra_markers here — _finish_audio_record_save already wrote
+        # a sidecar for these same markers, which AudioClip.load reads on
+        # its own; passing them again here would just add every one of
+        # them a second time.
+        self._open_audio_clip(path)
         self._show_tab(self.LEAF_AUDIO_EDIT)
 
     # How many seconds are visible by default while following the live
@@ -1622,10 +1683,11 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
             ("aedit_trim_button", self._audio_edit_trim, "aedit_tip_trim"),
             ("aedit_split_button", self._audio_edit_split, "aedit_tip_split"),
             ("aedit_silence_button", self._audio_edit_insert_silence, "aedit_tip_silence"),
+            ("aedit_append_button", self._audio_edit_append_file_dialog, "aedit_tip_append"),
         ])
         self._build_button_group(editrow, 2, "aedit_group_history", [
-            ("aedit_undo_button", self._audio_edit_undo, None),
-            ("aedit_redo_button", self._audio_edit_redo, None),
+            ("aedit_undo_button", self._audio_edit_undo, "aedit_tip_undo_redo"),
+            ("aedit_redo_button", self._audio_edit_redo, "aedit_tip_undo_redo"),
             ("aedit_find_button", self._run_find_similar, "aedit_tip_find"),
             ("aedit_detect_silence_button", self._detect_silences, "aedit_tip_detect_silence"),
             ("aedit_marker_button", self._add_marker_at_playhead, "aedit_tip_marker"),
@@ -1882,6 +1944,8 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         ("Ctrl+F", "aedit_shortcut_find"),
         ("Home", "aedit_shortcut_home"),
         ("End", "aedit_shortcut_end"),
+        ("Ctrl+→", "aedit_shortcut_next_marker"),
+        ("Ctrl+←", "aedit_shortcut_prev_marker"),
         ("Ctrl+S", "aedit_shortcut_save"),
     ]
 
@@ -1928,16 +1992,18 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         if path:
             self._open_audio_clip(path)
 
-    def _open_audio_clip(self, path, extra_markers=None):
+    def _open_audio_clip(self, path):
         """Decoding runs on a background thread behind the modal "please
         wait" dialog — a several-minute MP3 can take a noticeable moment
         to decode/resample, which used to just freeze the window (or, in
         an earlier version, disable one button and change a status label
         that was easy to miss) with no clear feedback that it was still
-        working. `extra_markers` (used by _send_last_recording_to_edit)
-        are [{"time", "label"}, ...] added to the freshly-loaded clip —
-        e.g. live markers dropped during recording, carried over now that
-        Edit's marker tools (rename, per-segment Save) are available."""
+        working. Markers (including any dropped live while recording)
+        come along automatically — AudioClip.load reads them from a
+        sidecar file next to the protected copy (see
+        audio_clip.save_markers/load_markers), not from anything passed
+        in here, so they show up the same way no matter how this file
+        gets opened."""
         def work():
             return audio_clip.AudioClip.load(path, settings.audio_originals_folder())
 
@@ -1947,8 +2013,6 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
                 return
             self.audio_clip = clip
             self.audio_clip_path = path
-            for m in (extra_markers or []):
-                clip.add_marker(m["time"], m["label"], auto=False)
             self.audio_selection = None
             self.audio_clipboard = None
             self.audio_preview = None
@@ -1976,7 +2040,7 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         for attr in ("aedit_play_button", "aedit_stop_button", "aedit_speed_menu",
                      "aedit_zoom_out_button", "aedit_zoom_fit_button", "aedit_zoom_in_button",
                      "aedit_cut_button", "aedit_copy_button", "aedit_trim_button",
-                     "aedit_split_button", "aedit_silence_button", "aedit_find_button",
+                     "aedit_split_button", "aedit_silence_button", "aedit_append_button", "aedit_find_button",
                      "aedit_detect_silence_button",
                      "aedit_marker_button",
                      "aedit_save_wav_button", "aedit_save_mp3_button", "aedit_revert_button",
@@ -1992,6 +2056,31 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
     def _set_audio_edit_status(self, key, detail=None):
         self.audio_status_key, self.audio_status_detail = key, detail or {}
         self.aedit_status_line.configure(text=i18n.t(self.ui_lang, key, **(detail or {})))
+
+    def _warn_if_markers_removed(self, before_count):
+        """Appends a note to whatever status _set_audio_edit_status just
+        showed, if the edit that just ran (Cut/Trim/Delete-selected/AI
+        Enhance apply — anything that can remove a time range) also
+        deleted one or more markers along the way. A marker sitting
+        exactly on the edge of whatever got removed is silently deleted
+        (see AudioClip._shift_markers_after_removal — the audio it
+        pointed at is genuinely gone, so there's no position left to
+        shift it to), which without this note would look like a marker
+        randomly vanished or the wrong one got affected, with no way to
+        tell that's actually what happened. `before_count` is the marker
+        count the CALLER captured right before running the edit."""
+        if self.audio_clip is None:
+            return
+        removed = before_count - len(self.audio_clip.markers)
+        if removed <= 0:
+            return
+        note = i18n.t(self.ui_lang, "aedit_status_markers_removed", count=removed)
+        # Cut/Trim show no status of their own on success (a quiet,
+        # every-edit-is-instant UX) — this becomes the whole message for
+        # those; Delete-selected/AI-apply already set one, so this reads
+        # as a continuation of it instead of replacing it.
+        current = self.aedit_status_line.cget("text")
+        self.aedit_status_line.configure(text=f"{current}  {note}" if current else note)
 
     # -- transport ------------------------------------------------------
 
@@ -2020,9 +2109,12 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
             self._set_audio_edit_status("aedit_status_need_selection")
             return
         start, end = self.audio_selection
+        before_marker_count = len(self.audio_clip.markers)
         self.audio_clip.cut(start, end)
         self.audio_selection = None
         self._after_audio_edit()
+        self._zoom_audio_edit_fit()
+        self._warn_if_markers_removed(before_marker_count)
 
     def _toggle_audio_edit_play(self):
         if self.audio_clip is None:
@@ -2506,6 +2598,24 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
             text=f"{_fmt_hms(self.audio_player.get_time())} / "
                  f"{_fmt_hms(self.audio_player.duration)}")
 
+    def _jump_to_next_marker(self):
+        if not self.audio_clip or not self.audio_clip.markers:
+            return
+        current = self.audio_player.get_time()
+        for m in self.audio_clip.markers:  # kept sorted by time
+            if m["time"] > current + 0.05:  # a small margin so re-pressing at a marker still advances
+                self._seek_audio_edit_to(m["time"])
+                return
+
+    def _jump_to_previous_marker(self):
+        if not self.audio_clip or not self.audio_clip.markers:
+            return
+        current = self.audio_player.get_time()
+        for m in reversed(self.audio_clip.markers):
+            if m["time"] < current - 0.05:
+                self._seek_audio_edit_to(m["time"])
+                return
+
     def _on_wave_press(self, event):
         if self.audio_clip is None:
             return
@@ -2569,15 +2679,75 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         self.audio_player.load_buffer(self.audio_clip.buffer, self.audio_clip.sample_rate)
         self._seek_audio_edit_to(playhead_t)
         self._refresh_audio_studio_ui()
+        self._autosave_edited_export()
+
+    def _autosave_edited_export_path(self):
+        """The currently open file's path, IF it's itself an "_edited"
+        export already sitting in the Exports folder — the one case an
+        in-place autosave is safe. Anything in Originals must never be
+        silently overwritten (that's what makes Revert to Original
+        work), and a file just opened from somewhere else hasn't been
+        "promoted" to a working copy yet — Export still makes a NEW file
+        for it the first time, same as always. Only once you're already
+        editing a file that IS one of Export's own outputs does this
+        kick in, at which point re-clicking Export after every change
+        would just be busywork. Returns None otherwise."""
+        path = self.audio_clip_path
+        if not path:
+            return None
+        exports_folder = os.path.normcase(os.path.abspath(settings.audio_exports_folder()))
+        folder = os.path.normcase(os.path.abspath(os.path.dirname(path)))
+        stem = os.path.splitext(os.path.basename(path))[0]
+        if folder == exports_folder and stem.endswith("_edited"):
+            return path
+        return None
+
+    def _autosave_edited_export(self):
+        """Silently re-saves the currently open file in place after every
+        committed edit, if _autosave_edited_export_path says it's safe
+        to. Runs on a background thread with no busy modal — autosave is
+        meant to be invisible, not one more "please wait" after every
+        single edit — and reports back through the same events queue
+        every other background task uses, so mark_exported()/the dirty
+        indicator only ever get touched from the main thread."""
+        path = self._autosave_edited_export_path()
+        if not path or self.audio_clip is None:
+            return
+        fmt = os.path.splitext(path)[1].lstrip(".").lower()
+        buffer, sample_rate = self.audio_clip.buffer, self.audio_clip.sample_rate
+        markers = [dict(m) for m in self.audio_clip.markers]
+
+        def work():
+            try:
+                audio_export.export_audio(buffer, sample_rate, path, fmt=fmt)
+                audio_clip.save_markers(path, markers)
+                self.events.put(("autosave_edited_export", True))
+            except Exception:
+                settings.log_exception("Audio Studio: autosave of edited export failed:")
+                self.events.put(("autosave_edited_export", False))
+
+        threading.Thread(target=work, daemon=True).start()
 
     def _audio_edit_cut(self):
         if not self.audio_clip or not self.audio_selection:
             self._set_audio_edit_status("aedit_status_need_selection")
             return
         start, end = self.audio_selection
+        before_marker_count = len(self.audio_clip.markers)
         self.audio_clipboard = self.audio_clip.cut(start, end)
         self.audio_selection = None
         self._after_audio_edit()
+        # Every other action that can shorten the buffer (Trim, Delete
+        # selected in Matches/No-speech, AI Enhance apply, AI Preset)
+        # already re-fits the zoom afterward — Cut was the one exception,
+        # which used to leave the on-screen window spanning the OLD,
+        # longer duration. peaks_from_buffer now renders that correctly
+        # (the missing portion draws as real silence, not stretched
+        # audio) rather than visually desyncing from the timeline, but
+        # showing a large blank stretch on the right when the remaining
+        # audio doesn't fill the old window is still worth avoiding.
+        self._zoom_audio_edit_fit()
+        self._warn_if_markers_removed(before_marker_count)
 
     def _audio_edit_copy(self):
         if not self.audio_clip or not self.audio_selection:
@@ -2601,16 +2771,19 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         at = self.audio_selection[0] if self.audio_selection else self.audio_player.get_time()
         self.audio_clip.paste(at, self.audio_clipboard)
         self._after_audio_edit()
+        self._zoom_audio_edit_fit()
 
     def _audio_edit_trim(self):
         if not self.audio_clip or not self.audio_selection:
             self._set_audio_edit_status("aedit_status_need_selection")
             return
         start, end = self.audio_selection
+        before_marker_count = len(self.audio_clip.markers)
         self.audio_clip.trim(start, end)
         self.audio_selection = None
         self._after_audio_edit()
         self._zoom_audio_edit_fit()
+        self._warn_if_markers_removed(before_marker_count)
 
     def _audio_edit_split(self):
         """Splits at the playhead (a single point — click the waveform to
@@ -2639,6 +2812,7 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         self.audio_clip.markers = [m for m in self.audio_clip.markers if m["time"] < at]
         self.audio_clip.apply(before, markers_before=markers_before)
         self._after_audio_edit()
+        self._zoom_audio_edit_fit()
         self._set_audio_edit_status("aedit_status_split", {"path": os.path.basename(after_path)})
 
     INSERT_SILENCE_S = 1.0  # kept as one constant so the button's tooltip can't drift from the actual amount
@@ -2649,17 +2823,67 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         at = self.audio_selection[0] if self.audio_selection else self.audio_player.get_time()
         self.audio_clip.insert_silence(at, self.INSERT_SILENCE_S)
         self._after_audio_edit()
+        self._zoom_audio_edit_fit()
+
+    def _audio_edit_append_file_dialog(self):
+        """Wires up AudioClip.join() — previously a real method with no
+        button anywhere calling it. Decodes the chosen file at this
+        clip's own sample rate (so it splices in cleanly regardless of
+        the source file's native rate) on a background thread, then
+        appends it to the end of the current clip. Markers are left
+        exactly where they are (join() doesn't touch them — there's
+        nothing meaningful to guess about a marker for audio that didn't
+        exist yet)."""
+        if not self.audio_clip:
+            return
+        path = filedialog.askopenfilename(
+            title=i18n.t(self.ui_lang, "aedit_append_dialog"),
+            filetypes=[(i18n.t(self.ui_lang, "audio_filetypes"),
+                       "*.wav *.mp3 *.m4a *.flac *.ogg *.aac")])
+        if not path:
+            return
+        sample_rate = self.audio_clip.sample_rate
+
+        def work():
+            return audio_clip.decode_to_buffer(path, sample_rate)
+
+        def done(buffer, error):
+            if error is not None:  # already logged by _run_busy itself
+                self._set_audio_edit_status("aedit_status_append_failed", {})
+                return
+            self.audio_clip.join(buffer)
+            self._after_audio_edit()
+            self._zoom_audio_edit_fit()
+            self._set_audio_edit_status("aedit_status_appended", {"name": os.path.basename(path)})
+
+        self._run_busy("aedit_status_appending", work, done)
 
     def _audio_edit_undo(self):
         if self.audio_clip and self.audio_clip.undo():
             self._after_audio_edit()
+            self._zoom_audio_edit_fit()
 
     def _audio_edit_redo(self):
         if self.audio_clip and self.audio_clip.redo():
             self._after_audio_edit()
+            self._zoom_audio_edit_fit()
 
     def _audio_edit_revert(self):
-        if self.audio_clip and self.audio_clip.revert_to_original():
+        if not self.audio_clip:
+            return
+        # Only asks when there's actually something to lose — reverting
+        # with no edits made yet is a no-op either way, so a confirmation
+        # dialog for it would just be a pointless extra click. Still
+        # undoable afterward (revert_to_original is itself just another
+        # buffer replacement on the undo stack), but a single unconfirmed
+        # click discarding a whole editing session is an easy accidental
+        # press to make without ever meaning to.
+        if self.audio_clip.can_undo and not messagebox.askyesno(
+            i18n.t(self.ui_lang, "aedit_revert_confirm_title"),
+            i18n.t(self.ui_lang, "aedit_revert_confirm"),
+        ):
+            return
+        if self.audio_clip.revert_to_original():
             self._after_audio_edit()
             self._zoom_audio_edit_fit()
             self._set_audio_edit_status("aedit_status_reverted")
@@ -2689,6 +2913,13 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
             if error is not None:  # already logged by _run_busy itself
                 self._set_audio_edit_status("aedit_status_export_failed")
                 return
+            # Its OWN sidecar, not original_path's — the exported file's
+            # waveform is whatever self.audio_clip.markers is currently
+            # positioned against (unedited or not), so this is always
+            # correct for IT specifically, independent of whether
+            # _persist_audio_clip_markers was willing to touch the
+            # original's own sidecar earlier in the session.
+            audio_clip.save_markers(path, self.audio_clip.markers)
             self.audio_clip.mark_exported()
             self._update_dirty_indicator()
             self._set_audio_edit_status("aedit_status_exported", {"path": os.path.basename(path)})
@@ -2890,6 +3121,7 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         if self.audio_clip is None:
             return
         result_buffer, removed_ranges = self._split_effect_result(result)
+        before_marker_count = len(self.audio_clip.markers)
         i0, i1 = self._selection_bounds()
         full = np.concatenate(
             [self.audio_clip.buffer[:i0], result_buffer, self.audio_clip.buffer[i1:]])
@@ -2900,6 +3132,13 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         else:
             self.audio_clip.apply(full)
         self._after_audio_edit()
+        # Only pause-shortening (and any saved Configuration that includes
+        # it) actually changes the buffer's length — every other effect
+        # row is a same-length DSP pass — but running this unconditionally
+        # is what caught the Cut bug in the first place, so it stays
+        # unconditional here too rather than gated on removed_ranges.
+        self._zoom_audio_edit_fit()
+        self._warn_if_markers_removed(before_marker_count)
         self._set_audio_edit_status("aedit_status_effect_applied")
 
     def _apply_auto_enhance(self):
@@ -3562,6 +3801,29 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
 
     # -- user-added markers -------------------------------------------------
 
+    def _persist_audio_clip_markers(self):
+        """Writes the current clip's markers to their sidecar file (see
+        audio_clip.save_markers) so a rename/delete/add made here is what
+        shows up the next time this file is opened, by any route — not
+        just whatever markers happened to be there when it was first
+        loaded this session.
+
+        Only while the buffer is still exactly its original_length,
+        though: a structural edit (cut/trim/split/insert/join/any range
+        removal) shifts marker times to match the EDITED buffer, and
+        those times aren't valid positions on original_path's own
+        (different-length) waveform — writing them to its sidecar would
+        corrupt the one place a later "Revert to Original" or a fresh
+        re-open of the pristine original relies on for correct
+        positions. Once a structural edit has happened, marker changes
+        stay in-memory only for the rest of this session, until Export
+        writes a NEW sidecar next to the exported file instead (see
+        _export_audio_clip) — that file's own waveform is what these
+        times actually correspond to."""
+        clip = self.audio_clip
+        if clip is not None and clip.original_path and len(clip.buffer) == clip.original_length:
+            audio_clip.save_markers(clip.original_path, clip.markers)
+
     def _add_marker_at_playhead(self):
         if self.audio_clip is None:
             return
@@ -3574,6 +3836,7 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         self.audio_clip.add_marker(self.audio_player.get_time(), label, auto=False)
         self._redraw_waveform()
         self._render_markers_panel()
+        self._persist_audio_clip_markers()
 
     def _marker_lane_x_to_seconds(self, x):
         width = max(1, self.amarker_canvas.winfo_width())
@@ -3638,6 +3901,7 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
             self.audio_clip.markers[index]["label"] = new_label
             self._redraw_waveform()
             self._render_markers_panel()
+            self._persist_audio_clip_markers()
 
     def _delete_marker(self, index):
         if self.audio_clip is None:
@@ -3645,6 +3909,7 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         self.audio_clip.remove_marker_at(index)
         self._redraw_waveform()
         self._render_markers_panel()
+        self._persist_audio_clip_markers()
 
     def _redraw_marker_lane(self):
         canvas = self.amarker_canvas
@@ -3960,10 +4225,12 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         ranges = [m[:2] for m, v in zip(self._find_visible_matches, self._find_vars) if v.get()]
         if not ranges:
             return
+        before_marker_count = len(self.audio_clip.markers)
         self.audio_clip.remove_ranges(ranges)
         self._after_audio_edit()  # also clears _find_matches — the positions just shifted
         self._zoom_audio_edit_fit()
         self._set_audio_edit_status("aedit_status_removed_matches", {"count": len(ranges)})
+        self._warn_if_markers_removed(before_marker_count)
 
     # ==================================================== audio studio: markers
     # panel — a fourth collapsible panel beside Enhance/Clean/Matches,
@@ -3983,8 +4250,14 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         top = ctk.CTkFrame(parent, fg_color="transparent")
         top.grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 8))
         top.grid_columnconfigure(0, weight=1)
+        # One label, not two stacked rows — the sidecar note (see
+        # audio_clip.save_markers) reads as a continuation of the marker
+        # count on the same line. No wraplength (unlike every other hint
+        # label in Audio Studio): this one's meant to stay a single line
+        # rather than wrap, even though that means it can run wide on a
+        # narrow window.
         self.amark_hint_label = ctk.CTkLabel(
-            top, text="", anchor="w", text_color=self.MUTED_TEXT, wraplength=700, justify="left")
+            top, text="", anchor="w", text_color=self.MUTED_TEXT)
         self.amark_hint_label.grid(row=0, column=0, sticky="w")
 
         self.amark_rows_frame = ctk.CTkScrollableFrame(parent, fg_color="transparent")
@@ -4028,7 +4301,9 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
                 btn.configure(state="disabled")
             self._update_rows_scrollbar(self.amark_rows_frame)
             return
-        self.amark_hint_label.configure(text=i18n.t(self.ui_lang, "amark_found", count=len(markers)))
+        self.amark_hint_label.configure(text=(
+            i18n.t(self.ui_lang, "amark_found", count=len(markers)) + "  "
+            + i18n.t(self.ui_lang, "amark_sidecar_note")))
         for i, m in enumerate(markers):
             var = ctk.BooleanVar(value=False)
             self._marker_vars.append(var)
@@ -4077,6 +4352,7 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
             self.audio_clip.remove_marker_at(i)
         self._render_markers_panel()
         self._redraw_waveform()
+        self._persist_audio_clip_markers()
 
     def _marker_segment_bounds(self, idx):
         """(start_s, end_s) for the span a marker "owns": from its own
@@ -4099,12 +4375,21 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         ).strip("_")
         return cleaned[:_LIVE_FILENAME_MAX_LEN] or "segment"
 
+    def _marker_segment_export_fmt(self):
+        """"wav" or "mp3", matching the currently-open file's own
+        extension — Save/Save Selected export in whatever format the
+        file was opened as, not always WAV. Anything else (m4a, flac,
+        ogg, aac — real formats "Open a file…" accepts but that
+        audio_export.export_audio can't itself write) falls back to WAV,
+        the always-safe, always-supported default."""
+        ext = os.path.splitext(self.audio_clip_path or "")[1].lower().lstrip(".")
+        return ext if ext in ("wav", "mp3") else "wav"
+
     def _save_marker_segment(self, idx):
         """Saves the span this one marker owns (see
-        _marker_segment_bounds) as its own WAV file in the exports
-        folder — reuses copy_region/write_wav, the same building blocks
-        Cut/Copy and Save-as-WAV already use, rather than a new export
-        path."""
+        _marker_segment_bounds) as its own file in the exports folder —
+        reuses copy_region, the same building block Cut/Copy already
+        uses, rather than a new export path."""
         if self.audio_clip is None:
             return
         start, end = self._marker_segment_bounds(idx)
@@ -4112,10 +4397,11 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         buffer = self.audio_clip.copy_region(start, end)
         sample_rate = self.audio_clip.sample_rate
         stem = self._sanitize_segment_filename(label)
-        path = transcriber.unique_path(os.path.join(settings.audio_exports_folder(), f"{stem}.wav"))
+        fmt = self._marker_segment_export_fmt()
+        path = transcriber.unique_path(os.path.join(settings.audio_exports_folder(), f"{stem}.{fmt}"))
 
         def work():
-            audio_clip.write_wav(path, buffer, sample_rate)
+            audio_export.export_audio(buffer, sample_rate, path, fmt=fmt)
             return path
 
         def done(_result, error):
@@ -4137,6 +4423,7 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         markers = self.audio_clip.markers
         sample_rate = self.audio_clip.sample_rate
         folder = settings.audio_exports_folder()
+        fmt = self._marker_segment_export_fmt()
         # (stem, buffer) only — the actual path is resolved one at a time
         # inside work(), immediately before writing each file. Two markers
         # can share a label (e.g. the same speaker's name used twice), and
@@ -4153,8 +4440,8 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
 
         def work():
             for stem, buffer in jobs:
-                path = transcriber.unique_path(os.path.join(folder, f"{stem}.wav"))
-                audio_clip.write_wav(path, buffer, sample_rate)
+                path = transcriber.unique_path(os.path.join(folder, f"{stem}.{fmt}"))
+                audio_export.export_audio(buffer, sample_rate, path, fmt=fmt)
             return len(jobs)
 
         def done(count, error):
@@ -4338,10 +4625,12 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         ranges = [s for s, v in zip(self._silence_visible_spans, self._silence_vars) if v.get()]
         if not ranges:
             return
+        before_marker_count = len(self.audio_clip.markers)
         self.audio_clip.remove_ranges(ranges)
         self._after_audio_edit()  # also clears _silence_spans — the positions just shifted
         self._zoom_audio_edit_fit()
         self._set_audio_edit_status("aedit_status_removed_matches", {"count": len(ranges)})
+        self._warn_if_markers_removed(before_marker_count)
 
     def _clear_silence_results(self):
         self._silence_spans = []
@@ -4769,6 +5058,7 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         total_checked = len(whole_checked) + sum(len(v) for v in range_selections.values())
         if total_checked == 0:
             return
+        before_marker_count = len(self.audio_clip.markers)
         buffer, sample_rate = self.audio_clip.buffer, self.audio_clip.sample_rate
 
         def work():
@@ -4811,6 +5101,7 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
             self._after_audio_edit()
             self._zoom_audio_edit_fit()
             self._set_audio_edit_status("aai_status_applied", {"count": total_checked})
+            self._warn_if_markers_removed(before_marker_count)
 
         self._run_busy("aai_busy_applying", work, done)
 
@@ -4826,6 +5117,7 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         values = list(self.aai_preset_menu.cget("values"))
         idx = values.index(self.aai_preset_menu.get()) if self.aai_preset_menu.get() in values else 0
         preset_key = audio_ai_edit.AI_PRESET_ORDER[idx]
+        before_marker_count = len(self.audio_clip.markers)
         buffer, sample_rate = self.audio_clip.buffer, self.audio_clip.sample_rate
 
         def work():
@@ -4843,6 +5135,7 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
             self._after_audio_edit()
             self._zoom_audio_edit_fit()
             self._set_audio_edit_status("aai_status_preset_applied", {})
+            self._warn_if_markers_removed(before_marker_count)
 
         self._run_busy("aai_busy_applying", work, done)
 
@@ -4986,6 +5279,7 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         self.aedit_trim_button.configure(text=t("aedit_trim_button"))
         self.aedit_split_button.configure(text=t("aedit_split_button"))
         self.aedit_silence_button.configure(text=t("aedit_silence_button"))
+        self.aedit_append_button.configure(text=t("aedit_append_button"))
         self.aedit_undo_button.configure(text=t("aedit_undo_button"))
         self.aedit_redo_button.configure(text=t("aedit_redo_button"))
         self.aedit_find_button.configure(text=t("aedit_find_button"))
@@ -5047,7 +5341,7 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         self.amark_select_none_button.configure(text=t("afind_select_none"))
         self.amark_delete_button.configure(text=t("afind_delete_button"))
         self.amark_save_selected_button.configure(text=t("amark_save_selected_button"))
-        self._render_markers_panel()  # re-renders the hint text and any marker rows/buttons
+        self._render_markers_panel()  # re-renders the hint text (sidecar note included) and any marker rows/buttons
 
         self.aai_analyze_button.configure(text=t("aai_analyze_button"))
         self.aai_quick_analyze_button.configure(text=t("aai_quick_analyze_button"))
@@ -7406,6 +7700,11 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
             self._on_find_similar_event(event[1], event[2])
         elif kind == "ai_analyze":
             self._on_ai_analyze_event(event[1], event[2])
+        elif kind == "autosave_edited_export":
+            success = event[1]
+            if success and self.audio_clip is not None:
+                self.audio_clip.mark_exported()
+                self._update_dirty_indicator()
         elif kind == "busy_done":
             _, on_done, result, error = event
             self._close_busy_dialog()

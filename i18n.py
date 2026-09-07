@@ -310,15 +310,18 @@ STRINGS = {
                         " recording to Edit, where each marker's span can"
                         " be renamed and saved as its own file.",
         "arec_partial_save_button": "Partial Save",
+        "arec_partial_save_edit_button": "Partial Save && Edit",
         "arec_tip_partial_save": "Exports the audio between two markers as"
                                  " its own file, right now — while this"
                                  " recording keeps going uninterrupted."
                                  " Needs at least 2 markers dropped first.",
         "arec_partial_save_title": "Partial Save",
         "arec_partial_save_hint": "Pick two markers — everything between"
-                                  " them is saved as its own file, opened"
-                                  " in Edit right after. The main recording"
-                                  " is not paused or interrupted.",
+                                  " them is saved as its own file. \"Partial"
+                                  " Save\" stays here; \"Partial Save & Edit\""
+                                  " also opens it in Edit right after. Either"
+                                  " way, the main recording is not paused or"
+                                  " interrupted.",
         "arec_partial_save_from": "From:",
         "arec_partial_save_to": "To:",
         "arec_partial_save_same_marker": "\"From\" and \"To\" can't be the same marker.",
@@ -382,6 +385,8 @@ STRINGS = {
         "aedit_shortcut_find": "Find similar… (needs a selection)",
         "aedit_shortcut_home": "Jump to the start",
         "aedit_shortcut_end": "Jump to the end",
+        "aedit_shortcut_next_marker": "Jump to the next marker",
+        "aedit_shortcut_prev_marker": "Jump to the previous marker",
         "aedit_shortcut_save": "Export as WAV",
         "aedit_no_file": "No audio file open.",
         "aedit_zoom_fit": "Fit",
@@ -391,8 +396,14 @@ STRINGS = {
         "aedit_trim_button": "Trim",
         "aedit_split_button": "Split",
         "aedit_silence_button": "Insert silence",
+        "aedit_append_button": "Append file…",
         "aedit_undo_button": "Undo",
         "aedit_redo_button": "Redo",
+        "aedit_tip_undo_redo": "Up to the last 50 edits — beyond that, the"
+                              " oldest ones drop off to make room. Revert to"
+                              " original always works regardless, since it"
+                              " restores from the protected copy, not the"
+                              " undo history.",
         "aedit_find_button": "Find similar…",
         "aedit_marker_button": "Add marker",
         "aedit_tip_marker": "Adds a labeled marker at the current playhead"
@@ -409,6 +420,9 @@ STRINGS = {
         "aedit_tip_silence": "Inserts {seconds:.0f}s of silence at the"
                              " playhead, or at the start of the selection"
                              " if one is active.",
+        "aedit_tip_append": "Appends another audio file to the end of this"
+                            " clip. Markers stay exactly where they are.",
+        "aedit_append_dialog": "Append audio file",
         "aedit_tip_find": "Finds other places in the recording that sound"
                           " like the current selection, so you can review"
                           " and remove every occurrence. Needs a selection"
@@ -424,9 +438,18 @@ STRINGS = {
                                    " need a selection, it scans the whole"
                                    " clip.",
         "aedit_status_removed_matches": "Removed {count} segment(s).",
+        "aedit_status_markers_removed": "{count} marker(s) were also removed —"
+                                        " their position no longer exists.",
+        "aedit_status_appending": "Appending file…",
+        "aedit_status_appended": "Appended {name}.",
+        "aedit_status_append_failed": "Could not append that file — see sota.log for details.",
         "aedit_save_wav_button": "Export WAV",
         "aedit_save_mp3_button": "Export MP3",
         "aedit_revert_button": "Revert to original",
+        "aedit_revert_confirm_title": "SOTA",
+        "aedit_revert_confirm": "Discard every edit and restore the original"
+                                " recording? Markers are kept either way."
+                                " This can still be undone afterward.",
         "aedit_status_loading": "Loading…",
         "aedit_status_loaded": "Loaded.",
         "aedit_status_load_failed": "Could not open that file — see sota.log for details.",
@@ -619,6 +642,10 @@ STRINGS = {
         "amark_toggle": "Markers",
         "amark_none": "No markers yet — use Add marker above.",
         "amark_found": "{count} marker(s).",
+        "amark_sidecar_note": "Markers are saved next to the audio file"
+                              " (a hidden .markers.json alongside it) — copying"
+                              " just the audio elsewhere won't bring them along"
+                              " unless that file goes with it.",
         "amark_save_button": "Save",
         "amark_tip_save": "Saves the audio from this marker up to the next"
                           " one (or the end) as its own WAV file in the"
@@ -676,7 +703,9 @@ STRINGS = {
         "aai_filler_words_button": "Filler Words…",
         "aai_filler_words_title": "Filler Words",
         "aai_filler_words_intro": "Words or phrases Remove Filler Words looks for"
-                                 " (English only) — add or remove entries below."
+                                 " — add or remove entries below. These defaults"
+                                 " are English, but you can add words/phrases in"
+                                 " any language the recording is spoken in."
                                  " Takes effect on the next Analyze Audio.",
         "aai_filler_words_none": "No filler words configured — Remove Filler Words won't flag anything.",
         "aai_filler_words_add_placeholder": "Add a word or phrase…",
@@ -1000,13 +1029,16 @@ STRINGS = {
                         "（例如每次換人說話時標記一次）。傳送錄音至「編輯」時"
                         "會一併帶過去，之後可為每個標記區段重新命名並個別存檔。",
         "arec_partial_save_button": "部分存檔",
+        "arec_partial_save_edit_button": "部分存檔並編輯",
         "arec_tip_partial_save": "將兩個標記之間的音訊立即另存為一個檔案"
                                  "——同時本次錄音會持續進行、不受影響。"
                                  "需要先加入至少 2 個標記。",
         "arec_partial_save_title": "部分存檔",
         "arec_partial_save_hint": "選擇兩個標記——兩者之間的所有音訊將另存為"
-                                  "一個檔案，儲存後立即在「編輯」中開啟。"
-                                  "主錄音不會暫停或中斷。",
+                                  "一個檔案。「部分存檔」會留在此頁面；"
+                                  "「部分存檔並編輯」則會另外在「編輯」中"
+                                  "開啟該檔案。無論哪一種，主錄音都不會"
+                                  "暫停或中斷。",
         "arec_partial_save_from": "從：",
         "arec_partial_save_to": "到：",
         "arec_partial_save_same_marker": "「從」與「到」不能是同一個標記。",
@@ -1065,6 +1097,8 @@ STRINGS = {
         "aedit_shortcut_find": "尋找相似片段…（需要先選取範圍）",
         "aedit_shortcut_home": "跳至開頭",
         "aedit_shortcut_end": "跳至結尾",
+        "aedit_shortcut_next_marker": "跳至下一個標記",
+        "aedit_shortcut_prev_marker": "跳至上一個標記",
         "aedit_shortcut_save": "匯出為 WAV",
         "aedit_no_file": "尚未開啟音訊檔案。",
         "aedit_zoom_fit": "符合視窗",
@@ -1074,8 +1108,13 @@ STRINGS = {
         "aedit_trim_button": "修剪",
         "aedit_split_button": "分割",
         "aedit_silence_button": "插入靜音",
+        "aedit_append_button": "附加檔案…",
         "aedit_undo_button": "復原",
         "aedit_redo_button": "取消復原",
+        "aedit_tip_undo_redo": "最多保留最近 50 步編輯 — 超過後，"
+                              "最舊的紀錄會被移除以騰出空間。"
+                              "「還原為原始檔」則不受影響，永遠都能使用，"
+                              "因為它是從受保護的原始副本還原，而非復原紀錄。",
         "aedit_find_button": "尋找相似片段…",
         "aedit_marker_button": "新增標記",
         "aedit_tip_marker": "在目前播放位置新增一個帶標籤的標記。"
@@ -1087,6 +1126,8 @@ STRINGS = {
                            "後半段會儲存為新檔案，前半段則繼續留在此處編輯。",
         "aedit_tip_silence": "在播放位置（若有選取範圍則為選取範圍的起點）"
                              "插入 {seconds:.0f} 秒的靜音。",
+        "aedit_tip_append": "將另一個音訊檔附加到此片段的結尾。標記位置不受影響。",
+        "aedit_append_dialog": "附加音訊檔",
         "aedit_tip_find": "在整段錄音中尋找與目前選取範圍聽起來相似的片段，"
                           "方便您逐一檢視並移除。需要先在波形圖上拖曳選取範圍。",
         "aedit_detect_silence_button": "偵測無語音片段",
@@ -1097,9 +1138,17 @@ STRINGS = {
                                    "供您檢視。較短的自然停頓不會列入。"
                                    "不需要先選取範圍，會掃描整段錄音。",
         "aedit_status_removed_matches": "已移除 {count} 個片段。",
+        "aedit_status_markers_removed": "同時也移除了 {count} 個標記——"
+                                        "其所在位置已不存在。",
+        "aedit_status_appending": "正在附加檔案…",
+        "aedit_status_appended": "已附加 {name}。",
+        "aedit_status_append_failed": "無法附加該檔案 — 詳情請見 sota.log。",
         "aedit_save_wav_button": "匯出 WAV",
         "aedit_save_mp3_button": "匯出 MP3",
         "aedit_revert_button": "還原為原始檔",
+        "aedit_revert_confirm_title": "SOTA",
+        "aedit_revert_confirm": "要捨棄所有編輯並還原為原始錄音嗎？"
+                                "標記無論如何都會保留。之後仍可復原此動作。",
         "aedit_status_loading": "載入中…",
         "aedit_status_loaded": "已載入。",
         "aedit_status_load_failed": "無法開啟該檔案 — 詳情請見 sota.log。",
@@ -1260,6 +1309,9 @@ STRINGS = {
         "amark_toggle": "標記",
         "amark_none": "尚無標記 — 可使用上方的「新增標記」。",
         "amark_found": "共 {count} 個標記。",
+        "amark_sidecar_note": "標記會儲存在音訊檔旁邊（一個隱藏的 .markers.json 檔）"
+                              "——若只複製音訊檔到別處，標記不會一併帶過去，"
+                              "除非連同該檔案一起複製。",
         "amark_save_button": "存檔",
         "amark_tip_save": "將此標記到下一個標記（或結尾）之間的音訊，"
                           "另存為一個 WAV 檔至匯出資料夾。",
@@ -1307,8 +1359,9 @@ STRINGS = {
         "aai_preset_apply": "套用預設",
         "aai_filler_words_button": "贅字清單…",
         "aai_filler_words_title": "贅字清單",
-        "aai_filler_words_intro": "「移除贅字」比對的字詞或片語（僅限英文）— "
-                                 "可在下方新增或移除。下次「分析音訊」時生效。",
+        "aai_filler_words_intro": "「移除贅字」比對的字詞或片語 — 可在下方新增或移除。"
+                                 "預設清單為英文，但您也可以新增錄音中所使用的"
+                                 "任何語言的字詞或片語。下次「分析音訊」時生效。",
         "aai_filler_words_none": "尚未設定任何贅字 — 「移除贅字」將不會標記任何內容。",
         "aai_filler_words_add_placeholder": "新增字詞或片語…",
         "aai_filler_words_add_button": "新增",

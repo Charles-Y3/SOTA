@@ -10,6 +10,7 @@ copy is made into `originals_dir` before any edit can run, so "Revert to
 Original" always works even after the working copy has been saved over.
 """
 
+import json
 import os
 import shutil
 import wave
@@ -20,6 +21,45 @@ import numpy as np
 # quick playback preview — that rate was chosen for small live-session
 # files and fast WSOLA stretching, not editing fidelity.
 CLIP_SAMPLE_RATE = 44100
+
+
+def markers_sidecar_path(audio_path):
+    return os.path.splitext(audio_path)[0] + ".markers.json"
+
+
+def save_markers(audio_path, markers):
+    """Persists `markers` (AudioClip.markers's own list-of-dicts shape)
+    to a sidecar file next to `audio_path`, so they survive being closed
+    and reopened later — by any route, not just the one this app session
+    happened to load them through. Markers otherwise live only in the
+    in-memory AudioClip, which is why they used to vanish the moment you
+    reopened the same file via "Open a file…" instead of the exact
+    "Open in Edit" button that had carried them over live. An empty
+    `markers` removes any existing sidecar rather than writing an empty
+    one, so "no markers" reads the same on disk whether or not one was
+    ever created."""
+    path = markers_sidecar_path(audio_path)
+    if not markers:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        return
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(markers, f)
+    except OSError:
+        pass  # markers are a convenience, never worth failing the caller over
+
+
+def load_markers(audio_path):
+    """[] if there's no sidecar, or it can't be read — never raises, same
+    reasoning as save_markers not raising."""
+    try:
+        with open(markers_sidecar_path(audio_path), "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return []
 
 
 def decode_to_buffer(path, sample_rate=CLIP_SAMPLE_RATE):
@@ -47,21 +87,52 @@ def write_wav(path, buffer, sample_rate=CLIP_SAMPLE_RATE):
 def peaks_from_buffer(buffer, sample_rate, start_s, end_s, pixel_count):
     """Standalone version of AudioClip.peaks — usable on any array, not
     just a clip's own buffer (e.g. a not-yet-applied preview composite in
-    app.py). AudioClip.peaks below just delegates here."""
+    app.py). AudioClip.peaks below just delegates here.
+
+    [start_s, end_s) is a request, not a guarantee — a caller's zoom
+    window can span further than the buffer actually goes now (most
+    commonly: a structural edit just shortened the buffer while the
+    on-screen zoom window still reflects the old, longer duration, since
+    not every edit path re-fits it). The portion of the window past the
+    buffer's real end must render as genuine silence at its own correct
+    pixel columns — NOT get the real audio that IS there stretched to
+    visually fill every column regardless, which is what a naive
+    clamp-then-reshape used to do: clamping i1 down to the buffer's
+    length changed how much audio `region` held, but reshaping that
+    into the FULL pixel_count regardless meant fewer real samples got
+    spread across the same number of columns, visually stretching every
+    feature in the buffer to roughly double its correct on-screen width
+    whenever the request was e.g. 2x the buffer's actual remaining
+    length — silently desyncing the waveform's rendered shape from the
+    timeline the ruler and markers (computed independently, correctly)
+    agree on."""
+    pixel_count = max(1, int(pixel_count))
+    if end_s <= start_s:
+        z = np.zeros(pixel_count, dtype=np.float32)
+        return z, z
+    buffer_duration = len(buffer) / sample_rate if sample_rate else 0.0
+    real_end_s = min(end_s, buffer_duration)
     i0 = max(0, min(len(buffer), int(round(start_s * sample_rate))))
-    i1 = max(0, min(len(buffer), int(round(end_s * sample_rate))))
+    i1 = max(0, min(len(buffer), int(round(real_end_s * sample_rate))))
     if i1 < i0:
         i0, i1 = i1, i0
     region = buffer[i0:i1]
-    pixel_count = max(1, int(pixel_count))
-    if region.size == 0:
+    # How many of the pixel_count columns actually fall within
+    # [start_s, real_end_s) — the rest (if any) is the silent remainder
+    # past the buffer's real end and gets zero-filled, never stretched.
+    real_pixel_count = max(0, min(
+        pixel_count, int(round((real_end_s - start_s) / (end_s - start_s) * pixel_count))))
+    if region.size == 0 or real_pixel_count == 0:
         z = np.zeros(pixel_count, dtype=np.float32)
         return z, z
-    pad = (-len(region)) % pixel_count
+    pad = (-len(region)) % real_pixel_count
     if pad:
         region = np.concatenate([region, np.zeros(pad, dtype=np.float32)])
-    chunks = region.reshape(pixel_count, -1)
-    return chunks.min(axis=1), chunks.max(axis=1)
+    chunks = region.reshape(real_pixel_count, -1)
+    silent_cols = pixel_count - real_pixel_count
+    mins = np.concatenate([chunks.min(axis=1), np.zeros(silent_cols, dtype=np.float32)])
+    maxes = np.concatenate([chunks.max(axis=1), np.zeros(silent_cols, dtype=np.float32)])
+    return mins, maxes
 
 
 def _same_file(a, b):
@@ -82,13 +153,23 @@ class AudioClip:
         self.buffer = np.zeros(0, dtype=np.float32)
         self.original_path = None   # protected copy — never overwritten again
         self.source_path = None     # the file the user originally opened
+        # Sample count as of load() — before any edit. Marker times only
+        # ever correspond to original_path's own waveform while the
+        # buffer is still exactly this length; a structural edit (cut,
+        # trim, split, insert, join, any range removal) changes it, at
+        # which point the CURRENT markers describe the edited buffer,
+        # not the original file the sidecar is named after. See
+        # app.py's _persist_audio_clip_markers, which checks this before
+        # ever overwriting original_path's sidecar.
+        self.original_length = 0
         # [{"time": seconds, "label": str, "auto": bool}, ...], always
-        # kept sorted by time. "auto" markers come from Detect Sections
-        # and are wholesale replaced by the next detection run; user-
-        # added ones (auto=False) never are. Undo/redo restore markers
-        # alongside the buffer (see _undo/_redo below) since a structural
-        # edit's marker positions are only meaningful paired with the
-        # buffer state they were computed against.
+        # kept sorted by time. Undo/redo restore markers alongside the
+        # buffer (see _undo/_redo below) since a structural edit's marker
+        # positions are only meaningful paired with the buffer state they
+        # were computed against. Persisted to a sidecar file next to
+        # original_path (see save_markers/load_markers) so they survive
+        # being closed and reopened later through any route, not just
+        # whichever one first carried them into this in-memory list.
         self.markers = []
         self._undo = []  # [(buffer, markers_snapshot), ...]
         self._redo = []
@@ -109,6 +190,7 @@ class AudioClip:
         de-duplication elsewhere in the app)."""
         clip = cls(sample_rate)
         clip.buffer = decode_to_buffer(path, sample_rate)
+        clip.original_length = len(clip.buffer)
         clip.source_path = path
         os.makedirs(originals_dir, exist_ok=True)
         stem, ext = os.path.splitext(os.path.basename(path))
@@ -120,22 +202,49 @@ class AudioClip:
             n += 1
         if not os.path.exists(dest):
             shutil.copy2(path, dest)
+            # `path`'s own sidecar (e.g. one Export just wrote next to an
+            # edited file, in a folder that isn't originals_dir) needs to
+            # travel along with it — the protected copy is what markers
+            # will always be looked up and persisted against from here
+            # on (see below and _persist_audio_clip_markers), so without
+            # this, markers saved next to a file living anywhere other
+            # than originals_dir would never be found again the moment
+            # it's opened, even though a sidecar genuinely exists.
+            src_sidecar = markers_sidecar_path(path)
+            if os.path.isfile(src_sidecar):
+                shutil.copy2(src_sidecar, markers_sidecar_path(dest))
         clip.original_path = dest
+        # Restores markers saved from a previous session (see
+        # save_markers) — the sidecar lives next to `dest`, the protected
+        # copy, since that's the one stable location this file will
+        # always be re-opened through and markers will always be
+        # persisted to, regardless of which path the caller passed in.
+        clip.markers = load_markers(dest)
         return clip
 
     def revert_to_original(self):
         """Discards every edit made so far, restoring the buffer exactly
-        as it was when first loaded. Markers are left untouched —
-        they're time annotations independent of the audio content, not
-        an edit to discard, and can already be present at load time
-        (e.g. live markers dropped while recording, carried straight
-        into this clip — see app.py's _open_audio_clip), so clearing
-        them here would delete exactly the markers most worth keeping.
-        Still undoable — this is itself just another buffer replacement
-        on the same stack."""
+        as it was when first loaded — markers included, reloaded fresh
+        from original_path's own sidecar (see save_markers/load_markers)
+        rather than left as whatever they currently are. That matters
+        whenever a structural edit (cut/trim/split/insert/join/any range
+        removal) happened since load: such an edit shifts marker times to
+        match the EDITED buffer, and those shifted times generally aren't
+        valid positions on the original (different-length) buffer this
+        reverts back to — keeping them as-is would silently misplace
+        every marker relative to the audio revert just restored. The
+        sidecar is exactly the record of what's actually correct for
+        original_path's own waveform, since app.py only ever writes to it
+        while the buffer is still that same original length (see
+        _persist_audio_clip_markers) — reloading from it is what
+        guarantees revert always lines markers back up correctly, not
+        just "whatever happened to survive in memory." Still undoable —
+        this is itself just another buffer(+markers) replacement on the
+        same stack."""
         if not self.original_path or not os.path.isfile(self.original_path):
             return False
         before = self._markers_copy()
+        self.markers = load_markers(self.original_path)
         self.apply(decode_to_buffer(self.original_path, self.sample_rate), markers_before=before)
         return True
 
@@ -218,23 +327,27 @@ class AudioClip:
     def _shift_markers_after_removal(self, removed_ranges_s):
         """Call after deciding which [start_s, end_s) spans are about to
         be cut from the timeline (in current, pre-removal coordinates),
-        before actually slicing self.buffer. Markers inside a removed
-        span collapse to its start; markers after a span shift left by
-        its duration — mirrors exactly what happens to the audio itself."""
+        before actually slicing self.buffer. A marker inside a removed
+        span is DELETED — the audio it was pointing at is gone, so
+        keeping it around (at the cut boundary, as an earlier version of
+        this did) just left a marker sitting on top of unrelated audio
+        with no indication anything had moved. A marker after a removed
+        span shifts left by that span's duration, same as the audio
+        itself does."""
         ranges = sorted(removed_ranges_s)
         new_markers = []
         for m in self.markers:
             t = m["time"]
             shift = 0.0
-            collapsed_to = None
+            removed = False
             for r0, r1 in ranges:
                 if r1 <= t:
                     shift += (r1 - r0)
                 elif r0 <= t < r1:
-                    collapsed_to = max(0.0, r0 - shift)
+                    removed = True
                     break
-            new_time = collapsed_to if collapsed_to is not None else max(0.0, t - shift)
-            new_markers.append({**m, "time": new_time})
+            if not removed:
+                new_markers.append({**m, "time": max(0.0, t - shift)})
         self.markers = new_markers
 
     def _shift_markers_after_insertion(self, at_s, duration_s):
@@ -288,9 +401,12 @@ class AudioClip:
         return self.buffer[:i].copy(), self.buffer[i:].copy()
 
     def join(self, other_buffer):
-        # Not currently wired to any UI action; markers are left as-is
-        # (nothing before the join point moves) rather than guessing
-        # what, if anything, the appended audio's own markers should be.
+        # Appends another file's audio to the end of this clip — see
+        # app.py's Structure group ("Append file…"). Markers are left as
+        # they are (nothing before the join point moves) rather than
+        # guessing what, if anything, the appended audio's own markers
+        # should be — it wasn't decoded with any of its own to carry over
+        # anyway (the caller only ever passes a plain buffer here).
         self.apply(np.concatenate([self.buffer, other_buffer]))
 
     def insert_silence(self, at_s, duration_s):
