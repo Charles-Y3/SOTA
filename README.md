@@ -1,6 +1,6 @@
 # SOTA — Smart Offline Transcription & Audio
 
-**Version 2.1.1**
+**Version 2.1.2**
 
 Drop in audio files, click **Transcribe All**, and get a transcript for each
 file — saved as `.docx` if Microsoft Word is installed, otherwise `.txt`. Or
@@ -421,11 +421,11 @@ macOS `.app`.
   **Run workflow**. When it finishes, download `SOTA-windows` and
   `SOTA-macOS` from the run's **Artifacts** section.
 - **Automatically**: every push to `main` builds both platforms.
-- **Releases**: pushing a tag like `v2.1.1` also publishes a GitHub Release
+- **Releases**: pushing a tag like `v2.1.2` also publishes a GitHub Release
   with both zips attached:
   ```
-  git tag v2.1.1
-  git push origin v2.1.1
+  git tag v2.1.2
+  git push origin v2.1.2
   ```
 
 ### Running the unsigned macOS build

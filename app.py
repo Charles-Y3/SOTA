@@ -612,21 +612,22 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
 
     def _build_audio_record_tab(self, parent):
         parent.grid_columnconfigure(0, weight=1)
-        parent.grid_rowconfigure(4, weight=1)  # the live waveform canvas
+        parent.grid_rowconfigure(3, weight=1)  # the live waveform canvas
 
         # Two side-by-side cards (same "grouped, bordered section" idea as
         # Audacity's own toolbars, and this app's Edit-tab button groups —
-        # see _build_button_group) rather than one long undifferentiated
-        # row: "Input" is everything about the mic/level/gain (what you'd
-        # touch while doing a sound check), "Format" is everything about
-        # the resulting file's quality/type — two different concerns that
-        # used to be interleaved across four loose rows.
+        # see _build_button_group): "Input" holds the mic/level/gain AND
+        # the live-monitor Output sub-section (its speaker only ever
+        # plays back what this same mic just captured, so it stays under
+        # one roof rather than a third card competing for width), "Format"
+        # is everything about the resulting file's quality/type.
         top_row = ctk.CTkFrame(parent, fg_color="transparent")
         top_row.grid(row=0, column=0, sticky="ew", padx=12, pady=(8, 6))
         top_row.grid_columnconfigure(0, weight=3)
         top_row.grid_columnconfigure(1, weight=2)
 
         CARD_HEADER_FONT = ctk.CTkFont(size=13, weight="bold")
+        SUBHEAD_FONT = ctk.CTkFont(size=12, weight="bold")
 
         input_card = ctk.CTkFrame(top_row)
         input_card.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
@@ -660,13 +661,74 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         self.arec_gain_value_label = ctk.CTkLabel(input_card, text="1.0x", text_color=self.MUTED_TEXT)
         self.arec_gain_value_label.grid(row=1, column=5, sticky="w", padx=(0, 12), pady=(2, 2))
 
+        # wraplength on both device-name labels below is load-bearing, not
+        # cosmetic: without it, a long device name (e.g. a USB headset's
+        # full product name) has no way to fit its allotted space except
+        # by forcing its whole COLUMN wider — grid sizes a column to its
+        # widest requester, and a plain CTkLabel has no width limit of its
+        # own. That growth cascades into the Format card getting squeezed
+        # or pushed off the window instead of this just wrapping a line.
         self.arec_device_label = ctk.CTkLabel(
-            input_card, text="", text_color=self.MUTED_TEXT, anchor="w")
-        self.arec_device_label.grid(row=2, column=0, columnspan=3, sticky="w", padx=12, pady=(0, 10))
+            input_card, text="", text_color=self.MUTED_TEXT, anchor="w",
+            justify="left", wraplength=440)
+        self.arec_device_label.grid(row=2, column=0, columnspan=3, sticky="w", padx=12, pady=(0, 2))
 
         self.arec_clip_label = ctk.CTkLabel(
-            input_card, text="", text_color="#e04b4b", font=ctk.CTkFont(weight="bold"), anchor="w")
-        self.arec_clip_label.grid(row=2, column=3, columnspan=3, sticky="w", padx=(0, 12), pady=(0, 10))
+            input_card, text="", text_color="#e04b4b", font=ctk.CTkFont(weight="bold"), anchor="w",
+            justify="left", wraplength=340)
+        self.arec_clip_label.grid(row=2, column=3, columnspan=3, sticky="w", padx=(0, 12), pady=(0, 2))
+
+        # Output — the live monitor: mirrors the mic to a speaker while
+        # recording (the mic is often in a different room from the
+        # machine running SOTA, so this is the only way to hear it as
+        # it's captured). On by default. A sub-section of Input rather
+        # than its own card — see the top_row comment above.
+        self.arec_output_subhead_label = ctk.CTkLabel(
+            input_card, text="", font=SUBHEAD_FONT, anchor="w")
+        self.arec_output_subhead_label.grid(row=3, column=0, columnspan=6, sticky="w", padx=12, pady=(8, 2))
+
+        # Its own row frame with its own column grid — NOT columns 0-5
+        # shared with the mic row above — so its spacing is tight and
+        # consistent regardless of how wide mic_menu/test_button/etc made
+        # those columns. A widget sharing a column with a much wider one
+        # from another row gets left-aligned inside that column's full
+        # width, which reads as a stray gap, not a deliberate one.
+        output_row = ctk.CTkFrame(input_card, fg_color="transparent")
+        output_row.grid(row=4, column=0, columnspan=6, sticky="w", padx=12, pady=(2, 2))
+
+        self.arec_speaker_menu = ctk.CTkOptionMenu(
+            output_row, width=210, dynamic_resizing=False, command=self._on_arec_pref_change)
+        self.arec_speaker_menu.grid(row=0, column=0, sticky="w", padx=(0, 18))
+
+        # Monitor volume — separate from Input gain: gain sets what gets
+        # RECORDED (and feeds clip detection), this only sets how loud the
+        # live playback sounds, so dialing it down to listen comfortably
+        # can never touch the recording itself. Stays live-adjustable
+        # during recording, same as the gain slider.
+        self.arec_monitor_volume_label = ctk.CTkLabel(output_row, text="")
+        self.arec_monitor_volume_label.grid(row=0, column=1, sticky="w", padx=(0, 6))
+        self.arec_monitor_volume_slider = ctk.CTkSlider(
+            output_row, width=90, from_=0.0, to=1.5, number_of_steps=30,
+            command=self._on_arec_monitor_volume_change)
+        self.arec_monitor_volume_slider.set(1.0)
+        self.arec_monitor_volume_slider.grid(row=0, column=2, sticky="w", padx=(0, 6))
+        # Fixed width, left-anchored: without it, "0%" vs "150%" are
+        # different natural label widths, so the checkbox after it would
+        # shift sideways every time the slider moves.
+        self.arec_monitor_volume_value_label = ctk.CTkLabel(
+            output_row, text="100%", text_color=self.MUTED_TEXT, width=40, anchor="w")
+        self.arec_monitor_volume_value_label.grid(row=0, column=3, sticky="w", padx=(0, 18))
+
+        self.arec_monitor_var = ctk.BooleanVar(value=True)
+        self.arec_monitor_checkbox = ctk.CTkCheckBox(
+            output_row, text="", variable=self.arec_monitor_var, command=self._on_arec_pref_change)
+        self.arec_monitor_checkbox.grid(row=0, column=4, sticky="w")
+
+        self.arec_speaker_device_label = ctk.CTkLabel(
+            input_card, text="", text_color=self.MUTED_TEXT, anchor="w",
+            justify="left", wraplength=440)
+        self.arec_speaker_device_label.grid(
+            row=5, column=0, columnspan=6, sticky="w", padx=12, pady=(0, 10))
 
         format_card = ctk.CTkFrame(top_row)
         format_card.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
@@ -706,23 +768,32 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         # building blocks the low-disk-space guard in _start_audio_record
         # and Settings' model-storage view already use.
         self.arec_space_label = ctk.CTkLabel(
-            format_card, text="", text_color=self.MUTED_TEXT, anchor="w")
+            format_card, text="", text_color=self.MUTED_TEXT, anchor="w",
+            justify="left", wraplength=480)
         self.arec_space_label.grid(row=2, column=0, columnspan=8, sticky="w", padx=12, pady=(0, 10))
         self._arec_space_tick_counter = 0
 
-        filename_row = ctk.CTkFrame(parent, fg_color="transparent")
-        filename_row.grid(row=1, column=0, sticky="ew", padx=12)
-        self.arec_filename_label = ctk.CTkLabel(filename_row, text="")
-        self.arec_filename_label.grid(row=0, column=0, padx=(0, 6), pady=(0, 8))
-        self.arec_filename_entry = ctk.CTkEntry(filename_row, width=440)
-        self.arec_filename_entry.grid(row=0, column=1, sticky="w", pady=(0, 8))
+        # Filename lives here rather than its own row below both cards —
+        # Format already governs everything about the resulting file
+        # (rate/channels/bit depth/type), and naming it is one more thing
+        # about that same file, not a third concern of its own. A divider
+        # marks it as its own sub-section rather than reading as a fifth
+        # format setting.
+        ctk.CTkFrame(format_card, height=1, fg_color=("gray80", "gray30")).grid(
+            row=3, column=0, columnspan=8, sticky="ew", padx=12, pady=(4, 8))
+        self.arec_filename_label = ctk.CTkLabel(format_card, text="", anchor="w")
+        self.arec_filename_label.grid(
+            row=4, column=0, columnspan=8, sticky="w", padx=12, pady=(0, 2))
+        self.arec_filename_entry = ctk.CTkEntry(format_card, width=480)
+        self.arec_filename_entry.grid(
+            row=5, column=0, columnspan=8, sticky="w", padx=12, pady=(0, 12))
 
         self.arec_timer_label = ctk.CTkLabel(
             parent, text="00:00", font=ctk.CTkFont(size=32, weight="bold"))
-        self.arec_timer_label.grid(row=2, column=0, pady=(24, 8))
+        self.arec_timer_label.grid(row=1, column=0, pady=(24, 8))
 
         controls = ctk.CTkFrame(parent, fg_color="transparent")
-        controls.grid(row=3, column=0, pady=(0, 12))
+        controls.grid(row=2, column=0, pady=(0, 12))
         self.arec_start_button = ctk.CTkButton(
             controls, text="", height=40, width=150,
             font=ctk.CTkFont(size=14, weight="bold"), command=self._toggle_audio_record)
@@ -771,7 +842,7 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         # one consistent waveform widget rather than two unrelated ones —
         # minus the marker lane, which only Edit has markers for.
         wave_area = ctk.CTkFrame(parent, fg_color="transparent")
-        wave_area.grid(row=4, column=0, sticky="nsew", padx=12, pady=(0, 6))
+        wave_area.grid(row=3, column=0, sticky="nsew", padx=12, pady=(0, 6))
         wave_area.grid_columnconfigure(1, weight=1)
         wave_area.grid_rowconfigure(1, weight=1)
 
@@ -806,7 +877,7 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         self.arec_wave_scrollbar.set(0, 1)
 
         bottom = ctk.CTkFrame(parent, fg_color="transparent")
-        bottom.grid(row=5, column=0, sticky="sew", padx=12, pady=(0, 8))
+        bottom.grid(row=4, column=0, sticky="sew", padx=12, pady=(0, 8))
         bottom.grid_columnconfigure(2, weight=1)
         self.arec_edit_button = ctk.CTkButton(
             bottom, text="", height=32, state="disabled",
@@ -826,18 +897,50 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         current = getattr(self, "_arec_selected_mic", "")
         self.arec_mic_menu.configure(values=[default_label] + names)
         self.arec_mic_menu.set(current if current in names else default_label)
+        self._refresh_audio_record_speaker_menu()
         self._update_arec_device_label()
+
+    def _refresh_audio_record_speaker_menu(self):
+        names = audio_record.list_output_devices()
+        default_label = i18n.t(self.ui_lang, "mic_default")
+        current = getattr(self, "_arec_selected_speaker", "")
+        self.arec_speaker_menu.configure(values=[default_label] + names)
+        self.arec_speaker_menu.set(current if current in names else default_label)
 
     def _on_arec_pref_change(self, _value=None):
         default_label = i18n.t(self.ui_lang, "mic_default")
         mic_value = self.arec_mic_menu.get()
         self._arec_selected_mic = "" if mic_value == default_label else mic_value
+        speaker_value = self.arec_speaker_menu.get()
+        self._arec_selected_speaker = "" if speaker_value == default_label else speaker_value
         self._update_arec_device_label()
+        # Monitor is the one Output control that stays live during
+        # recording (see _start_audio_record) — flipping the checkbox
+        # just mutes/unmutes the AudioRecorder's already-open duplex
+        # stream, no reopen needed, so it can take effect immediately.
+        if self.audio_recorder is not None:
+            self.audio_recorder.monitor = self.arec_monitor_var.get()
 
     def _update_arec_device_label(self):
         label = audio_record.resolved_device_label(getattr(self, "_arec_selected_mic", ""))
         self.arec_device_label.configure(
             text=i18n.t(self.ui_lang, "arec_device_using", device=label) if label else "")
+        monitor_on = self.arec_monitor_var.get()
+        if monitor_on:
+            speaker_label = audio_record.resolved_output_device_label(
+                getattr(self, "_arec_selected_speaker", ""))
+            self.arec_speaker_device_label.configure(
+                text=i18n.t(self.ui_lang, "arec_monitor_using", device=speaker_label)
+                if speaker_label else "")
+        else:
+            self.arec_speaker_device_label.configure(text="")
+        self.arec_monitor_volume_slider.configure(state="normal" if monitor_on else "disabled")
+        # The speaker DEVICE picker, unlike the Monitor checkbox itself,
+        # needs the stream reopened to take effect — so it stays locked
+        # for the whole recording regardless of what the checkbox does;
+        # only restore it here once nothing is actually recording.
+        if not self.audio_recording:
+            self.arec_speaker_menu.configure(state="normal" if monitor_on else "disabled")
 
     def _on_arec_gain_change(self, value):
         self.arec_gain_value_label.configure(text=f"{float(value):.1f}x")
@@ -845,6 +948,11 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
             self.audio_recorder.gain = float(value)
         if getattr(self, "mic_tester", None) is not None:
             self.mic_tester.gain = float(value)
+
+    def _on_arec_monitor_volume_change(self, value):
+        self.arec_monitor_volume_value_label.configure(text=f"{int(round(float(value) * 100))}%")
+        if self.audio_recorder is not None:
+            self.audio_recorder.monitor_volume = float(value)
 
     def _toggle_audio_record(self):
         if not self.audio_recording:
@@ -902,7 +1010,10 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
             channels=int(self.arec_channels_menu.get()),
             custom_stem=custom or None,
             gain=self.arec_gain_slider.get(),
-            bit_depth=int(self.arec_bitdepth_menu.get()))
+            bit_depth=int(self.arec_bitdepth_menu.get()),
+            monitor=self.arec_monitor_var.get(),
+            monitor_device_name=self._arec_selected_speaker,
+            monitor_volume=self.arec_monitor_volume_slider.get())
         self.audio_recording = True
         self.arec_following = True     # fresh recording — back to the live edge
         self.arec_span = self.DEFAULT_LIVE_SPAN_S
@@ -918,8 +1029,14 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         self.arec_partial_save_button.configure(state="disabled")  # needs 2+ markers first
         self.arec_test_mic_button.configure(state="disabled")
         for w in (self.arec_mic_menu, self.arec_rate_menu, self.arec_channels_menu,
-                  self.arec_bitdepth_menu, self.arec_format_menu, self.arec_filename_entry):
+                  self.arec_bitdepth_menu, self.arec_format_menu, self.arec_filename_entry,
+                  self.arec_speaker_menu):
             w.configure(state="disabled")
+        # Monitor itself stays live-toggleable during recording (unlike
+        # the speaker device it plays through, which needs the stream
+        # reopened) — see _on_arec_pref_change, which pushes the flip
+        # straight to the running AudioRecorder.
+        self.arec_monitor_checkbox.configure(state="normal")
         self._set_audio_record_status("arec_status_recording", {})
         self.audio_recorder.start()
 
@@ -1169,8 +1286,11 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
             self.arec_start_button.configure(state="normal")
             self.arec_test_mic_button.configure(state="normal")
             for w in (self.arec_mic_menu, self.arec_rate_menu, self.arec_channels_menu,
-                      self.arec_bitdepth_menu, self.arec_format_menu, self.arec_filename_entry):
+                      self.arec_bitdepth_menu, self.arec_format_menu, self.arec_filename_entry,
+                      self.arec_monitor_checkbox):
                 w.configure(state="normal")
+            self.arec_speaker_menu.configure(
+                state="normal" if self.arec_monitor_var.get() else "disabled")
             self.arec_filename_entry.delete(0, "end")
             if not path:
                 self._set_audio_record_status("arec_status_failed", {})
@@ -5241,6 +5361,8 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         t = lambda key, **kw: i18n.t(self.ui_lang, key, **kw)  # noqa: E731
 
         self.arec_input_card_label.configure(text=t("arec_input_card_label"))
+        self.arec_output_subhead_label.configure(text=t("arec_output_card_label"))
+        self.arec_monitor_volume_label.configure(text=t("arec_monitor_volume_label"))
         self.arec_format_card_label.configure(text=t("arec_format_card_label"))
         self.arec_rate_label.configure(text=t("arec_rate_label"))
         self.arec_channels_label.configure(text=t("arec_channels_label"))
@@ -5250,6 +5372,8 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         self.arec_gain_label.configure(text=t("arec_gain_label"))
         self.arec_test_mic_button.configure(text=t(
             "arec_test_mic_stop" if getattr(self, "mic_tester", None) is not None else "arec_test_mic"))
+        self.arec_monitor_checkbox.configure(text=t("arec_monitor_checkbox"))
+        self._update_arec_device_label()
         self.arec_filename_label.configure(text=t("arec_filename_label"))
         self.arec_filename_entry.configure(placeholder_text=t("live_filename_placeholder"))
         self.arec_start_button.configure(text=t("arec_start_button"))
