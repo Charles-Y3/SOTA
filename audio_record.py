@@ -10,6 +10,7 @@ patches itself as it goes) mirrors LiveTranscriber's reasoning, but is a
 fresh, self-contained implementation, not a shared one.
 """
 
+import collections
 import datetime
 import os
 import threading
@@ -19,6 +20,7 @@ import numpy as np
 import settings
 
 DEFAULT_SAMPLE_RATE = 44100
+MONITOR_BUFFER_S = 0.5  # live-monitor playback lag cap — see AudioRecorder.__init__
 SAMPLE_RATE_OPTIONS = [16000, 22050, 44100, 48000]
 CHANNEL_OPTIONS = [1, 2]
 BIT_DEPTH_OPTIONS = [16, 24]
@@ -248,21 +250,42 @@ class AudioRecorder(threading.Thread):
         self.custom_stem = custom_stem or None
         self.gain = gain
         self.bit_depth = bit_depth if bit_depth in BIT_DEPTH_OPTIONS else DEFAULT_BIT_DEPTH
-        # Live monitor: mirrors the mic straight to a speaker while
-        # recording, e.g. when the mic is in a different room from the
-        # machine running SOTA. `monitor_active` reflects whether it's
-        # actually running — the duplex stream this needs can fail to
-        # open (e.g. the chosen speaker doesn't support the recording's
-        # sample rate/channel count) without that being a reason to fail
-        # the recording itself; run() falls back to input-only in that case.
-        # `monitor_volume` is deliberately separate from `gain`: gain sets
-        # what gets recorded (and feeds clip detection), monitor_volume
-        # only scales what comes out the speaker, so turning it down to
-        # listen comfortably can never touch the recorded file.
+        # Live monitor: mirrors the mic to a speaker while recording, e.g.
+        # when the mic is in a different room from the machine running
+        # SOTA. Deliberately a SEPARATE sd.OutputStream, not one combined
+        # duplex stream — full duplex ties the mic and speaker to one
+        # PortAudio callback on one shared clock, and the two devices'
+        # independent hardware clocks drift apart the longer that stays
+        # open; a driver that handles that drift badly can stall inside
+        # the callback and hang the whole recording (confirmed in the
+        # wild: reproduced on 2.1.2's duplex version, absent on 2.1.1's
+        # plain sd.InputStream). Two independent streams, loosely coupled
+        # by `_monitor_queue`, mean a stalled/flaky output device can only
+        # ever degrade the monitor playback (a skip, a gap) — it cannot
+        # block the input stream's own callback or thread, since they're
+        # not the same stream. `monitor_active` reflects whether the
+        # output stream is actually running — it can fail to open (e.g.
+        # the chosen speaker doesn't support the recording's sample rate/
+        # channel count) without that being a reason to fail the
+        # recording itself. `monitor_volume` is deliberately separate
+        # from `gain`: gain sets what gets recorded (and feeds clip
+        # detection), monitor_volume only scales what comes out the
+        # speaker, so turning it down to listen comfortably can never
+        # touch the recorded file.
         self.monitor = monitor
         self.monitor_device_name = monitor_device_name or ""
         self.monitor_volume = monitor_volume
         self.monitor_active = False
+        self._monitor_stream = None
+        self._monitor_lock = threading.Lock()
+        self._monitor_queue = collections.deque()
+        self._monitor_queue_samples = 0
+        # How far the monitor is allowed to lag before old audio is
+        # dropped rather than left to grow without bound — the same
+        # "never let a buffer grow unboundedly on a stall" principle as
+        # the live-transcription tail-cap fix, applied here to the
+        # monitor path instead of the transcription one.
+        self._monitor_cap_samples = int(sample_rate * MONITOR_BUFFER_S)
         self.stop_event = threading.Event()
         self._paused = threading.Event()
         self._lock = threading.Lock()
@@ -340,28 +363,12 @@ class AudioRecorder(threading.Thread):
     def _emit(self, *event):
         self.events.put(event)
 
-    def _on_audio(self, indata, _frames, _time_info, _status, outdata=None):
+    def _on_audio(self, indata, _frames, _time_info, _status):
         chunk = indata.copy()
         if self.gain != 1.0:
             chunk *= self.gain
-        if outdata is not None:
-            # Live monitor: mirror the (gained) input straight to the
-            # speaker on this same callback tick, rather than a second
-            # OutputStream with its own buffer that could drift out of
-            # sync with this one. monitor_volume scales ONLY this path —
-            # the disk write and clip detection below always use the
-            # gained-only `chunk`. The duplex stream stays open for the
-            # whole recording regardless of `self.monitor` (see run()) so
-            # that toggling the Monitor checkbox mid-recording can just
-            # mute/unmute here instead of needing the stream reopened.
-            if self.monitor:
-                monitor_chunk = chunk * self.monitor_volume if self.monitor_volume != 1.0 else chunk
-                n = min(len(monitor_chunk), len(outdata))
-                outdata[:n] = np.clip(monitor_chunk[:n], -1.0, 1.0)
-                if n < len(outdata):
-                    outdata[n:] = 0.0
-            else:
-                outdata[:] = 0.0
+        if self.monitor and self._monitor_stream is not None:
+            self._push_monitor_chunk(chunk)
         if self._paused.is_set():
             return
         mono = chunk[:, 0]
@@ -375,8 +382,42 @@ class AudioRecorder(threading.Thread):
                 self._clipped = True
         self.level = _rms(mono)
 
-    def _on_audio_duplex(self, indata, outdata, frames, time_info, status):
-        self._on_audio(indata, frames, time_info, status, outdata=outdata)
+    def _push_monitor_chunk(self, chunk):
+        """Queues a (gained) chunk for the independent monitor
+        OutputStream's callback to play — see __init__'s comment on why
+        this is a queue between two separate streams rather than one
+        combined duplex stream. monitor_volume scales ONLY this queued
+        copy; the disk write and clip detection in _on_audio always use
+        the gained-only `chunk` untouched by it. Caps total queued
+        duration at MONITOR_BUFFER_S by dropping the OLDEST audio first —
+        the same "never let it grow unboundedly" rule as the live-
+        transcription tail cap — so a stalled/slow output device can only
+        ever make playback lag briefly and skip, never accumulate memory
+        or back up onto the input side."""
+        monitor_chunk = chunk * self.monitor_volume if self.monitor_volume != 1.0 else chunk
+        monitor_chunk = np.clip(monitor_chunk, -1.0, 1.0).astype(np.float32)
+        with self._monitor_lock:
+            self._monitor_queue.append(monitor_chunk)
+            self._monitor_queue_samples += len(monitor_chunk)
+            while self._monitor_queue_samples > self._monitor_cap_samples and self._monitor_queue:
+                dropped = self._monitor_queue.popleft()
+                self._monitor_queue_samples -= len(dropped)
+
+    def _on_monitor_output(self, outdata, frames, _time_info, _status):
+        with self._monitor_lock:
+            filled = 0
+            while filled < frames and self._monitor_queue:
+                piece = self._monitor_queue[0]
+                take = min(len(piece), frames - filled)
+                outdata[filled:filled + take] = piece[:take]
+                self._monitor_queue_samples -= take
+                if take == len(piece):
+                    self._monitor_queue.popleft()
+                else:
+                    self._monitor_queue[0] = piece[take:]
+                filled += take
+        if filled < frames:
+            outdata[filled:] = 0.0
 
     def _accumulate_recent(self, mono_chunk):
         """Called under self._lock, right alongside _accumulate_peaks —
@@ -495,44 +536,49 @@ class AudioRecorder(threading.Thread):
         self._emit("record_started", self._audio_path)
         try:
             device = _resolve_device(self.device_name)
-            # The duplex stream is attempted regardless of the initial
-            # Monitor checkbox state (self.monitor), not just when it
-            # started checked — muting/unmuting happens per-callback in
-            # _on_audio instead, which is what lets the checkbox be
-            # toggled live for the rest of this recording (app.py pushes
-            # the flip straight into self.monitor). Only a genuine
-            # failure to open it at all (unsupported device/format) falls
-            # back to input-only, and that fallback is then permanent for
-            # this recording — reopening mid-stream would glitch the
-            # recording itself to fix something that's just for listening.
-            try:
-                out_device = _resolve_output_device(self.monitor_device_name)
-                self._stream = sd.Stream(
-                    samplerate=self.sample_rate, channels=self.channels,
-                    dtype="float32", device=(device, out_device),
-                    callback=self._on_audio_duplex)
-                self._stream.start()
-                self.monitor_active = True
-            except Exception:
-                settings.log_exception(
-                    "Audio Studio monitor unavailable, recording without it:")
+            # The actual recording always goes through this plain
+            # InputStream, unconditionally — identical to how 2.1.1
+            # captured audio, before live-monitor existed. Its health
+            # never depends on the separate monitor OutputStream below
+            # (see __init__'s comment on why they're not one combined
+            # duplex stream): if the speaker/monitor side ever stalls or
+            # a driver misbehaves, this stream and this thread are
+            # unaffected, so recording itself can't hang because of it.
+            self._stream = sd.InputStream(
+                samplerate=self.sample_rate, channels=self.channels,
+                dtype="float32", device=device, callback=self._on_audio)
+            self._stream.start()
+            if self.monitor:
                 try:
-                    if self._stream is not None:
-                        self._stream.close()
+                    out_device = _resolve_output_device(self.monitor_device_name)
+                    self._monitor_stream = sd.OutputStream(
+                        samplerate=self.sample_rate, channels=self.channels,
+                        dtype="float32", device=out_device,
+                        callback=self._on_monitor_output)
+                    self._monitor_stream.start()
+                    self.monitor_active = True
                 except Exception:
-                    pass
-                self._stream = None
-            if self._stream is None:
-                self._stream = sd.InputStream(
-                    samplerate=self.sample_rate, channels=self.channels,
-                    dtype="float32", device=device, callback=self._on_audio)
-                self._stream.start()
+                    settings.log_exception(
+                        "Audio Studio monitor unavailable, recording without it:")
+                    try:
+                        if self._monitor_stream is not None:
+                            self._monitor_stream.close()
+                    except Exception:
+                        pass
+                    self._monitor_stream = None
             while not self.stop_event.is_set():
                 self.stop_event.wait(self.TICK_S)
                 self._flush_audio()
         except Exception:
             settings.log_exception("Audio Studio recording failed:")
         finally:
+            if self._monitor_stream is not None:
+                try:
+                    self._monitor_stream.stop()
+                    self._monitor_stream.close()
+                except Exception:
+                    pass
+                self._monitor_stream = None
             if self._stream is not None:
                 try:
                     self._stream.stop()

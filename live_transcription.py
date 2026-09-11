@@ -532,10 +532,28 @@ class LiveTranscriber(threading.Thread):
         try:
             text, detected = transcriber.sensevoice_transcribe(tail, self._language_for_call())
         except Exception:
-            # Don't let one bad tick kill the whole session — the tail
-            # isn't cleared, so this same audio just gets retried next
-            # tick instead of being silently dropped.
             settings.log_exception("Live transcription tick failed, retrying next tick:")
+            # A single bad tick just retries next time with this same
+            # (short) tail — cheap and lossless. But if the tail was
+            # ALREADY at the hard cap when this failed, retrying leaves it
+            # to keep growing tick after tick (the mic never stops
+            # recording), and SenseVoice's attention cost grows with the
+            # SQUARE of the audio length — so a sustained failure at the
+            # cap turns into a runaway spiral: each retry's tail is bigger
+            # than the last, so each retry is more likely to fail, and
+            # fail on an even bigger allocation than before. Seen in the
+            # wild as repeated identical crashes trying to allocate tens
+            # of GB. Force-dropping this stretch from the TEXT (not the
+            # recording — the raw audio is already safe in _pending_disk,
+            # flushed to the WAV independently of this) breaks that
+            # spiral at the cost of losing one stretch of transcript
+            # instead of hanging/crashing repeatedly and losing more.
+            if tail_dur >= MAX_UNCOMMITTED_S:
+                self._commit_tail()
+                settings.log(
+                    f"Live transcription: dropped {tail_dur:.1f}s of audio from the "
+                    "transcript after a tick failure at the buffer cap (the recording "
+                    "itself was unaffected).")
             return
         if detected and not self.language:
             self._pinned_lang = detected

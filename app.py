@@ -916,10 +916,18 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         self._update_arec_device_label()
         # Monitor is the one Output control that stays live during
         # recording (see _start_audio_record) — flipping the checkbox
-        # just mutes/unmutes the AudioRecorder's already-open duplex
-        # stream, no reopen needed, so it can take effect immediately.
+        # just mutes/unmutes the independent monitor OutputStream (see
+        # audio_record.AudioRecorder._push_monitor_chunk), no reopen
+        # needed, so it can take effect immediately. Only has an audible
+        # effect if the recording actually started with Monitor on —
+        # that's the only case a monitor stream exists at all to mute.
         if self.audio_recorder is not None:
-            self.audio_recorder.monitor = self.arec_monitor_var.get()
+            new_monitor = self.arec_monitor_var.get()
+            if new_monitor != self.audio_recorder.monitor:
+                settings.log_action(
+                    f"Monitor toggled {'on' if new_monitor else 'off'} mid-recording "
+                    f"(Audio Studio, monitor_active={self.audio_recorder.monitor_active})")
+            self.audio_recorder.monitor = new_monitor
 
     def _update_arec_device_label(self):
         label = audio_record.resolved_device_label(getattr(self, "_arec_selected_mic", ""))
@@ -1004,6 +1012,10 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
                 self._set_audio_record_status(
                     "arec_status_low_disk", {"minutes": self.MIN_RECORDING_MINUTES})
                 return
+        settings.log_action(
+            f"Start Recording (Audio Studio) — mic={self._arec_selected_mic or 'default'}, "
+            f"monitor={'on' if self.arec_monitor_var.get() else 'off'}, "
+            f"speaker={self._arec_selected_speaker or 'default'}")
         self.audio_recorder = audio_record.AudioRecorder(
             self.events, device_name=self._arec_selected_mic,
             sample_rate=int(self.arec_rate_menu.get()),
@@ -1044,15 +1056,18 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         if not self.audio_recorder:
             return
         if self.audio_recorder.is_paused:
+            settings.log_action("Resume Recording (Audio Studio)")
             self.audio_recorder.resume()
             self.arec_pause_button.configure(text=i18n.t(self.ui_lang, "arec_pause"))
             self._set_audio_record_status("arec_status_recording", {})
         else:
+            settings.log_action("Pause Recording (Audio Studio)")
             self.audio_recorder.pause()
             self.arec_pause_button.configure(text=i18n.t(self.ui_lang, "arec_resume"))
             self._set_audio_record_status("arec_status_paused", {})
 
     def _stop_audio_record(self):
+        settings.log_action("Stop Recording (Audio Studio)")
         if self.audio_recorder:
             self.audio_recorder.stop()
         self.arec_stop_button.configure(state="disabled")
@@ -8072,6 +8087,7 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         # is the one place the Live tab can trigger it. Gate on disk room.
         if not self._confirm_sensevoice_download():
             return
+        settings.log_action("Start Recording (Live Transcription)")
         code = self.prefs["live_language"]
         language = "" if code == "auto" else code
         self.live_session_started = True
@@ -8163,6 +8179,7 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         self._render_play_button()
 
     def _stop_live_recording(self):
+        settings.log_action("Stop Recording (Live Transcription)")
         if self.live_worker:
             self.live_worker.stop()
         self.live_toggle_button.configure(state="disabled")

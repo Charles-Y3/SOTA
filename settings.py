@@ -1,11 +1,12 @@
 """User settings, app folders, and logging for SOTA."""
 
+import datetime
 import json
 import os
 import sys
 import traceback
 
-APP_VERSION = "2.1.2"
+APP_VERSION = "2.1.3"
 
 
 def _default_app_dir():
@@ -213,10 +214,23 @@ def save(values):
 def log(message):
     try:
         os.makedirs(APP_DIR, exist_ok=True)
+        stamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         with open(LOG_FILE, "a", encoding="utf-8") as f:
-            f.write(message.rstrip() + "\n")
+            f.write(f"[{stamp}] {message.rstrip()}\n")
     except Exception:
         pass
+
+
+def log_action(message):
+    """Logs a user-initiated action (Start/Stop Recording, toggling
+    Monitor, etc.) — same timestamped file as log()/log_exception(), just
+    a distinct name so it's clear at the call site that this isn't error
+    reporting. The point is diagnosing a HANG: a hang produces no
+    exception (nothing ever gets far enough to raise one, see the 2.1.2
+    live-monitor hang), so the only way to tell what the app was doing
+    right before one is a timestamped trail of what the user actually
+    clicked, checked against how long ago the last line in this file is."""
+    log("ACTION: " + message)
 
 
 def log_exception(prefix):
