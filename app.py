@@ -286,12 +286,35 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         # (rename, and the per-segment Save added alongside this) can cut
         # and export each span without a separate live-recording pipeline.
         self._arec_markers = []
+        self._arec_pending_label = ""
         self.audio_player = Player(
             ready_callback=lambda: self.events.put(("audio_speed_ready",)),
             progress_callback=lambda speed, frac: None,
         )
         self.audio_clip = None            # audio_clip.AudioClip currently open, or None
         self.audio_clip_path = None       # source path it was opened from
+        # Set when audio_clip_path is a Record-tab recording that was
+        # still running at the moment it was opened (see _open_audio_clip)
+        # — lets "Bring in new audio" (_audio_edit_pull_in_live) find its
+        # source and know how many seconds of it have already been pulled
+        # into the clip, independent of whatever edits the user has since
+        # made to the clip's own buffer. None whenever the open file isn't
+        # (or is no longer) an active recording.
+        # audio_clip_live_wav_path is always the recorder's own WAV — the
+        # stable identity matched against "record_stopped" events (the
+        # WAV that gets deleted/renamed after Stop always started as
+        # this), regardless of which file was actually opened/displayed.
+        # audio_clip_live_display_path is whichever file that actually
+        # was (the WAV, or its MP3 sibling if streaming was active and
+        # "Open in Edit" preferred it — see _send_last_recording_to_edit)
+        # — _audio_edit_pull_in_live reads from THIS one, since a growing
+        # MP3 needs a different (decode-whole-and-slice) approach than a
+        # growing WAV's cheap frame-range extraction.
+        self.audio_clip_live_wav_path = None
+        self.audio_clip_live_display_path = None
+        self.audio_clip_live_seconds = 0.0
+        self._aedit_pull_in_visual_state = None  # see _refresh_audio_edit_pull_in_button
+        self._arec_finalizing_live_clip = None  # see _on_audio_record_event/_finish_audio_record_save
         self.audio_selection = None       # (start_s, end_s) or None
         self._find_cancel_event = None    # threading.Event for the in-progress Find Similar search, or None
         self._find_progress_dialog = None
@@ -333,6 +356,15 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         self.live_preload_started = False
         self.live_status_key = None
         self.live_status_detail = None
+        # Filename-label state (see _stop_live_recording/_apply_live_label):
+        # the label typed into live_filename_entry, read once at the actual
+        # Stop click since the field stays editable for the whole session;
+        # the last-known final audio/txt paths, tracked from every
+        # "live_saved" event so the true final ones are on hand once
+        # "live_stopped" arrives and the rename can happen.
+        self._live_pending_label = ""
+        self._live_last_audio_path = None
+        self._live_last_txt_path = None
 
         # Edit tab state
         self.player = Player(
@@ -342,6 +374,17 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         )
         self.edit_files = []       # [{label, audio, txt}] (shared with AI tab)
         self.edit_current = None   # current {label, audio, txt}
+        # True once the user has explicitly picked a file here (dropdown or
+        # Open a file…) — _maybe_autoload_edit then stops silently jumping
+        # the tab to whatever transcript/live session most recently
+        # finished, since that would otherwise yank a reviewer's view away
+        # mid-read the moment a brand new recording starts elsewhere (e.g.
+        # Recording begins the next person's session while Wenshu is still
+        # reading the previous one — no unsaved-edits guard would have
+        # caught that, since simply reading makes no edits). Auto-follow
+        # stays the default — this only ever gets set true by deliberate
+        # user action, never reset automatically.
+        self._edit_manual_pin = False
         self.edit_status_key = None
         self.edit_status_detail = None
         self._edit_loaded_text = None  # editor content as of the last load — lets
@@ -363,6 +406,7 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         self.llm_worker = None
         self.llm_running = False
         self.llm_current = None
+        self._llm_manual_pin = False  # same idea as _edit_manual_pin, for the AI tab's source picker
         self.llm_status_key = None
         self.llm_status_detail = None
 
@@ -787,6 +831,13 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         self.arec_filename_entry = ctk.CTkEntry(format_card, width=480)
         self.arec_filename_entry.grid(
             row=5, column=0, columnspan=8, sticky="w", padx=12, pady=(0, 12))
+        # Keeps Audio Studio's Edit subtab's file-name preview live as the
+        # label is typed — see _update_dirty_indicator/_preview_labeled_name.
+        # A no-op whenever that subtab isn't tracking a live recording
+        # (_update_dirty_indicator's own guard), so this is safe to fire
+        # unconditionally on every keystroke.
+        self.arec_filename_entry.bind(
+            "<KeyRelease>", lambda _e: self._update_dirty_indicator())
 
         self.arec_timer_label = ctk.CTkLabel(
             parent, text="00:00", font=ctk.CTkFont(size=32, weight="bold"))
@@ -1000,11 +1051,6 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
     def _start_audio_record(self):
         self._stop_mic_test()
         self._on_arec_pref_change()
-        custom = self.arec_filename_entry.get().strip()
-        error_key = _validate_live_filename(custom)
-        if error_key:
-            self._set_audio_record_status(error_key, {})
-            return
         free_gb = sysinfo.free_disk_gb(settings.audio_recordings_folder())
         if free_gb is not None:
             required_gb = self._arec_bytes_per_second() * 60 * self.MIN_RECORDING_MINUTES / (1024 ** 3)
@@ -1020,12 +1066,12 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
             self.events, device_name=self._arec_selected_mic,
             sample_rate=int(self.arec_rate_menu.get()),
             channels=int(self.arec_channels_menu.get()),
-            custom_stem=custom or None,
             gain=self.arec_gain_slider.get(),
             bit_depth=int(self.arec_bitdepth_menu.get()),
             monitor=self.arec_monitor_var.get(),
             monitor_device_name=self._arec_selected_speaker,
-            monitor_volume=self.arec_monitor_volume_slider.get())
+            monitor_volume=self.arec_monitor_volume_slider.get(),
+            want_mp3=self.arec_format_menu.get() == "MP3")
         self.audio_recording = True
         self.arec_following = True     # fresh recording — back to the live edge
         self.arec_span = self.DEFAULT_LIVE_SPAN_S
@@ -1040,10 +1086,22 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         self.arec_mark_button.configure(state="normal")
         self.arec_partial_save_button.configure(state="disabled")  # needs 2+ markers first
         self.arec_test_mic_button.configure(state="disabled")
+        # "Open in Edit" now works while recording, not just after Stop —
+        # it opens whatever's been flushed to disk so far (same safe
+        # concurrent-read pattern Partial Save already relies on) and lets
+        # "Bring in new audio" pull in the rest as it's captured. See
+        # _send_last_recording_to_edit and _audio_edit_pull_in_live.
+        self.arec_edit_button.configure(state="normal")
         for w in (self.arec_mic_menu, self.arec_rate_menu, self.arec_channels_menu,
-                  self.arec_bitdepth_menu, self.arec_format_menu, self.arec_filename_entry,
+                  self.arec_bitdepth_menu, self.arec_format_menu,
                   self.arec_speaker_menu):
             w.configure(state="disabled")
+        # arec_filename_entry deliberately stays editable throughout the
+        # recording — it's no longer the live file's actual name (that's
+        # always the auto timestamp, so an in-progress WAV/MP3 path never
+        # changes mid-write), just an optional label appended to the
+        # finished file's name once Stop is clicked. See _stop_audio_record
+        # and _apply_recording_label.
         # Monitor itself stays live-toggleable during recording (unlike
         # the speaker device it plays through, which needs the stream
         # reopened) — see _on_arec_pref_change, which pushes the flip
@@ -1068,6 +1126,13 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
 
     def _stop_audio_record(self):
         settings.log_action("Stop Recording (Audio Studio)")
+        # Read the label right now, at the moment of the actual Stop click —
+        # the field has been freely editable for the whole recording, so
+        # this is the only point that means "the user is done typing it."
+        # Applied later, in _finish_audio_record_save, once the real file
+        # (after any MP3 conversion) is known.
+        self._arec_pending_label = self.arec_filename_entry.get().strip()
+        self.arec_filename_entry.delete(0, "end")
         if self.audio_recorder:
             self.audio_recorder.stop()
         self.arec_stop_button.configure(state="disabled")
@@ -1106,6 +1171,21 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         self._redraw_arec_timeline()
         if len(self._arec_markers) >= 2:
             self.arec_partial_save_button.configure(state="normal")
+        # Written immediately (not just at Stop, which used to be the only
+        # time _finish_audio_record_save wrote this same sidecar) so a
+        # marker dropped mid-recording is visible right away to anything
+        # reading the file's markers, including Audio Studio's own Edit
+        # subtab if it currently has this exact recording open (see
+        # audio_clip_live_wav_path) — appended straight into the live
+        # AudioClip's own marker list too, since that's already in memory
+        # and won't otherwise refresh from disk until the file is reopened.
+        audio_clip.save_markers(self.audio_recorder.audio_path, self._arec_markers)
+        if self.audio_clip_live_wav_path == self.audio_recorder.audio_path and self.audio_clip:
+            self.audio_clip.markers = sorted(
+                self.audio_clip.markers + [{"time": time_s, "label": label, "auto": False}],
+                key=lambda m: m["time"])
+            self._render_markers_panel()
+            self._redraw_waveform()
 
     def _arec_partial_save_source_path(self):
         """The file Partial Save should read from right now: the live
@@ -1293,24 +1373,69 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
 
     def _on_audio_record_event(self, kind, *rest):
         if kind == "record_stopped":
-            path, _seconds = rest
+            path, _seconds, mp3_path = rest
             clipped = self.audio_recorder.clipped if self.audio_recorder else False
             self.audio_recording = False
             self.audio_recorder = None
+            if self.audio_clip_live_wav_path == path:
+                # One last pull of whatever landed between the last "Bring
+                # in new audio" click and this Stop — done now, on the WAV,
+                # before the possible conversion/rename below can delete or
+                # rename it. Uses the WAV specifically (not
+                # audio_clip_live_display_path, which might be the MP3
+                # sibling if that's what got opened) since it's the one
+                # guaranteed to still exist at this exact moment.
+                self._pull_in_final_live_audio(path)
+                # Consumed by _finish_audio_record_save once the TRUE final
+                # path (after any MP3 conversion and filename label) is
+                # known, so the still-open Edit view gets re-pointed at it
+                # instead of being left referencing a file that's about to
+                # be renamed or deleted out from under it. Captured as the
+                # exact path that was open (not just a bool) so that check
+                # can confirm the user hasn't since switched to editing
+                # something else entirely during the gap before then (e.g.
+                # the busy modal while a fallback MP3 conversion runs).
+                self._arec_finalizing_live_clip = self.audio_clip_live_display_path
+                self.audio_clip_live_wav_path = None
+                self.audio_clip_live_display_path = None
             self._clear_safeguard_notices_with_prefix("audio_record_")
             self.arec_start_button.configure(state="normal")
             self.arec_test_mic_button.configure(state="normal")
             for w in (self.arec_mic_menu, self.arec_rate_menu, self.arec_channels_menu,
-                      self.arec_bitdepth_menu, self.arec_format_menu, self.arec_filename_entry,
+                      self.arec_bitdepth_menu, self.arec_format_menu,
                       self.arec_monitor_checkbox):
                 w.configure(state="normal")
             self.arec_speaker_menu.configure(
                 state="normal" if self.arec_monitor_var.get() else "disabled")
-            self.arec_filename_entry.delete(0, "end")
             if not path:
                 self._set_audio_record_status("arec_status_failed", {})
             elif self.arec_format_menu.get() == "MP3":
-                self._convert_recording_to_mp3(path, clipped)
+                if mp3_path:
+                    # Already encoded incrementally during the recording
+                    # (see AudioRecorder.want_mp3) — Stop only needs to drop
+                    # the now-redundant intermediate WAV, not run a multi-
+                    # minute conversion, so this skips the busy modal
+                    # entirely instead of just backgrounding it.
+                    try:
+                        os.remove(path)
+                    except OSError:
+                        settings.log_exception("Could not remove intermediate WAV after streaming MP3:")
+                    # A marker sidecar may already have been written next
+                    # to the WAV (see _add_live_recording_marker, which
+                    # persists it live rather than only at Stop) — orphaned
+                    # now that the WAV itself is gone; _finish_audio_record_save
+                    # writes a fresh one next to the real final path below.
+                    try:
+                        os.remove(audio_clip.markers_sidecar_path(path))
+                    except OSError:
+                        pass
+                    self._finish_audio_record_save(mp3_path, clipped)
+                else:
+                    # Streaming MP3 wasn't available or failed partway
+                    # (see AudioRecorder._disable_mp3_stream) — fall back to
+                    # the old whole-file conversion, still safely
+                    # backgrounded behind the busy modal.
+                    self._convert_recording_to_mp3(path, clipped)
             else:
                 self._finish_audio_record_save(path, clipped)
         # "record_started" needs no UI update beyond what _start_audio_record
@@ -1330,6 +1455,10 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         def work():
             audio_export.export_wav_as_mp3(wav_path, mp3_path)
             os.remove(wav_path)
+            try:
+                os.remove(audio_clip.markers_sidecar_path(wav_path))
+            except OSError:
+                pass
             return mp3_path
 
         def done(result, error):
@@ -1343,7 +1472,107 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
 
         self._run_busy("arec_status_converting_mp3", work, done)
 
+    def _pull_in_final_live_audio(self, wav_path):
+        """One last synchronous pull of whatever landed between the last
+        "Bring in new audio" click (_audio_edit_pull_in_live) and the
+        moment Stop was pressed — called from _on_audio_record_event right
+        as "record_stopped" arrives, before any MP3 conversion or
+        filename-label rename can touch the file (see that call site).
+        Always reads `wav_path` specifically (never
+        audio_clip_live_display_path, which might be the MP3 sibling if
+        that's what got opened) since it's the one guaranteed to still
+        exist, complete and untouched, at this exact moment — MP3 and WAV
+        share the same real-time timeline closely enough (the only
+        difference being LAME's fixed, sub-frame encoder delay) that
+        audio_clip_live_seconds, whichever one it was last measured
+        against, is still an accurate cut point on this file. Small and
+        quick enough (typically a few seconds' worth, if the user was
+        clicking "Bring in new audio" as they went) to do inline rather
+        than through the busy-modal async path everything else here uses."""
+        if not (self.audio_clip and os.path.exists(wav_path)):
+            return
+        import wave
+
+        try:
+            with wave.open(wav_path, "rb") as wf:
+                total_s = wf.getnframes() / wf.getframerate()
+        except Exception:
+            settings.log_exception("Could not read the final recording length for pull-in:")
+            return
+        start_s = self.audio_clip_live_seconds
+        if total_s <= start_s + 0.05:
+            return
+        tmp_path = wav_path + ".pullin.tmp.wav"
+        try:
+            audio_record.extract_wav_segment(wav_path, start_s, total_s, tmp_path)
+            buffer = audio_clip.decode_to_buffer(tmp_path, self.audio_clip.sample_rate)
+        except Exception:
+            settings.log_exception("Could not bring in the final recorded audio:")
+            return
+        finally:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+        old_start, _old_end = self.audio_zoom
+        self.audio_clip.join(buffer)
+        self.audio_clip_live_seconds = total_s
+        self.audio_zoom = (old_start, self.audio_clip.duration)
+        self._after_audio_edit()
+        self._set_audio_edit_status("aedit_status_pull_in_done", {})
+
+    def _apply_recording_label(self, path):
+        """Renames the just-finished recording to append the label typed
+        into arec_filename_entry, if any — read once at the Stop click
+        (see _stop_audio_record) since the field stays editable for the
+        whole recording rather than fixing the live file's actual name
+        (which is always the auto timestamp). Best-effort: an empty or
+        invalid label, or a rename that fails (e.g. the file is open
+        elsewhere), just keeps the auto name — a cosmetic label is never
+        worth losing or blocking access to the recording itself."""
+        label, self._arec_pending_label = self._arec_pending_label, ""
+        if not label or _validate_live_filename(label):
+            return path
+        folder, base = os.path.split(path)
+        stem, ext = os.path.splitext(base)
+        new_path = transcriber.unique_path(os.path.join(folder, f"{stem} - {label}{ext}"))
+        try:
+            os.replace(path, new_path)
+        except OSError:
+            settings.log_exception("Could not apply recording label, kept the auto name:")
+            return path
+        # A marker sidecar may already exist next to `path` (see
+        # _add_live_recording_marker, which persists it live rather than
+        # only here) — carried along so it isn't left behind orphaned;
+        # _finish_audio_record_save's own save_markers call below would
+        # recreate it at the new name anyway, but only after this returns.
+        old_sidecar = audio_clip.markers_sidecar_path(path)
+        if os.path.exists(old_sidecar):
+            try:
+                os.replace(old_sidecar, audio_clip.markers_sidecar_path(new_path))
+            except OSError:
+                pass
+        return new_path
+
     def _finish_audio_record_save(self, path, clipped):
+        path = self._apply_recording_label(path)
+        was_editing, self._arec_finalizing_live_clip = self._arec_finalizing_live_clip, None
+        if (was_editing and self.audio_clip is not None
+                and self.audio_clip_path == was_editing):
+            # The Edit subtab had this exact recording open while it was
+            # still running (see _on_audio_record_event), and — the guard
+            # above — still does now: `path` here is the true final file,
+            # after whatever MP3 conversion and/or filename label happened
+            # above, which may not be either of the WAV/MP3 paths the clip
+            # was originally opened from (both can be gone — the WAV
+            # deleted, or renamed along with the label). Re-point the open
+            # clip's own identity at it so Export/Save/Revert-to-Original
+            # keep working instead of silently aiming at a file that no
+            # longer exists under its old name.
+            self.audio_clip_path = path
+            self.audio_clip.original_path = path
+            self.audio_clip.source_path = path
+            self._refresh_audio_studio_ui()  # picker row's file label shows the old name until this runs
         self._last_recording_path = path
         # Writes a sidecar (audio_clip.save_markers) next to the finished
         # file so any later re-open of it — via "Open in Edit" right now,
@@ -1398,6 +1627,24 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         self.arec_test_mic_button.configure(text=i18n.t(self.ui_lang, "arec_test_mic"))
 
     def _send_last_recording_to_edit(self):
+        # While still recording, opens whatever's been flushed so far —
+        # the MP3 sibling if the Format menu is set to MP3 and streaming
+        # is actually up (matches what Stop will eventually save as, per
+        # AudioRecorder.mp3_path's own flush-on-every-write guarantee),
+        # otherwise the WAV, using the same concurrent-read pattern
+        # Partial Save already relies on for this exact file.
+        # _open_audio_clip's own done() callback notices it's the live
+        # recorder's own audio and arms "Bring in new audio" (see
+        # audio_clip_live_wav_path/audio_clip_live_display_path). Markers
+        # dropped so far DO show — _add_live_recording_marker writes their
+        # sidecar live, not just at Stop.
+        if self.audio_recording and self.audio_recorder and self.audio_recorder.audio_path:
+            path = (self.audio_recorder.mp3_path
+                    if self.audio_recorder.mp3_streamed_ok and self.audio_recorder.mp3_path
+                    else self.audio_recorder.audio_path)
+            self._open_audio_clip(path)
+            self._show_tab(self.LEAF_AUDIO_EDIT)
+            return
         path = self._last_recording_path
         if not path or not os.path.isfile(path):
             return
@@ -1819,7 +2066,15 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
             ("aedit_split_button", self._audio_edit_split, "aedit_tip_split"),
             ("aedit_silence_button", self._audio_edit_insert_silence, "aedit_tip_silence"),
             ("aedit_append_button", self._audio_edit_append_file_dialog, "aedit_tip_append"),
+            ("aedit_pull_in_button", self._audio_edit_pull_in_live, "aedit_tip_pull_in"),
         ])
+        # Unlike every other button in this row, enabled state isn't just
+        # "a clip is loaded" (_set_audio_edit_controls_enabled's generic
+        # list) — it also needs the open clip to BE the Record tab's still-
+        # running recording (see audio_clip_live_path), refreshed by
+        # _refresh_audio_edit_pull_in_button. Starts disabled so it isn't
+        # briefly shown enabled before that first runs.
+        self.aedit_pull_in_button.configure(state="disabled")
         self._build_button_group(editrow, 2, "aedit_group_history", [
             ("aedit_undo_button", self._audio_edit_undo, "aedit_tip_undo_redo"),
             ("aedit_redo_button", self._audio_edit_redo, "aedit_tip_undo_redo"),
@@ -2148,6 +2403,23 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
                 return
             self.audio_clip = clip
             self.audio_clip_path = path
+            # Arms "Bring in new audio" (_audio_edit_pull_in_live) whenever
+            # what just got opened is the Record tab's own still-running
+            # recording — either its WAV directly, or its MP3 sibling if
+            # streaming was active and _send_last_recording_to_edit
+            # preferred it. clip.duration is exactly how many seconds of
+            # it this decode captured, the starting point future pull-ins
+            # measure from regardless of what the user then does to the
+            # clip's own buffer.
+            if (self.audio_recording and self.audio_recorder and self.audio_recorder.audio_path
+                    and path in (self.audio_recorder.audio_path, self.audio_recorder.mp3_path)):
+                self.audio_clip_live_wav_path = self.audio_recorder.audio_path
+                self.audio_clip_live_display_path = path
+                self.audio_clip_live_seconds = clip.duration
+            else:
+                self.audio_clip_live_wav_path = None
+                self.audio_clip_live_display_path = None
+                self.audio_clip_live_seconds = 0.0
             self.audio_selection = None
             self.audio_clipboard = None
             self.audio_preview = None
@@ -2167,8 +2439,60 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         has_clip = self.audio_clip is not None
         self._set_audio_edit_controls_enabled(has_clip)
         self._set_audio_enhance_controls_enabled(has_clip)
+        self._refresh_audio_edit_pull_in_button()
         self._render_markers_panel()
         self._redraw_waveform()
+
+    # Minimum gap (seconds) between what's already pulled in and what the
+    # recorder reports captured before "Bring in new audio" lights up —
+    # avoids the button flickering active for a fraction of a second of
+    # genuinely new audio that isn't worth a click yet.
+    PULL_IN_READY_GAP_S = 1.0
+
+    def _refresh_audio_edit_pull_in_button(self):
+        """"Bring in new audio" only makes sense while the open clip IS
+        the Record tab's still-running recording (see
+        audio_clip_live_wav_path, set in _open_audio_clip's done() and
+        cleared the moment that recording stops) — checked fresh rather
+        than cached since the recording can stop at any moment while this
+        clip stays open. Called every tick while on this subtab, so the
+        actual widget is only ever touched on a genuine state change
+        (tracked via _aedit_pull_in_visual_state) — CTkButton redraws its
+        whole rounded-rectangle canvas on every configure() regardless of
+        whether anything passed in actually differs, so reconfiguring
+        unconditionally at tick rate is what was causing the reported
+        flicker."""
+        tracking = (
+            self.audio_clip is not None
+            and self.audio_clip_live_wav_path is not None
+            and self.audio_recording
+            and self.audio_recorder is not None
+            and self.audio_recorder.audio_path == self.audio_clip_live_wav_path)
+        # elapsed_seconds is the recorder's own in-memory tally (updated on
+        # every mic callback), cheaper and more current than re-opening the
+        # file to check — accurate enough to gate "is there something new"
+        # since the actual pull-in re-reads the file itself regardless.
+        has_new = tracking and (
+            self.audio_recorder.elapsed_seconds
+            > self.audio_clip_live_seconds + self.PULL_IN_READY_GAP_S)
+        visual_state = "ready" if has_new else ("armed" if tracking else "idle")
+        if getattr(self, "_aedit_pull_in_visual_state", None) == visual_state:
+            return
+        self._aedit_pull_in_visual_state = visual_state
+        if visual_state == "ready":
+            # Solid theme color instead of the row's usual thin outline —
+            # the same "this is worth a click" treatment _render_live_toggle_button
+            # and _render_llm_generate_button already use elsewhere.
+            theme = ctk.ThemeManager.theme["CTkButton"]
+            self.aedit_pull_in_button.configure(
+                state="normal", border_width=0,
+                fg_color=theme["fg_color"], hover_color=theme["hover_color"],
+                text_color=theme["text_color"])
+        else:
+            self.aedit_pull_in_button.configure(
+                state="normal" if visual_state == "armed" else "disabled",
+                border_width=1, fg_color="transparent",
+                text_color=self.OUTLINE_BUTTON_TEXT)
 
     def _set_audio_edit_controls_enabled(self, enabled):
         state = "normal" if enabled else "disabled"
@@ -2384,11 +2708,32 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
             self.aedit_dirty_label.configure(text="")
             return
         name = os.path.basename(self.audio_clip_path or "")
+        if (self.audio_clip_live_wav_path and self.audio_recorder
+                and self.audio_recorder.audio_path == self.audio_clip_live_wav_path):
+            # Still recording — the real file (and audio_clip_path) won't
+            # actually carry the label until Stop (see
+            # _apply_recording_label), but showing the plain auto-name
+            # here the whole time reads as "the label field does
+            # nothing" until it suddenly changes. Preview-only: this never
+            # touches audio_clip_path, just what's displayed.
+            name = self._preview_labeled_name(name, self.arec_filename_entry)
         self.aedit_file_label.configure(text=i18n.t(
             self.ui_lang, "aedit_file_status", name=name,
             duration=_fmt_hms(self.audio_clip.duration)))
         self.aedit_dirty_label.configure(
             text=i18n.t(self.ui_lang, "aedit_dirty") if self.audio_clip.dirty else "")
+
+    @staticmethod
+    def _preview_labeled_name(basename, filename_entry):
+        """basename with the filename_entry's current text spliced in the
+        same way _apply_recording_label/_apply_live_label actually name
+        the finished file — a live preview while a recording's still
+        running, shown without waiting for (or pre-empting) Stop."""
+        label = filename_entry.get().strip()
+        if not label:
+            return basename
+        stem, ext = os.path.splitext(basename)
+        return f"{stem} - {label}{ext}"
 
     def _redraw_waveform(self):
         """Redraws the waveform/spectrogram canvas. The expensive part —
@@ -2992,6 +3337,82 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
             self._set_audio_edit_status("aedit_status_appended", {"name": os.path.basename(path)})
 
         self._run_busy("aedit_status_appending", work, done)
+
+    def _audio_edit_pull_in_live(self):
+        """Pulls in whatever the Record tab has captured since this clip
+        was opened (or since the last pull-in) — enabled only while
+        audio_clip_live_wav_path is armed (see
+        _refresh_audio_edit_pull_in_button). Two sourcing strategies
+        depending on what's actually open (audio_clip_live_display_path):
+        a WAV gets extract_wav_segment's cheap frame-range extraction
+        (already proven safe to read from a file a recorder thread is
+        still actively appending to — see its own docstring), since MP3
+        has no equivalent — decoding the whole (still-growing) file fresh
+        each time and slicing the new tail off the end in memory is the
+        only option there, acceptable since streaming MP3 flushes on every
+        write (see AudioRecorder._flush_mp3) so it's always current.
+        Either way the result joins onto the clip exactly like appending a
+        whole separate file via the button above, just automatically
+        sourced and only the new part. audio_clip_live_seconds (how much
+        of the SOURCE timeline is already incorporated) advances
+        regardless of what the user has done to the clip's own buffer in
+        the meantime — cuts/trims/etc. don't change how much source
+        material was pulled in, only what happened to it afterward."""
+        if not (self.audio_clip and self.audio_clip_live_wav_path
+                and self.audio_recorder and self.audio_recording
+                and self.audio_recorder.audio_path == self.audio_clip_live_wav_path):
+            return
+        display_path = self.audio_clip_live_display_path
+        start_s = self.audio_clip_live_seconds
+        sample_rate = self.audio_clip.sample_rate
+        is_wav = os.path.splitext(display_path)[1].lower() == ".wav"
+
+        def work():
+            if is_wav:
+                import wave
+
+                with wave.open(display_path, "rb") as wf:
+                    total_s = wf.getnframes() / wf.getframerate()
+                if total_s <= start_s + 0.05:
+                    return None
+                tmp_path = display_path + ".pullin.tmp.wav"
+                audio_record.extract_wav_segment(display_path, start_s, total_s, tmp_path)
+                try:
+                    buffer = audio_clip.decode_to_buffer(tmp_path, sample_rate)
+                finally:
+                    try:
+                        os.remove(tmp_path)
+                    except OSError:
+                        pass
+                return buffer, total_s
+            whole = audio_clip.decode_to_buffer(display_path, sample_rate)
+            total_s = len(whole) / sample_rate
+            if total_s <= start_s + 0.05:
+                return None
+            return whole[int(round(start_s * sample_rate)):], total_s
+
+        def done(result, error):
+            if error is not None:  # already logged by _run_busy itself
+                self._set_audio_edit_status("aedit_status_pull_in_failed", {})
+                return
+            if result is None:
+                self._set_audio_edit_status("aedit_status_pull_in_none", {})
+                return
+            buffer, total_s = result
+            old_start, _old_end = self.audio_zoom
+            self.audio_clip.join(buffer)
+            self.audio_clip_live_seconds = total_s
+            # Expands the visible window to include what was just pulled
+            # in (keeping wherever the user was already looking as the
+            # start) instead of leaving it clipped to the pre-pull-in
+            # duration — the whole point of clicking this was to see the
+            # new audio, not have it sit scrolled off to the right,
+            # technically present but invisible until a manual re-zoom.
+            self.audio_zoom = (old_start, self.audio_clip.duration)
+            self._after_audio_edit()
+            self._set_audio_edit_status("aedit_status_pull_in_done", {})
+
+        self._run_busy("aedit_status_pull_in_running", work, done)
 
     def _audio_edit_undo(self):
         if self.audio_clip and self.audio_clip.undo():
@@ -5419,6 +5840,7 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         self.aedit_split_button.configure(text=t("aedit_split_button"))
         self.aedit_silence_button.configure(text=t("aedit_silence_button"))
         self.aedit_append_button.configure(text=t("aedit_append_button"))
+        self.aedit_pull_in_button.configure(text=t("aedit_pull_in_button"))
         self.aedit_undo_button.configure(text=t("aedit_undo_button"))
         self.aedit_redo_button.configure(text=t("aedit_redo_button"))
         self.aedit_find_button.configure(text=t("aedit_find_button"))
@@ -5652,11 +6074,18 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         self.live_filename_entry = ctk.CTkEntry(options, width=440)
         self.live_filename_entry.grid(
             row=1, column=1, columnspan=3, sticky="w", padx=(0, 16), pady=(4, 4))
+
+        self.live_format_label = ctk.CTkLabel(options, text="")
+        self.live_format_label.grid(row=1, column=4, padx=(0, 6), pady=(4, 4))
+        self.live_format_menu = ctk.CTkOptionMenu(options, width=80, values=["WAV", "MP3"])
+        self.live_format_menu.set("MP3")
+        self.live_format_menu.grid(row=1, column=5, sticky="w", padx=(0, 12), pady=(4, 4))
         # Cleared any stale validation message the moment the user starts
         # fixing what they typed — the message itself only (re)appears on
         # the next Start Recording click, not on every keystroke.
         self.live_filename_entry.bind(
-            "<KeyRelease>", lambda _e: self._hide_live_filename_error())
+            "<KeyRelease>", lambda _e: (self._hide_live_filename_error(),
+                                        self._refresh_edit_menu(), self._refresh_llm_menu()))
         self.live_filename_error_label = ctk.CTkLabel(
             options, text="", anchor="w", text_color="#e57373")
         self.live_filename_error_label.grid(
@@ -6244,16 +6673,26 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
                 "download_bytes": transcriber.SENSEVOICE_DOWNLOAD_MB * 1024 ** 2,
                 "is_downloaded": transcriber.sensevoice_is_downloaded,
             })
-        for q in i18n.QUALITY_KEYS:
-            spec = llm.QUALITY_LLM[q]
+        for q, spec in llm.TRANSLATE_LLM.items():
             specs.append({
-                "key": f"llm_{q}", "kind": "llm", "quality": q,
+                "key": f"llm_translate_{q}", "kind": "llm", "task": "translate",
+                "quality": q, "repo": spec["repo"], "file": spec["file"],
                 "folders": [os.path.join(
                     settings.MODELS_DIR,
                     "models--" + spec["repo"].replace("/", "--"))],
                 "download_bytes": int(spec["size_gb"] * 1024 ** 3),
-                "is_downloaded": lambda qq=q: llm.llm_model_is_downloaded(qq),
+                "is_downloaded": lambda s=spec: llm.llm_model_is_downloaded(s),
             })
+        spec = llm.SUMMARIZE_LLM
+        specs.append({
+            "key": "llm_summarize", "kind": "llm", "task": "summarize",
+            "quality": None, "repo": spec["repo"], "file": spec["file"],
+            "folders": [os.path.join(
+                settings.MODELS_DIR,
+                "models--" + spec["repo"].replace("/", "--"))],
+            "download_bytes": int(spec["size_gb"] * 1024 ** 3),
+            "is_downloaded": lambda s=spec: llm.llm_model_is_downloaded(s),
+        })
         specs.append({
             "key": "nsnet2", "kind": "nsnet2", "quality": None,
             "folders": [audio_ai_edit.nsnet2_model_dir()],
@@ -6269,7 +6708,9 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
             size = "whisper-" + transcriber.QUALITY_MODELS[spec["quality"]]
             return i18n.t(self.ui_lang, "settings_model_whisper", quality=quality, size=size)
         if spec["kind"] == "llm":
-            return i18n.t(self.ui_lang, "settings_model_llm", quality=quality)
+            if spec["task"] == "translate":
+                return i18n.t(self.ui_lang, "settings_model_llm_translate", quality=quality)
+            return i18n.t(self.ui_lang, "settings_model_llm_summarize")
         if spec["kind"] == "nsnet2":
             return i18n.t(self.ui_lang, "settings_model_nsnet2")
         return i18n.t(self.ui_lang, "settings_model_sensevoice")
@@ -6362,8 +6803,7 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
                 elif spec["kind"] == "llm":
                     from huggingface_hub import hf_hub_download
 
-                    llm_spec = llm.QUALITY_LLM[spec["quality"]]
-                    hf_hub_download(llm_spec["repo"], llm_spec["file"],
+                    hf_hub_download(spec["repo"], spec["file"],
                                     cache_dir=settings.MODELS_DIR,
                                     tqdm_class=reporter)
                 elif spec["kind"] == "nsnet2":
@@ -7118,12 +7558,27 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
             self._maybe_preload_sensevoice()
         elif index == self.LEAF_EDIT:
             self._maybe_autoload_edit()
+            # Audio Studio's equivalent picks this up "for free" via its
+            # waveform canvas's own <Configure> binding firing on tab
+            # switch (frames being un-hidden trigger one); the Edit &
+            # Export dropdown has no such canvas to piggyback on, so
+            # without this it wouldn't show a running session's label
+            # preview until the next keystroke or newly-arrived text.
+            self._refresh_edit_menu()
         elif index == self.LEAF_AI:
             self._maybe_autoload_llm()
+            self._refresh_llm_menu()
         elif index == self.LEAF_SETTINGS:
             self._refresh_settings_tab()
         elif index == self.LEAF_AUDIO_RECORD:
             self._refresh_audio_record_mic_menu()
+        elif index == self.LEAF_AUDIO_EDIT and self.audio_clip is not None:
+            # Usually redundant with awave_canvas's own <Configure> binding
+            # firing as this frame is un-hidden, but that's an incidental
+            # side effect of Tk's geometry management, not something to
+            # depend on — this makes the label preview's refresh-on-tab-
+            # switch explicit rather than accidental.
+            self._update_dirty_indicator()
         self._style_tab_buttons()
         self._ensure_active_tab_visible()
 
@@ -7373,9 +7828,14 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         transcript — a fresh batch job, a live session, or simply nothing
         open yet — so it's always ready to review without the user having
         to reselect it from the dropdown. Backs off if there's nothing new,
-        or if the currently-open transcript has unsaved edits: switching
-        out from under those would silently discard them."""
-        if not self.edit_files:
+        if the currently-open transcript has unsaved edits (switching out
+        from under those would silently discard them), or if the user has
+        ever explicitly picked a file here (_edit_manual_pin) — merely
+        reading a transcript with no edits made yet would otherwise still
+        get yanked away the instant a brand new recording starts
+        elsewhere (e.g. Recording begins the next person's live session
+        while Wenshu is still reading the previous one)."""
+        if not self.edit_files or self._edit_manual_pin:
             return
         latest = self.edit_files[-1]
         if self.edit_current is latest:
@@ -7389,8 +7849,10 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         picker. Backs off while a generation is running — switching the
         source out from under an in-progress (or just-finished, still on
         screen) generation would be confusing, even though it wouldn't
-        actually destroy the AI output itself."""
-        if not self.edit_files or self.llm_running:
+        actually destroy the AI output itself — and once the user has ever
+        explicitly picked a source here (_llm_manual_pin), same reasoning
+        as _edit_manual_pin."""
+        if not self.edit_files or self.llm_running or self._llm_manual_pin:
             return
         latest = self.edit_files[-1]
         if self.llm_current is not latest:
@@ -7414,13 +7876,17 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         self.live_filename_entry.configure(state="normal" if self.sensevoice_available else "disabled")
         self.chinese_trad_var.set(bool(self.prefs.get("chinese_traditional")))
         self.ui_lang_button.set("EN" if self.ui_lang == "en" else "繁中")
-        if self.prefs["llm_mode"] not in i18n.LLM_MODES:
-            self.prefs["llm_mode"] = "summarize"
+        if self.prefs["llm_mode"] == "summarize":
+            # Standalone same-language Summarize mode was removed — the
+            # closest surviving equivalent is Summarize & Translate.
+            self.prefs["llm_mode"] = "both"
+        elif self.prefs["llm_mode"] not in i18n.LLM_MODES:
+            self.prefs["llm_mode"] = "translate"
         valid_targets = {key for key, _, _, _ in i18n.LLM_TARGET_LANGUAGES}
         if self.prefs["llm_target"] not in valid_targets:
             self.prefs["llm_target"] = "zh-hant"
-        if self.prefs["llm_quality"] not in i18n.QUALITY_KEYS:
-            self.prefs["llm_quality"] = "balanced"
+        if self.prefs["llm_quality"] not in i18n.LLM_TRANSLATE_QUALITY_KEYS:
+            self.prefs["llm_quality"] = "fast"
 
     # --------------------------------------------------------- translation
 
@@ -7487,6 +7953,7 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         self.live_level_label.configure(text=t("live_level_label"))
         self.live_filename_label.configure(text=t("live_filename_label"))
         self.live_filename_entry.configure(placeholder_text=t("live_filename_placeholder"))
+        self.live_format_label.configure(text=t("arec_format_label"))
         self.live_hint_label.configure(text=t("live_hint"))
         self.live_text_hint_label.configure(text=t("live_text_hint"))
         self.live_open_folder_button.configure(text=t("open_output_folder"))
@@ -7534,7 +8001,8 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         self.llm_target_menu.configure(values=i18n.llm_target_options(self.ui_lang))
         self.llm_target_menu.set(
             i18n.llm_target_display(self.prefs["llm_target"], self.ui_lang))
-        self.llm_quality_button.configure(values=i18n.quality_options(self.ui_lang))
+        self.llm_quality_button.configure(
+            values=i18n.quality_options(self.ui_lang, keys=i18n.LLM_TRANSLATE_QUALITY_KEYS))
         self.llm_quality_button.set(
             i18n.quality_display(self.prefs["llm_quality"], self.ui_lang))
         self._equalize_segments(self.llm_quality_button, 88)
@@ -7543,6 +8011,7 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         self._refresh_llm_menu()
         self._render_llm_status()
         self._update_llm_target_state()
+        self._update_llm_quality_visibility()
         self._update_ram_caption()
         # Mode/Target/Quality label widths and the RAM caption text just
         # changed (language switch) — re-check whether the actions row
@@ -7557,7 +8026,18 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         if self.sys_ram_gb is None:
             self.llm_ram_caption.configure(text="")
             return
-        recommended, close_apps_hint = llm.recommended_quality(
+        if self.prefs["llm_mode"] != "translate":
+            # Summarize & Translate is a single fixed model (Qwen3-8B) —
+            # nothing to recommend a tier for, only warn if RAM is short.
+            required = llm.SUMMARIZE_LLM["ram_gb"]
+            if self.sys_ram_gb >= required:
+                self.llm_ram_caption.configure(text="")
+            else:
+                self.llm_ram_caption.configure(text=i18n.t(
+                    self.ui_lang, "ram_caption_fixed_low",
+                    ram=f"{self.sys_ram_gb:.0f}", required=f"{required:.0f}"))
+            return
+        recommended, close_apps_hint = llm.recommended_translate_quality(
             self.sys_ram_gb, sysinfo.free_ram_gb(),
             sysinfo.free_disk_gb(settings.MODELS_DIR))
         key = "ram_caption_close_apps" if close_apps_hint else "ram_caption"
@@ -7711,10 +8191,12 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         quality = self.prefs["quality"]
         model_size = transcriber.QUALITY_MODELS[quality]
         if not transcriber.model_is_downloaded(model_size):
+            recommended_key = transcriber.recommended_quality(self.sys_ram_gb)
             if not self._confirm_model_download(
-                quality, transcriber.QUALITY_RAM_GB[quality],
+                i18n.quality_display(quality, self.ui_lang),
+                transcriber.QUALITY_RAM_GB[quality],
                 transcriber.MODEL_DOWNLOAD_MB[model_size] / 1024,
-                transcriber.recommended_quality(self.sys_ram_gb),
+                i18n.quality_display(recommended_key, self.ui_lang),
             ):
                 return
         # With the SenseVoice box checked, jobs in its 5 languages will pull
@@ -7872,17 +8354,6 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
                     self._write_live_text(i18n.t(self.ui_lang, text_key, **(detail or {})))
                 elif key == "recording":
                     self._write_live_text("")
-                    # The field was left blank (auto-name requested) — now
-                    # that the worker has settled on one, show it. Still
-                    # disabled/unmodifiable; this is display-only, matching
-                    # what a custom name already does for the rest of the
-                    # session.
-                    stem = (detail or {}).get("stem")
-                    if stem and not self.live_filename_entry.get().strip():
-                        self.live_filename_entry.configure(state="normal")
-                        self.live_filename_entry.delete(0, "end")
-                        self.live_filename_entry.insert(0, stem)
-                        self.live_filename_entry.configure(state="disabled")
                 elif key == "save_failed":
                     self._offer_output_folder_fix()
                 elif key in ("idle", "idle_cleared"):
@@ -7897,6 +8368,10 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
             self._set_live_text(committed, preview)
         elif kind == "live_saved":
             _, audio_path, txt_path = event
+            if audio_path:
+                self._live_last_audio_path = audio_path
+            if txt_path:
+                self._live_last_txt_path = txt_path
             self._register_live_transcript(audio_path, txt_path)
         elif kind == "live_draft":
             # Paragraphs a draft (or the final) save just appended to the
@@ -7980,12 +8455,18 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         except Exception:
             settings.log_exception(f"Open output folder failed: {folder}")
 
-    def _confirm_model_download(self, quality, required_ram_gb, download_gb,
-                                 recommended_key):
+    def _confirm_model_download(self, display_name, required_ram_gb, download_gb,
+                                 recommended_display_name):
         """Runs once, right before a model that isn't downloaded yet would
         be fetched and loaded. Blocks (with a dialog) only when the PC looks
         genuinely too tight for it — never nags for a model already sized
-        fine for this hardware. Returns True to proceed, False to back out."""
+        fine for this hardware. Returns True to proceed, False to back out.
+
+        display_name/recommended_display_name are already-localized labels
+        (e.g. "Accurate", "Summarize & Translate") — callers resolve
+        whichever key vocabulary applies to their model (Whisper's 3-tier
+        quality, the AI tab's 2-tier translate quality, or a fixed
+        single-model task) before calling this shared dialog."""
         free_gb = sysinfo.free_disk_gb(settings.MODELS_DIR)
         needed_disk = download_gb * 1.2 + 0.2
         if free_gb is not None and free_gb < needed_disk:
@@ -7999,17 +8480,16 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         if self.sys_ram_gb is not None and self.sys_ram_gb < required_ram_gb:
             ram = f"{self.sys_ram_gb:.1f}"
             required = f"{required_ram_gb:.1f}"
-            quality_name = i18n.quality_display(quality, self.ui_lang)
-            if quality == recommended_key:
+            if display_name == recommended_display_name:
                 return messagebox.askyesno(
                     i18n.t(self.ui_lang, "capability_low_ram_title"),
                     i18n.t(self.ui_lang, "capability_low_ram_message_min",
-                           ram=ram, required=required, quality=quality_name))
+                           ram=ram, required=required, quality=display_name))
             return messagebox.askyesno(
                 i18n.t(self.ui_lang, "capability_low_ram_title"),
                 i18n.t(self.ui_lang, "capability_low_ram_message",
-                       ram=ram, required=required, quality=quality_name,
-                       recommended=i18n.quality_display(recommended_key, self.ui_lang)))
+                       ram=ram, required=required, quality=display_name,
+                       recommended=recommended_display_name))
         return True
 
     def _confirm_sensevoice_download(self):
@@ -8027,9 +8507,9 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         that's already running."""
         if transcriber.sensevoice_is_downloaded() or transcriber.sensevoice_load_in_progress():
             return True
-        quality = self.prefs["quality"]
+        quality_name = i18n.quality_display(self.prefs["quality"], self.ui_lang)
         return self._confirm_model_download(
-            quality, 0, transcriber.SENSEVOICE_DOWNLOAD_MB / 1024, quality)
+            quality_name, 0, transcriber.SENSEVOICE_DOWNLOAD_MB / 1024, quality_name)
 
     def _set_status(self, text):
         self.status_key = None
@@ -8076,12 +8556,6 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
     def _start_live_recording(self):
         if self.live_running or not self.sensevoice_available:
             return
-        custom_name = self.live_filename_entry.get().strip()
-        error_key = _validate_live_filename(custom_name)
-        if error_key:
-            self._show_live_filename_error(error_key)
-            return
-        self._hide_live_filename_error()
         # First-ever session downloads the engine (~900 MB) — the tab's
         # preload deliberately doesn't (see SenseVoicePreloader), so this
         # is the one place the Live tab can trigger it. Gate on disk room.
@@ -8096,12 +8570,13 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         self._write_live_text("")
         self.live_language_menu.configure(state="disabled")
         self.live_mic_menu.configure(state="disabled")
-        # Locked for the life of the session (matches every other per-
-        # session choice — device, language): if left blank, the entry
-        # still gets filled in, once the worker settles on one, with
-        # whatever automatic name it ended up using (see _handle_event's
-        # "recording" case) — never editable, just shown.
-        self.live_filename_entry.configure(state="disabled")
+        self.live_format_menu.configure(state="disabled")
+        # live_filename_entry deliberately stays editable for the whole
+        # session — it's no longer the actual file's name (that's always
+        # the auto timestamp, so the in-progress WAV/transcript path never
+        # changes mid-write), just an optional label appended to the
+        # finished files' names once Stop is clicked. See
+        # _stop_live_recording and _apply_live_label.
         self._render_live_toggle_button()
         self._style_tab_buttons()
         # No status set here — the worker's own events ("loading",
@@ -8114,7 +8589,7 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
             language, self.events,
             device_name=self.prefs.get("live_mic_device", ""),
             traditional_chinese=bool(self.prefs.get("chinese_traditional")),
-            custom_stem=custom_name or None)
+            want_mp3=self.live_format_menu.get() == "MP3")
         self.live_worker.start()
         self.live_draft_button.configure(state="normal")
 
@@ -8180,6 +8655,13 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
 
     def _stop_live_recording(self):
         settings.log_action("Stop Recording (Live Transcription)")
+        # Read the label right now, at the moment of the actual Stop click
+        # — the field has been freely editable for the whole session, so
+        # this is the only point that means "the user is done typing it."
+        # Applied once the session's files are fully finalized and closed,
+        # in _on_live_stopped (see _apply_live_label).
+        self._live_pending_label = self.live_filename_entry.get().strip()
+        self.live_filename_entry.delete(0, "end")
         if self.live_worker:
             self.live_worker.stop()
         self.live_toggle_button.configure(state="disabled")
@@ -8270,7 +8752,143 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         elif self.current_tab == self.LEAF_AI:
             self._maybe_autoload_llm()
 
+    def _apply_live_label(self):
+        """Renames the just-finished session's files to append the label
+        typed into live_filename_entry, if any — read once at the Stop
+        click (see _stop_live_recording) since the field stays editable
+        for the whole session rather than fixing the actual files' name
+        (always the auto timestamp, matching Record tab's own design).
+        Runs after the worker's final "live_saved" event, so
+        _live_last_audio_path/_live_last_txt_path already hold the true
+        final paths — the audio one already being the MP3 rather than the
+        WAV, if streaming succeeded (see LiveTranscriber._save_and_finish).
+        Best-effort like Record tab's _apply_recording_label: an empty/
+        invalid label, or any rename that fails (e.g. a file open
+        elsewhere), just keeps the auto name for that file."""
+        label, self._live_pending_label = self._live_pending_label, ""
+        audio_path, self._live_last_audio_path = self._live_last_audio_path, None
+        txt_path, self._live_last_txt_path = self._live_last_txt_path, None
+        if not label:
+            return
+        error_key = _validate_live_filename(label)
+        if error_key:
+            self._show_live_filename_error(error_key)
+            return
+        renamed = {}
+        for old_path in (p for p in (audio_path, txt_path) if p and os.path.exists(p)):
+            folder, base = os.path.split(old_path)
+            stem, ext = os.path.splitext(base)
+            new_path = transcriber.unique_path(os.path.join(folder, f"{stem} - {label}{ext}"))
+            try:
+                os.replace(old_path, new_path)
+                renamed[old_path] = new_path
+            except OSError:
+                settings.log_exception(f"Could not apply label to {old_path}, kept the auto name:")
+        if not renamed:
+            return
+        if txt_path in renamed:
+            old_sidecar = timestamps.sidecar_path(txt_path)
+            if os.path.exists(old_sidecar):
+                try:
+                    os.replace(old_sidecar, timestamps.sidecar_path(renamed[txt_path]))
+                except OSError:
+                    settings.log_exception("Could not rename timestamps sidecar after labeling:")
+        for entry in self.edit_files:
+            if entry.get("audio") == audio_path or entry.get("live_draft_path") == txt_path:
+                if audio_path in renamed:
+                    entry["audio"] = renamed[audio_path]
+                if txt_path in renamed:
+                    entry["live_draft_path"] = renamed[txt_path]
+                edited_path = entry.get("edited_path")
+                if edited_path and os.path.exists(edited_path):
+                    # A "Save" during the session (see _save_edit) already
+                    # created — and, on every later save, keeps overwriting
+                    # — this evolving edited copy, its name computed once
+                    # from whatever the label field said at that FIRST
+                    # save (often nothing yet, since the field stays
+                    # editable for the whole session). Left alone, every
+                    # future save would keep landing on that stale
+                    # un-labeled name forever, since _save_edit only ever
+                    # computes edited_path once. Carried along here so it
+                    # picks up the label too, the same as the raw
+                    # audio/txt files just above.
+                    efolder, ebase = os.path.split(edited_path)
+                    estem, eext = os.path.splitext(ebase)
+                    new_estem = (f"{estem[:-len(' (edited)')]} - {label} (edited)"
+                                if estem.endswith(" (edited)") else f"{estem} - {label}")
+                    new_edited_path = transcriber.unique_path(
+                        os.path.join(efolder, new_estem + eext))
+                    try:
+                        os.replace(edited_path, new_edited_path)
+                    except OSError:
+                        settings.log_exception(
+                            "Could not apply label to the live session's edited copy:")
+                    else:
+                        old_backup = f"{os.path.splitext(edited_path)[0]} (previous){eext}"
+                        if os.path.exists(old_backup):
+                            try:
+                                os.replace(
+                                    old_backup,
+                                    f"{os.path.splitext(new_edited_path)[0]} (previous){eext}")
+                            except OSError:
+                                pass
+                        old_edited_sidecar = timestamps.sidecar_path(edited_path)
+                        if os.path.exists(old_edited_sidecar):
+                            try:
+                                os.replace(
+                                    old_edited_sidecar, timestamps.sidecar_path(new_edited_path))
+                            except OSError:
+                                pass
+                        entry["edited_path"] = new_edited_path
+                        entry["txt"] = new_edited_path
+                elif txt_path in renamed:
+                    # No edited copy yet — txt still follows the raw draft
+                    # (matches _register_edit_file's own rule).
+                    entry["txt"] = renamed[txt_path]
+                # Same bug as _register_edit_file used to have: "audio"/
+                # "txt" pointed at the new labeled name but "label" — what
+                # the file picker/Export/AI tab dropdown actually display —
+                # was left at whatever it was set to when this entry was
+                # first created, so the label never visibly showed up
+                # anywhere despite the rename having genuinely happened.
+                entry["label"] = os.path.basename(entry["audio"] or entry["txt"] or "")
+                break
+        if self.player.loaded_path in renamed:
+            self.player.loaded_path = renamed[self.player.loaded_path]
+        if self.live_pending_path in renamed:
+            # Found via a real reproduction: "live_draft" fires (arming the
+            # "Add new live text" notice, live_pending_path = the raw
+            # pre-label txt path) BEFORE this rename ever runs — see the
+            # emit order in LiveTranscriber._save_and_finish (live_draft,
+            # then live_saved, then live_stopped, and this only runs after
+            # live_stopped). Left unrepointed, _pull_in_live_content's own
+            # identity check (entry.get("live_draft_path") != path) would
+            # silently fail the moment a label renamed live_draft_path out
+            # from under it — the notice stays visible, but clicking it
+            # does nothing, with no error; only reselecting the file from
+            # the dropdown (a full reload from disk) would show the tail.
+            self.live_pending_path = renamed[self.live_pending_path]
+        self._refresh_edit_menu()
+        # The "Saved — <path>" status line was set by the worker itself
+        # (see LiveTranscriber._save_and_finish) BEFORE this rename ever
+        # ran, so it's still showing the pre-label name — the one visible,
+        # obvious confirmation a user has that Stop actually did something
+        # would otherwise silently go stale the moment a label was
+        # involved. Only touched for the two statuses that actually show a
+        # path — anything else (no_speech, engine_failed, ...) is
+        # unrelated and left alone.
+        if self.live_status_key in ("live_status_saved", "live_status_saved_idle_stop") and txt_path in renamed:
+            self._set_live_status(self.live_status_key,
+                                  {**self.live_status_detail, "path": renamed[txt_path]})
+
     def _on_live_stopped(self):
+        # _live_last_audio_path already reflects whatever the worker's own
+        # "live_saved" event reported as the final audio file — the MP3
+        # once streaming succeeds (LiveTranscriber._save_and_finish drops
+        # the WAV and reports the MP3 instead), the WAV otherwise — so
+        # there's nothing MP3-specific left to do here, unlike before that
+        # swap moved into the worker itself.
+        self._apply_live_label()
         self.live_running = False
         self.live_tab_idle = False
         self.live_worker = None
@@ -8278,6 +8896,7 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         state = "normal" if self.sensevoice_available else "disabled"
         self.live_language_menu.configure(state=state)
         self.live_mic_menu.configure(state=state)
+        self.live_format_menu.configure(state=state)
         self.live_level_bar.set(0)
         self.live_draft_button.configure(state="disabled")
         # Cleared rather than left showing the just-finished session's name
@@ -8295,8 +8914,25 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
 
     def _register_edit_file(self, audio_path, txt_path, is_live=False):
         label = os.path.basename(audio_path)
+        # Live entries are matched on live_draft_path (the txt-based
+        # identity, stable for the whole session — see the comment below)
+        # rather than on audio equality: the session's audio file itself
+        # can change once, at the very end, when streaming MP3 replaces
+        # the WAV (see LiveTranscriber._save_and_finish) — matching on the
+        # old audio path there would miss the existing entry and create a
+        # duplicate instead of updating it.
         for entry in self.edit_files:
-            if entry["audio"] == audio_path:
+            same = (entry.get("live_draft_path") == txt_path if is_live
+                    else entry["audio"] == audio_path)
+            if same:
+                entry["audio"] = audio_path
+                # Refreshed alongside "audio" — otherwise the file picker/
+                # Export/AI tab kept showing the stale name (and extension:
+                # a live session's audio can go from .wav to .mp3 the
+                # moment streaming finishes, see LiveTranscriber's own
+                # _save_and_finish) from whenever this entry was FIRST
+                # created, not what it currently points to.
+                entry["label"] = label
                 if is_live:
                     # live_draft_path is the stable raw-draft identity used
                     # to match incoming content (see _handle_event's
@@ -8330,21 +8966,37 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
             i += 1
         return f"{base} ({i})"
 
+    def _edit_menu_label(self, entry):
+        """entry["label"] itself only becomes the labeled name once Stop
+        actually renames the files (see _apply_live_label) — until then,
+        for whichever entry IS the currently-running live session, this
+        shows a live preview built from live_filename_entry's current
+        text instead, the same idea as Audio Studio's own
+        _preview_labeled_name. Never touches entry["label"] itself, so the
+        real rename at Stop still starts from the correct un-labeled
+        base."""
+        label = entry["label"]
+        if (self.live_running and self._live_last_txt_path
+                and entry.get("live_draft_path") == self._live_last_txt_path):
+            label = self._preview_labeled_name(label, self.live_filename_entry)
+        return label
+
     def _refresh_edit_menu(self):
         if not self.edit_files:
             self.edit_file_menu.configure(values=[i18n.t(self.ui_lang, "edit_no_file")])
             self.edit_file_menu.set(i18n.t(self.ui_lang, "edit_no_file"))
             return
-        values = [e["label"] for e in self.edit_files]
+        values = [self._edit_menu_label(e) for e in self.edit_files]
         self.edit_file_menu.configure(values=values)
         if self.edit_current and self.edit_current in self.edit_files:
-            self.edit_file_menu.set(self.edit_current["label"])
+            self.edit_file_menu.set(self._edit_menu_label(self.edit_current))
         else:
             self.edit_file_menu.set(values[-1])
 
     def _on_edit_file_selected(self, label):
-        entry = next((e for e in self.edit_files if e["label"] == label), None)
+        entry = next((e for e in self.edit_files if self._edit_menu_label(e) == label), None)
         if entry:
+            self._edit_manual_pin = True
             self._load_edit_entry(entry)
 
     def _open_file_for_edit(self):
@@ -8369,6 +9021,7 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         else:
             entry["txt"] = txt
         self._refresh_edit_menu()
+        self._edit_manual_pin = True
         self._load_edit_entry(entry)
 
     def _open_dialog_initialdir(self):
@@ -8544,6 +9197,7 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
                 if self.mic_tester.clipped:
                     self.arec_clip_label.configure(text=i18n.t(self.ui_lang, "arec_clip_warning"))
         if self.current_tab == self.LEAF_AUDIO_EDIT and self.audio_clip is not None:
+            self._refresh_audio_edit_pull_in_button()
             if self.audio_player.is_playing and self._play_until is not None \
                     and (self._preview_offset_s + self.audio_player.get_time()) >= self._play_until:
                 # Reached the end of a selection-limited Play/Preview —
@@ -8678,25 +9332,41 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         self.prefs["llm_target"] = i18n.llm_target_key_for_display(
             self.llm_target_menu.get(), self.ui_lang)
         self.prefs["llm_quality"] = i18n.quality_key_for_display(
-            self.llm_quality_button.get(), self.ui_lang)
+            self.llm_quality_button.get(), self.ui_lang, keys=i18n.LLM_TRANSLATE_QUALITY_KEYS)
         settings.save(self.prefs)
         self._update_llm_target_state()
+        self._update_llm_quality_visibility()
+        self._update_ram_caption()
+
+    def _update_llm_quality_visibility(self):
+        # Summarize & Translate is a single fixed model (Qwen3-8B) — the
+        # quality picker only applies to Translate mode's Hy-MT2 tiers.
+        if self.prefs["llm_mode"] == "translate":
+            self.llm_quality_label.grid()
+            self.llm_quality_button.grid()
+        else:
+            self.llm_quality_label.grid_remove()
+            self.llm_quality_button.grid_remove()
+        self._update_strip_overflow(self.llm_actions_canvas, self.llm_mode_button.master,
+                                    self.llm_actions_left, self.llm_actions_right)
 
     def _update_llm_target_state(self):
-        state = "disabled" if (
-            self.llm_running or self.prefs["llm_mode"] == "summarize"
-        ) else "normal"
+        state = "disabled" if self.llm_running else "normal"
         self.llm_target_menu.configure(state=state)
 
     def _refresh_llm_menu(self):
+        # Shares _edit_menu_label with the Edit & Export tab's own picker —
+        # same live-preview-before-Stop treatment for whichever entry is
+        # the currently-running live session, so the AI tab's source
+        # picker doesn't lag behind Edit & Export in showing it.
         if not self.edit_files:
             self.llm_file_menu.configure(values=[i18n.t(self.ui_lang, "edit_no_file")])
             self.llm_file_menu.set(i18n.t(self.ui_lang, "edit_no_file"))
             return
-        values = [e["label"] for e in self.edit_files]
+        values = [self._edit_menu_label(e) for e in self.edit_files]
         self.llm_file_menu.configure(values=values)
         if self.llm_current and self.llm_current in self.edit_files:
-            self.llm_file_menu.set(self.llm_current["label"])
+            self.llm_file_menu.set(self._edit_menu_label(self.llm_current))
         else:
             self.llm_file_menu.set(values[-1])
 
@@ -8704,8 +9374,9 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         if self.llm_running:
             self._refresh_llm_menu()
             return
-        entry = next((e for e in self.edit_files if e["label"] == label), None)
+        entry = next((e for e in self.edit_files if self._edit_menu_label(e) == label), None)
         if entry:
+            self._llm_manual_pin = True
             self._load_llm_entry(entry)
 
     def _open_file_for_llm(self):
@@ -8740,6 +9411,7 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
             else:
                 entry["txt"] = entry["txt"] or txt
         self._refresh_edit_menu()
+        self._llm_manual_pin = True
         self._load_llm_entry(entry)
 
     def _load_llm_entry(self, entry):
@@ -8777,24 +9449,27 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
             self._set_llm_status("llm_no_file", {})
             return
         self._on_llm_pref_change()
+        mode = self.prefs["llm_mode"]
         quality = self.prefs["llm_quality"]
-        if not llm.llm_model_is_downloaded(quality):
-            recommended_key, _close_apps_hint = llm.recommended_quality(
+        if mode == "translate":
+            spec = llm.TRANSLATE_LLM[quality]
+            recommended_key, _close_apps_hint = llm.recommended_translate_quality(
                 self.sys_ram_gb, sysinfo.free_ram_gb(),
                 sysinfo.free_disk_gb(settings.MODELS_DIR))
+            display = i18n.quality_display(quality, self.ui_lang)
+            recommended_display = i18n.quality_display(recommended_key, self.ui_lang)
+        else:  # "both" — Summarize & Translate, a single fixed model
+            spec = llm.SUMMARIZE_LLM
+            display = recommended_display = i18n.llm_mode_display("both", self.ui_lang)
+        if not llm.llm_model_is_downloaded(spec):
             if not self._confirm_model_download(
-                quality, llm.QUALITY_RAM_GB[quality],
-                llm.QUALITY_LLM[quality]["size_gb"],
-                recommended_key,
+                display, spec["ram_gb"], spec["size_gb"], recommended_display,
             ):
                 return
-        mode = self.prefs["llm_mode"]
-        target = None
-        if mode in ("translate", "both"):
-            target = i18n.llm_target_prompt_name(self.prefs["llm_target"])
+        target = i18n.llm_target_prompt_name(self.prefs["llm_target"])
         self.llm_worker = LLMWorker(
             text=text, mode=mode, target_prompt_name=target,
-            quality=self.prefs["llm_quality"], events=self.events)
+            translate_quality=quality, events=self.events)
         self._set_llm_running(True)
         self._clear_llm_output()
         self.llm_worker.start()

@@ -177,7 +177,7 @@ class LiveTranscriber(threading.Thread):
     transcript is auto-saved before ("live_stopped",) is emitted."""
 
     def __init__(self, language, events, device_name="", traditional_chinese=False,
-                 custom_stem=None):
+                 custom_stem=None, want_mp3=False):
         super().__init__(daemon=True)
         self.language = language or ""  # "" = auto; else one of SENSEVOICE_LANGUAGES
         self.events = events
@@ -188,6 +188,21 @@ class LiveTranscriber(threading.Thread):
         # app.py's _validate_live_filename. None/empty means "use the
         # automatic timestamp name" (_open_wav).
         self.custom_stem = custom_stem or None
+        # Format menu's MP3 choice: encoded incrementally alongside the WAV
+        # as the session runs (same reasoning as AudioRecorder's own
+        # want_mp3 — see audio_record.py), not converted from the whole
+        # finished WAV at Stop. The WAV stays the on-disk file all session
+        # long regardless (it's what the live-draft/pull-in system and the
+        # player's mid-session reload read from), but once the session
+        # actually ends and the MP3 is fully flushed, _save_and_finish
+        # drops the now-redundant WAV and reports the MP3 as the session's
+        # real audio file — same end state as Record tab's own MP3 format,
+        # just arrived at without touching anything mid-session.
+        self.want_mp3 = want_mp3
+        self._mp3_encoder = None
+        self._mp3_file = None
+        self._mp3_path = None
+        self.mp3_streamed_ok = False
         self.stop_event = threading.Event()
         self._lock = threading.Lock()
         # Audio is buffered as lists of small chunks, never one array grown
@@ -253,6 +268,14 @@ class LiveTranscriber(threading.Thread):
 
     def stop(self):
         self.stop_event.set()
+
+    @property
+    def mp3_path(self):
+        """The streamed MP3 sibling of the session's WAV, or None — set
+        once in _start_mp3_stream and never reassigned, so reading it from
+        the UI thread after "live_stopped" (see app.py's _on_live_stopped)
+        needs no lock."""
+        return self._mp3_path
 
     @property
     def elapsed_seconds(self):
@@ -341,9 +364,74 @@ class LiveTranscriber(threading.Thread):
             wav.setsampwidth(2)
             wav.setframerate(SAMPLE_RATE)
             self._wav, self._audio_path = wav, path
+            if self.want_mp3:
+                self._start_mp3_stream(path)
         except Exception:
             settings.log_exception("Could not create the live recording file:")
             self._wav, self._audio_path = None, None
+
+    def _start_mp3_stream(self, wav_path):
+        try:
+            import lameenc
+
+            encoder = lameenc.Encoder()
+            encoder.set_bit_rate(192)
+            encoder.set_in_sample_rate(SAMPLE_RATE)
+            encoder.set_channels(1)
+            encoder.set_quality(2)
+            mp3_path = os.path.splitext(wav_path)[0] + ".mp3"
+            self._mp3_file = open(mp3_path, "wb")
+            self._mp3_encoder = encoder
+            self._mp3_path = mp3_path
+            self.mp3_streamed_ok = True
+        except Exception:
+            settings.log_exception("Could not start streaming MP3 encode for the live session:")
+            self._disable_mp3_stream()
+
+    def _disable_mp3_stream(self):
+        self._mp3_encoder = None
+        if self._mp3_file is not None:
+            try:
+                self._mp3_file.close()
+            except Exception:
+                pass
+            self._mp3_file = None
+        if self._mp3_path and os.path.exists(self._mp3_path):
+            try:
+                os.remove(self._mp3_path)
+            except Exception:
+                pass
+        self._mp3_path = None
+        self.mp3_streamed_ok = False
+
+    def _flush_mp3(self, audio):
+        if self._mp3_encoder is None:
+            return
+        try:
+            pcm16 = (np.clip(audio, -1.0, 1.0) * 32767.0).astype(np.int16)
+            data = self._mp3_encoder.encode(pcm16.tobytes())
+            if data:
+                self._mp3_file.write(data)
+                self._mp3_file.flush()
+        except Exception:
+            settings.log_exception("Live session's streaming MP3 encode failed:")
+            self._disable_mp3_stream()
+
+    def _finish_mp3_stream(self, delete=False):
+        if self._mp3_encoder is None:
+            return
+        try:
+            data = self._mp3_encoder.flush()
+            if data:
+                self._mp3_file.write(data)
+            self._mp3_file.close()
+            self._mp3_file = None
+        except Exception:
+            settings.log_exception("Live session's streaming MP3 finalize failed:")
+            self._disable_mp3_stream()
+            return
+        if delete:
+            self._disable_mp3_stream()
 
     def _flush_audio(self):
         """Appends everything captured since the last flush to the WAV file.
@@ -365,6 +453,8 @@ class LiveTranscriber(threading.Thread):
             settings.log_exception(
                 "Live recording write failed — transcript continues, audio does not:")
             self._close_wav(delete=True)
+            return
+        self._flush_mp3(audio)
 
     def _close_wav(self, delete=False):
         wav, self._wav = self._wav, None
@@ -379,6 +469,8 @@ class LiveTranscriber(threading.Thread):
             except Exception:
                 pass
             self._audio_path = None
+        if delete:
+            self._disable_mp3_stream()
 
     def _finalize_audio(self):
         """Final flush + close. Discards recordings too short to be worth
@@ -386,6 +478,8 @@ class LiveTranscriber(threading.Thread):
         self._flush_audio()
         too_short = (self._recorded_samples / SAMPLE_RATE) < 0.5
         self._close_wav(delete=too_short)
+        if not too_short:
+            self._finish_mp3_stream()
         return self._audio_path
 
     # -- session ----------------------------------------------------------
@@ -623,7 +717,15 @@ class LiveTranscriber(threading.Thread):
         # Register the (still-growing) transcript + audio with the Edit tab
         # right away, then hand it the appended paragraphs so an already-
         # open editor can offer to pull them in instead of going stale.
-        self._emit("live_saved", self._audio_path, self._draft_path)
+        # Announces the MP3 (once streaming is up) rather than the WAV
+        # that's still the file actually being written to — otherwise
+        # Edit/Export and the AI tab would show .wav for the whole session
+        # and only flip to .mp3 at the very end, when _save_and_finish
+        # does the real swap; announcing it from the first draft save
+        # keeps what's shown consistent with the chosen format throughout,
+        # since the MP3 (flushed on every write — see _flush_mp3) is
+        # already just as current and just as safely readable.
+        self._emit("live_saved", self._mp3_path or self._audio_path, self._draft_path)
         self._emit("live_draft", self._draft_path, list(new))
         self._emit("live_status", "draft_saved", {"path": self._draft_path})
 
@@ -672,6 +774,18 @@ class LiveTranscriber(threading.Thread):
         # save below — the transcript is what actually matters most and is
         # orders of magnitude smaller.
         audio_path = self._finalize_audio()
+        # MP3 was streamed incrementally alongside the WAV the whole
+        # session (see _start_mp3_stream) — same reasoning as Record tab's
+        # want_mp3: by now it's already fully encoded, so there's nothing
+        # left to convert. The WAV was only ever the means to get there,
+        # not something worth keeping alongside a redundant copy.
+        if self.mp3_streamed_ok and self._mp3_path:
+            if audio_path:
+                try:
+                    os.remove(audio_path)
+                except OSError:
+                    settings.log_exception("Could not remove intermediate live WAV after streaming MP3:")
+            audio_path = self._mp3_path
 
         txt_path = None
         write_failed = False

@@ -6,7 +6,7 @@ import os
 import sys
 import traceback
 
-APP_VERSION = "2.1.3"
+APP_VERSION = "2.2.0"
 
 
 def _default_app_dir():
@@ -147,9 +147,9 @@ DEFAULTS = {
     "transcribe_language": "auto",
     "sensevoice_preferred": True,
     "ui_language": "en",
-    "llm_mode": "summarize",
+    "llm_mode": "translate",
     "llm_target": "zh-hant",
-    "llm_quality": "balanced",
+    "llm_quality": "fast",
     "editor_font_size": 14,
     "llm_source_font_size": 13,
     "llm_output_font_size": 13,

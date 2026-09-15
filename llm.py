@@ -1,10 +1,14 @@
 """Local LLM worker for summarize/translate, built on llama.cpp
 (llama-cpp-python). Runs fully offline after a one-time model download.
 
-The model family is fixed (Qwen3 instruct GGUF builds from the official,
-ungated Hugging Face repos) and hidden behind the app's Fast/Balanced/
-Accurate quality words. Thinking mode is disabled via Qwen's "/no_think"
-soft switch, and any think blocks are stripped from the stream defensively.
+Translation and summarization use different model families, picked per
+task rather than a single uniform quality dial: translate-only runs on
+Tencent's Hy-MT2 (a dedicated translation model, no chat/system-prompt
+template — see TRANSLATE_LLM), while summarize (and the translation step
+that follows it in "both" mode) runs on Qwen3-8B, the only tier that tested
+well on compression and fidelity together (see SUMMARIZE_LLM). Qwen's
+thinking mode is disabled via its "/no_think" soft switch where used, and
+any think blocks are stripped from the stream defensively regardless.
 
 Same event-queue pattern as transcriber.py:
 
@@ -22,33 +26,31 @@ import threading
 import settings
 from progress import make_progress_tqdm_class
 
-QUALITY_LLM = {
+TRANSLATE_LLM = {
     "fast": {
-        "repo": "Qwen/Qwen3-1.7B-GGUF",
-        "file": "Qwen3-1.7B-Q8_0.gguf",
-        "size_gb": 1.8,
-    },
-    "balanced": {
-        "repo": "Qwen/Qwen3-4B-GGUF",
-        "file": "Qwen3-4B-Q4_K_M.gguf",
-        "size_gb": 2.5,
+        "repo": "tencent/Hy-MT2-1.8B-GGUF",
+        "file": "Hy-MT2-1.8B-Q4_K_M.gguf",
+        "size_gb": 1.13,
+        "ram_gb": 2.0,
     },
     "accurate": {
-        "repo": "Qwen/Qwen3-8B-GGUF",
-        "file": "Qwen3-8B-Q4_K_M.gguf",
-        "size_gb": 4.7,
+        "repo": "tencent/Hy-MT2-7B-GGUF",
+        "file": "Hy-MT2-7B-Q4_K_M.gguf",
+        "size_gb": 4.62,
+        "ram_gb": 7.0,
     },
 }
 
-# Rough total-RAM guidance for running each tier's GGUF comfortably via
-# llama.cpp (model file + KV cache + interpreter overhead) — these models
-# are GB-sized, so unlike the Whisper ones this is where RAM actually
-# becomes a real constraint.
-QUALITY_RAM_GB = {"fast": 3.0, "balanced": 4.0, "accurate": 7.0}
+SUMMARIZE_LLM = {
+    "repo": "Qwen/Qwen3-8B-GGUF",
+    "file": "Qwen3-8B-Q4_K_M.gguf",
+    "size_gb": 4.7,
+    "ram_gb": 7.0,
+}
 
 
-def recommended_quality(total_ram_gb, free_ram_gb=None, free_disk_gb=None):
-    """Recommends a quality tier for these GB-sized local LLMs, where RAM
+def recommended_translate_quality(total_ram_gb, free_ram_gb=None, free_disk_gb=None):
+    """Recommends a translate quality tier (Hy-MT2 1.8B/7B), where RAM
     (and disk, for the download) are real constraints unlike whisper's
     much smaller models.
 
@@ -57,31 +59,24 @@ def recommended_quality(total_ram_gb, free_ram_gb=None, free_disk_gb=None):
         least 16GB installed (even if a lot of it is in use right now —
         that's recoverable by closing things, unlike a genuinely small
         total).
-      - "balanced" for any machine with at least 8GB total RAM.
       - "fast" otherwise.
-    Either of the first two is skipped if there isn't enough free disk
-    space to download that tier, falling through to the next one down.
-    close_apps_hint is True when the recommended tier's own RAM
-    requirement isn't currently free (only ever set for "balanced" — the
-    "accurate" branch already required free RAM to be sufficient, or relies
-    on total capacity rather than nagging about current usage).
+    "accurate" is skipped if there isn't enough free disk space to download
+    it, falling through to "fast". close_apps_hint is always False here —
+    "fast" needs so little RAM (Hy-MT2-1.8B) that it's never usefully
+    blocked by current usage the way the old middle "balanced" tier was.
     """
     def fits_disk(quality):
         if free_disk_gb is None:
             return True  # unknown — don't block the recommendation on it
-        needed = QUALITY_LLM[quality]["size_gb"] * 1.2 + 0.5
+        needed = TRANSLATE_LLM[quality]["size_gb"] * 1.2 + 0.5
         return free_disk_gb >= needed
 
     qualifies_accurate = (
-        (free_ram_gb is not None and free_ram_gb >= QUALITY_RAM_GB["accurate"])
+        (free_ram_gb is not None and free_ram_gb >= TRANSLATE_LLM["accurate"]["ram_gb"])
         or (total_ram_gb is not None and total_ram_gb >= 16)
     )
     if qualifies_accurate and fits_disk("accurate"):
         return "accurate", False
-
-    if total_ram_gb is not None and total_ram_gb >= 8 and fits_disk("balanced"):
-        close_apps_hint = free_ram_gb is not None and free_ram_gb < QUALITY_RAM_GB["balanced"]
-        return "balanced", close_apps_hint
 
     return "fast", False
 
@@ -94,8 +89,9 @@ TRANSLATE_CHUNK_TOKENS = 1100  # per-part input size for translation
 TIMESTAMP_RE = re.compile(r"^\[\d{1,2}:\d{2}(?::\d{2})?\]\s*", re.MULTILINE)
 SENTENCE_RE = re.compile(r"(?<=[.!?。！？])\s+")
 
-# One loaded model at a time (they are GB-sized); swapped when quality changes.
-_cache = {"quality": None, "llama": None}
+# One loaded model at a time (they are GB-sized); swapped when the task or
+# translate quality changes.
+_cache = {"key": None, "llama": None}
 _cache_lock = threading.Lock()
 
 
@@ -105,12 +101,11 @@ def unload_cached_model():
     memory-mapped, and on Windows a mapped file is locked — deleting the
     currently-loaded model would otherwise always fail."""
     with _cache_lock:
-        _cache["quality"], _cache["llama"] = None, None
+        _cache["key"], _cache["llama"] = None, None
     gc.collect()
 
 
-def llm_model_is_downloaded(quality):
-    spec = QUALITY_LLM[quality]
+def llm_model_is_downloaded(spec):
     repo_dir = "models--" + spec["repo"].replace("/", "--")
     snapshots = os.path.join(settings.MODELS_DIR, repo_dir, "snapshots")
     if not os.path.isdir(snapshots):
@@ -175,17 +170,20 @@ class ThinkFilter:
 class LLMWorker(threading.Thread):
     """Summarizes and/or translates `text`; results go to `events`.
 
-    mode: "summarize" | "translate" | "both"
+    mode: "translate" | "both" (translate then translate the summary)
     target_prompt_name: language name for the prompt (e.g. "Traditional
-        Chinese"); ignored when mode == "summarize".
+        Chinese") — required for both modes.
+    translate_quality: "fast" | "accurate", picks the Hy-MT2 size; only
+        meaningful when mode == "translate" ("both" always runs Qwen3-8B,
+        the only tier that summarizes well — see SUMMARIZE_LLM).
     """
 
-    def __init__(self, text, mode, target_prompt_name, quality, events):
+    def __init__(self, text, mode, target_prompt_name, translate_quality, events):
         super().__init__(daemon=True)
         self.text = text
         self.mode = mode
         self.target = target_prompt_name
-        self.quality = quality
+        self.translate_quality = translate_quality
         self.events = events
         self.cancel_event = threading.Event()
         self._emitted_any = False
@@ -208,9 +206,19 @@ class LLMWorker(threading.Thread):
 
     # -- model --------------------------------------------------------------
 
+    def _model_spec(self):
+        if self.mode == "translate":
+            return TRANSLATE_LLM[self.translate_quality]
+        return SUMMARIZE_LLM
+
+    def _cache_key(self):
+        if self.mode == "translate":
+            return f"translate:{self.translate_quality}"
+        return "summarize"
+
     def _load_model(self):
-        spec = QUALITY_LLM[self.quality]
-        first_run = not llm_model_is_downloaded(self.quality)
+        spec = self._model_spec()
+        first_run = not llm_model_is_downloaded(spec)
         os.makedirs(settings.MODELS_DIR, exist_ok=True)
         os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
 
@@ -244,7 +252,8 @@ class LLMWorker(threading.Thread):
 
         try:
             with _cache_lock:
-                if _cache["quality"] == self.quality and _cache["llama"] is not None:
+                key = self._cache_key()
+                if _cache["key"] == key and _cache["llama"] is not None:
                     return _cache["llama"]
                 _cache["llama"] = None
                 gc.collect()
@@ -257,7 +266,7 @@ class LLMWorker(threading.Thread):
                     n_gpu_layers=0,
                     verbose=False,
                 )
-                _cache["quality"], _cache["llama"] = self.quality, llama
+                _cache["key"], _cache["llama"] = key, llama
                 return llama
         except Exception:
             settings.log_exception("LLM model load failed:")
@@ -311,14 +320,19 @@ class LLMWorker(threading.Thread):
     # -- generation -----------------------------------------------------------
 
     def _generate(self, llama, system, user, max_tokens, stream_out, temperature):
-        """Run one chat completion. Returns the text, or None if cancelled."""
+        """Run one chat completion. Returns the text, or None if cancelled.
+
+        system=None sends a plain user-only message with no system role and
+        no "/no_think" suffix — Hy-MT2 has no system-prompt chat template
+        (see TRANSLATE_LLM) and doesn't need the Qwen thinking-mode switch.
+        """
         think = ThinkFilter()
         collected = []
+        messages = [{"role": "user", "content": user}]
+        if system is not None:
+            messages.insert(0, {"role": "system", "content": system + " /no_think"})
         stream = llama.create_chat_completion(
-            messages=[
-                {"role": "system", "content": system + " /no_think"},
-                {"role": "user", "content": user},
-            ],
+            messages=messages,
             stream=True,
             max_tokens=max_tokens,
             temperature=temperature,
@@ -365,7 +379,14 @@ class LLMWorker(threading.Thread):
         return ""
 
     def _translate(self, llama, text):
-        system = (
+        # Hy-MT2 (mode == "translate") has no system-prompt chat template —
+        # official usage is a single user-role message with the instruction
+        # inline (verified in testing: it complies cleanly without Qwen's
+        # /no_think + repeated language-directive scaffolding). "both" mode
+        # translates the summary on Qwen3-8B, which still needs that
+        # scaffolding.
+        use_hy = self.mode == "translate"
+        system = None if use_hy else (
             f"{self._lang_directive()} Translate the user's text into"
             f" {self.target}, preserving the paragraph structure. Output"
             f" only the translation — no notes, no explanations."
@@ -382,8 +403,13 @@ class LLMWorker(threading.Thread):
             if i > 1:
                 self._emit_text("\n\n")
             n = self._count_tokens(llama, chunk)
+            user = chunk if not use_hy else (
+                f"Translate the following text into {self.target}. Note"
+                " that you should only output the translated result"
+                f" without any additional explanation:\n\n{chunk}"
+            )
             out = self._generate(
-                llama, system, chunk,
+                llama, system, user,
                 max_tokens=min(2 * n + 256, N_CTX - n - 512),
                 stream_out=True, temperature=0.2,
             )
@@ -391,33 +417,38 @@ class LLMWorker(threading.Thread):
                 return False
         return True
 
-    def _summarize(self, llama, text, stream=True):
+    def _summarize(self, llama, text):
         """Returns the summary text (always in the transcript's own
         language), or None on failure/cancellation.
 
-        Deliberately has no language-switching logic at all: testing showed
-        that asking a small model to summarize AND switch output language
-        in one instruction reliably causes it to silently drop the language
-        instruction, producing a full English summary even when Chinese was
-        requested. "Both" mode instead calls this for a plain summary, then
+        Deliberately has no language-switching logic at all: a combined
+        summarize+translate instruction is unreliable — tried and reverted
+        twice now. First with the smaller Qwen3 tiers this mode used to run
+        on (produced 0% target-language output). Then, after pinning this
+        mode to Qwen3-8B alone, a combined single pass tested cleanly on
+        conversational transcripts but on a real short, heading/quote-heavy
+        document (a spiritual text with Analects citations) it silently
+        ignored *both* the condense and translate instructions and just
+        echoed the source text verbatim — reproduced deterministically
+        (see git history around the "one pass" experiment for the repro).
+        "Both" mode instead always calls this for a plain summary, then
         runs the well-tested single-purpose _translate() on the result —
-        each step only has to do one thing, which small models handle
-        reliably (verified: the combined approach produced 0% target-
-        language output; the two-step approach reliably produced it).
+        each step only has to do one thing, which is what actually proved
+        reliable across both failure modes.
         """
-        final_system = (
-            "Write a condensed summary of the user's transcript. Follow the"
-            " same order and structure as the original — condense each part"
-            " in sequence rather than reorganizing the content into"
-            " categories. Write in flowing prose paragraphs; do not use"
-            " bullet points or headings. Output only the summary."
-        )
         if self._count_tokens(llama, text) <= SINGLE_PASS_BUDGET:
+            final_system = (
+                "Write a condensed summary of the user's transcript. Follow"
+                " the same order and structure as the original — condense"
+                " each part in sequence rather than reorganizing the"
+                " content into categories. Write in flowing prose"
+                " paragraphs; do not use bullet points or headings. Output"
+                " only the summary."
+            )
             self._emit("llm_status", "llm_generating_status", {})
             return self._generate(llama, final_system, text,
-                                  max_tokens=1400, stream_out=stream,
+                                  max_tokens=1400, stream_out=False,
                                   temperature=0.7)
-
         # Long transcript: condense each part in prose (preserving order),
         # then merge (repeating the condensing if notes are still too long).
         notes_system = (
@@ -464,7 +495,7 @@ class LLMWorker(threading.Thread):
         self._emit("llm_status", "llm_generating_part",
                    {"part": len(chunks) + 1, "total": len(chunks) + 1})
         return self._generate(llama, merge_system, merged,
-                              max_tokens=1400, stream_out=stream,
+                              max_tokens=1400, stream_out=False,
                               temperature=0.7)
 
     # -- main -----------------------------------------------------------------
@@ -495,13 +526,11 @@ class LLMWorker(threading.Thread):
         self._emit("llm_reset")
         if self.mode == "translate":
             ok = self._translate(llama, text)
-        elif self.mode == "both":
+        else:  # "both"
             # Two focused single-purpose passes instead of one compound
             # instruction -- see _summarize()'s docstring for why.
-            summary = self._summarize(llama, text, stream=False)
+            summary = self._summarize(llama, text)
             ok = summary is not None and self._translate(llama, summary)
-        else:  # "summarize"
-            ok = self._summarize(llama, text) is not None
 
         if not ok:
             self._emit("llm_status", "llm_cancelled", {})

@@ -77,6 +77,8 @@ STRINGS = {
         "ram_caption": "Detected {ram} GB RAM — {recommended} recommended for this PC",
         "ram_caption_close_apps": "Detected {ram} GB RAM — {recommended} recommended;"
                                    " close other apps first for the best experience",
+        "ram_caption_fixed_low": "Detected {ram} GB RAM — Summarize & Translate needs"
+                                  " about {required} GB and may run slowly or fail",
         "model_info_title": "About the speech models",
         "model_info_body":
             "SOTA can transcribe using two different engines.\n\n"
@@ -127,8 +129,8 @@ STRINGS = {
         "no_transcript_found": "Loaded audio, but no transcript was found — you can type one.",
         # --- Live Transcription tab
         "tab_live": "Live Transcription",
-        "live_filename_label": "Filename (optional):",
-        "live_filename_placeholder": "e.g. Team meeting — leave blank for an automatic name",
+        "live_filename_label": "Filename label (optional):",
+        "live_filename_placeholder": "e.g. Team meeting — added to the automatic name when you Stop",
         "live_filename_invalid_chars": 'That name can\'t include: < > : " / \\ | ? *',
         "live_filename_trailing_dot_space": "That name can't end with a space or a period.",
         "live_filename_reserved": "That name is reserved by Windows and can't be"
@@ -177,9 +179,8 @@ STRINGS = {
         # --- AI Summary & Translate tab
         "tab_llm": "AI Summary & Translate",
         "llm_mode_label": "Mode",
-        "llm_mode_summarize": "Summarize",
         "llm_mode_translate": "Translate",
-        "llm_mode_both": "Both",
+        "llm_mode_both": "Summarize & Translate",
         "llm_translate_to": "Translate to",
         "llm_generate": "Generate",
         "llm_left_title": "Transcription",
@@ -214,7 +215,8 @@ STRINGS = {
                                  " connection, or delete them to free disk space.",
         "settings_model_whisper": "Speech model — {quality} ({size})",
         "settings_model_sensevoice": "SenseVoice engine (incl. voice-activity model)",
-        "settings_model_llm": "AI model — {quality}",
+        "settings_model_llm_translate": "AI model — Translate ({quality})",
+        "settings_model_llm_summarize": "AI model — Summarize & Translate",
         "settings_model_nsnet2": "AI noise reduction model (NSNet2)",
         "settings_model_downloaded": "Downloaded — {size}",
         "settings_model_not_downloaded": "Not downloaded (~{size})",
@@ -302,7 +304,7 @@ STRINGS = {
         "arec_monitor_checkbox": "Monitor (listen while recording)",
         "arec_monitor_using": "Monitoring via: {device}",
         "arec_monitor_volume_label": "Volume",
-        "arec_filename_label": "Filename (optional):",
+        "arec_filename_label": "Filename label (optional, added when you Stop):",
         "arec_start_button": "Start Recording",
         "arec_pause": "Pause",
         "arec_resume": "Resume",
@@ -401,6 +403,7 @@ STRINGS = {
         "aedit_split_button": "Split",
         "aedit_silence_button": "Insert silence",
         "aedit_append_button": "Append file…",
+        "aedit_pull_in_button": "Bring in new audio",
         "aedit_undo_button": "Undo",
         "aedit_redo_button": "Redo",
         "aedit_tip_undo_redo": "Up to the last 50 edits — beyond that, the"
@@ -427,6 +430,15 @@ STRINGS = {
         "aedit_tip_append": "Appends another audio file to the end of this"
                             " clip. Markers stay exactly where they are.",
         "aedit_append_dialog": "Append audio file",
+        "aedit_tip_pull_in": "Opened this recording while it was still"
+                             " running? Pulls in whatever's been captured"
+                             " since, onto the end of this clip. Only"
+                             " available while that same recording is"
+                             " still going.",
+        "aedit_status_pull_in_running": "Bringing in new audio…",
+        "aedit_status_pull_in_done": "Brought in the new audio.",
+        "aedit_status_pull_in_none": "Nothing new recorded yet.",
+        "aedit_status_pull_in_failed": "Could not bring in the new audio — see sota.log for details.",
         "aedit_tip_find": "Finds other places in the recording that sound"
                           " like the current selection, so you can review"
                           " and remove every occurrence. Needs a selection"
@@ -823,6 +835,8 @@ STRINGS = {
         "ram_caption": "偵測到 {ram} GB 記憶體 — 建議此電腦使用{recommended}",
         "ram_caption_close_apps": "偵測到 {ram} GB 記憶體 — 建議使用{recommended}；"
                                    "為求最佳體驗，請先關閉其他應用程式",
+        "ram_caption_fixed_low": "偵測到 {ram} GB 記憶體 — 「摘要並翻譯」約需"
+                                  " {required} GB，可能會執行緩慢或失敗",
         "model_info_title": "關於語音模型",
         "model_info_body":
             "SOTA 可以使用兩種不同的引擎進行轉錄。\n\n"
@@ -867,8 +881,8 @@ STRINGS = {
         "no_transcript_found": "已載入音訊，但找不到轉錄稿 — 您可以自行輸入。",
         # --- Live Transcription tab
         "tab_live": "即時轉錄",
-        "live_filename_label": "檔名（選填）：",
-        "live_filename_placeholder": "例如：團隊會議 — 留空則自動命名",
+        "live_filename_label": "檔名標籤（選填）：",
+        "live_filename_placeholder": "例如：團隊會議 — 按下停止時會加到自動檔名後面",
         "live_filename_invalid_chars": "名稱不可包含：< > : \" / \\ | ? *",
         "live_filename_trailing_dot_space": "名稱結尾不可為空格或句號。",
         "live_filename_reserved": "此名稱為 Windows 系統保留字，無法使用 —"
@@ -909,9 +923,8 @@ STRINGS = {
         # --- AI Summary & Translate tab
         "tab_llm": "AI 摘要與翻譯",
         "llm_mode_label": "模式",
-        "llm_mode_summarize": "摘要",
         "llm_mode_translate": "翻譯",
-        "llm_mode_both": "兩者",
+        "llm_mode_both": "摘要並翻譯",
         "llm_translate_to": "翻譯成",
         "llm_generate": "開始生成",
         "llm_left_title": "轉錄稿",
@@ -944,7 +957,8 @@ STRINGS = {
                                  "良好時先在此下載，或刪除以釋放磁碟空間。",
         "settings_model_whisper": "語音模型 — {quality}（{size}）",
         "settings_model_sensevoice": "SenseVoice 引擎（含語音活動模型）",
-        "settings_model_llm": "AI 模型 — {quality}",
+        "settings_model_llm_translate": "AI 模型 — 翻譯（{quality}）",
+        "settings_model_llm_summarize": "AI 模型 — 摘要並翻譯",
         "settings_model_nsnet2": "AI 降噪模型（NSNet2）",
         "settings_model_downloaded": "已下載 — {size}",
         "settings_model_not_downloaded": "未下載（約 {size}）",
@@ -1027,7 +1041,7 @@ STRINGS = {
         "arec_monitor_checkbox": "即時監聽（錄音時同步播放）",
         "arec_monitor_using": "監聽輸出：{device}",
         "arec_monitor_volume_label": "音量",
-        "arec_filename_label": "檔名（選填）：",
+        "arec_filename_label": "檔名標籤（選填，停止時加入）：",
         "arec_start_button": "開始錄音",
         "arec_pause": "暫停",
         "arec_resume": "繼續",
@@ -1117,6 +1131,7 @@ STRINGS = {
         "aedit_split_button": "分割",
         "aedit_silence_button": "插入靜音",
         "aedit_append_button": "附加檔案…",
+        "aedit_pull_in_button": "帶入新錄音",
         "aedit_undo_button": "復原",
         "aedit_redo_button": "取消復原",
         "aedit_tip_undo_redo": "最多保留最近 50 步編輯 — 超過後，"
@@ -1136,6 +1151,13 @@ STRINGS = {
                              "插入 {seconds:.0f} 秒的靜音。",
         "aedit_tip_append": "將另一個音訊檔附加到此片段的結尾。標記位置不受影響。",
         "aedit_append_dialog": "附加音訊檔",
+        "aedit_tip_pull_in": "在錄音仍在進行時開啟了它？可將這段時間內"
+                             "新錄到的內容帶入此片段的結尾。僅在該筆錄音"
+                             "仍在進行時才能使用。",
+        "aedit_status_pull_in_running": "正在帶入新錄音…",
+        "aedit_status_pull_in_done": "已帶入新錄音。",
+        "aedit_status_pull_in_none": "目前還沒有新錄到的內容。",
+        "aedit_status_pull_in_failed": "無法帶入新錄音 — 詳情請見 sota.log。",
         "aedit_tip_find": "在整段錄音中尋找與目前選取範圍聽起來相似的片段，"
                           "方便您逐一檢視並移除。需要先在波形圖上拖曳選取範圍。",
         "aedit_detect_silence_button": "偵測無語音片段",
@@ -1412,6 +1434,12 @@ STRINGS = {
 # (canonical quality key, model size) — display names come from STRINGS above.
 QUALITY_KEYS = ["fast", "balanced", "accurate"]
 
+# The AI tab's Translate mode only offers two tiers (Hy-MT2 1.8B/7B — see
+# llm.TRANSLATE_LLM), a subset of QUALITY_KEYS reusing the same generic
+# "Fast"/"Accurate" wording. Whisper's quality picker keeps using the full
+# QUALITY_KEYS list untouched.
+LLM_TRANSLATE_QUALITY_KEYS = ["fast", "accurate"]
+
 # (canonical language code key, English name, Traditional Chinese name).
 # code key is "auto" or an ISO 639-1 code understood by faster-whisper.
 TRANSCRIBE_LANGUAGES = [
@@ -1464,15 +1492,15 @@ def quality_display(quality_key, ui_lang):
     return t(ui_lang, f"quality_{quality_key}")
 
 
-def quality_options(ui_lang):
-    return [quality_display(k, ui_lang) for k in QUALITY_KEYS]
+def quality_options(ui_lang, keys=QUALITY_KEYS):
+    return [quality_display(k, ui_lang) for k in keys]
 
 
-def quality_key_for_display(display, ui_lang):
-    for key in QUALITY_KEYS:
+def quality_key_for_display(display, ui_lang, keys=QUALITY_KEYS):
+    for key in keys:
         if quality_display(key, ui_lang) == display:
             return key
-    return "balanced"
+    return "balanced" if keys is QUALITY_KEYS else keys[0]
 
 
 def language_display(code_key, ui_lang):
@@ -1532,7 +1560,7 @@ def job_status_text(ui_lang, key, detail):
 
 # --------------------------------------------------- AI summarize/translate
 
-LLM_MODES = ["summarize", "translate", "both"]
+LLM_MODES = ["translate", "both"]
 
 # (canonical key, name used inside the LLM prompt, English display, 繁中 display)
 LLM_TARGET_LANGUAGES = [
@@ -1572,7 +1600,7 @@ def llm_mode_key_for_display(display, ui_lang):
     for key in LLM_MODES:
         if llm_mode_display(key, ui_lang) == display:
             return key
-    return "summarize"
+    return "translate"
 
 
 def llm_target_display(key, ui_lang):

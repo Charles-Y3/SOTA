@@ -1,6 +1,6 @@
 # SOTA — Smart Offline Transcription & Audio
 
-**Version 2.1.3**
+**Version 2.2.0**
 
 Drop in audio files, click **Transcribe All**, and get a transcript for each
 file — saved as `.docx` if Microsoft Word is installed, otherwise `.txt`. Or
@@ -298,16 +298,22 @@ transcript — fully offline after a one-time model download:
 1. Pick a transcribed file from the dropdown, or **Open a file…** (accepts
    `.txt`/`.docx` transcripts directly, or an audio file whose transcript
    exists in `output\Transcription Studio`).
-2. Choose the mode: **Summarize**, **Translate** (pick a target language from
-   ~20 options), or **Both** (a summary written in the target language).
-3. Pick a quality: Fast / Balanced / Accurate — the first use of each level
-   downloads its AI model (~1.8 / 2.5 / 4.7 GB, one time). SOTA recommends a
-   quality tier based on both your total and currently-free RAM (and checks
-   there's enough free disk space to fit the download): **Accurate** if your
-   free RAM already covers it, or your PC has at least 16 GB installed;
-   **Balanced** for any PC with at least 8 GB (with a note to close other
-   apps first if RAM is tight for it right now); otherwise **Fast**.
-4. Click **Generate** and watch the output stream into the right panel. A
+2. Choose the mode: **Translate** (pick a target language from ~20 options)
+   or **Summarize & Translate** (a summary written in the target language).
+   Each mode uses a different AI model, picked for what it's actually good
+   at — translation and summarization are different skills, and testing
+   showed no single model excelled at both:
+   - **Translate** runs on Hy-MT2, a dedicated translation model. Pick a
+     quality: **Fast** (1.8B) or **Accurate** (7B) — the first use of each
+     downloads its model (~1.1 / 4.6 GB, one time). SOTA recommends
+     **Accurate** if your free RAM already covers it or your PC has at
+     least 16 GB installed, otherwise **Fast**.
+   - **Summarize & Translate** always runs on Qwen3-8B (~4.7 GB download,
+     one time) — the only model tested that both compresses a transcript
+     well and stays factually accurate. There's no quality picker for this
+     mode; a PC with less than about 7 GB of RAM may find it slow or unable
+     to run, with translate-only still available as a lighter option.
+3. Click **Generate** and watch the output stream into the right panel. A
    copy is **saved automatically** the moment generation finishes (same
    `.docx`/`.txt` rule as everywhere else) — no extra click needed. You can
    still edit the text afterward and click **Save copy** again to save an
@@ -331,7 +337,8 @@ Everything that isn't part of a day-to-day workflow lives here:
   folder you like (e.g. inside Documents or a synced drive), or click
   **Use default** to go back.
 - **Models & storage** — every model SOTA can use (three speech qualities,
-  the SenseVoice engine, three AI qualities) listed with its size and
+  the SenseVoice engine, two Translate qualities, and the Summarize &
+  Translate model) listed with its size and
   whether it's downloaded. **Download** fetches one ahead of time — handy
   on a good connection before going offline — and **Delete** frees the disk
   space (it simply re-downloads the next time it's needed). The total space
@@ -421,11 +428,11 @@ macOS `.app`.
   **Run workflow**. When it finishes, download `SOTA-windows` and
   `SOTA-macOS` from the run's **Artifacts** section.
 - **Automatically**: every push to `main` builds both platforms.
-- **Releases**: pushing a tag like `v2.1.3` also publishes a GitHub Release
+- **Releases**: pushing a tag like `v2.2.0` also publishes a GitHub Release
   with both zips attached:
   ```
-  git tag v2.1.3
-  git push origin v2.1.3
+  git tag v2.2.0
+  git push origin v2.2.0
   ```
 
 ### Running the unsigned macOS build
@@ -498,10 +505,12 @@ work, run locally instead of through a cloud API:
   runs **[SenseVoice](https://github.com/FunAudioLLM/SenseVoice)**, the
   more-accurate engine for English/Mandarin/Cantonese/Japanese/Korean, and
   its `fsmn-vad` voice-activity front-end.
+- **[Hy-MT2](https://huggingface.co/tencent/Hy-MT2-7B-GGUF)** (Tencent
+  Hunyuan) — the dedicated translation model used for Translate mode.
 - **[Qwen3](https://github.com/QwenLM/Qwen3)** (Alibaba Cloud / the Qwen
-  team) — the local models used for summarizing and translating, run via
-  **[llama.cpp](https://github.com/ggml-org/llama.cpp)** /
-  **[llama-cpp-python](https://github.com/abetlen/llama-cpp-python)**.
+  team) — the model used for Summarize & Translate mode. Both this and
+  Hy-MT2 run locally via **[llama.cpp](https://github.com/ggml-org/llama.cpp)**
+  / **[llama-cpp-python](https://github.com/abetlen/llama-cpp-python)**.
 - **[CustomTkinter](https://github.com/TomSchimansky/CustomTkinter)** — the
   UI toolkit.
 - **[tkinterdnd2](https://github.com/pmgagne/tkinterdnd2)** — drag-and-drop

@@ -241,7 +241,8 @@ class AudioRecorder(threading.Thread):
 
     def __init__(self, events, device_name="", sample_rate=DEFAULT_SAMPLE_RATE,
                 channels=1, custom_stem=None, gain=1.0, bit_depth=DEFAULT_BIT_DEPTH,
-                monitor=True, monitor_device_name="", monitor_volume=1.0):
+                monitor=True, monitor_device_name="", monitor_volume=1.0,
+                want_mp3=False):
         super().__init__(daemon=True)
         self.events = events
         self.device_name = device_name or ""
@@ -250,6 +251,20 @@ class AudioRecorder(threading.Thread):
         self.custom_stem = custom_stem or None
         self.gain = gain
         self.bit_depth = bit_depth if bit_depth in BIT_DEPTH_OPTIONS else DEFAULT_BIT_DEPTH
+        # When the Format menu is set to MP3, encode incrementally as audio
+        # arrives instead of converting the whole finished WAV in one burst
+        # at Stop (measured: ~2 minutes for a 3-hour recording at the
+        # default quality). Spreading the same LAME work across the whole
+        # session — which already has a background thread ticking every
+        # TICK_S regardless — costs a negligible sliver of CPU per tick and
+        # leaves only the last fraction of a second to encode at Stop. A
+        # failure at any point (see _disable_mp3_stream) falls back to the
+        # old whole-file conversion in app.py, driven by mp3_streamed_ok.
+        self.want_mp3 = want_mp3
+        self._mp3_encoder = None
+        self._mp3_file = None
+        self._mp3_path = None
+        self.mp3_streamed_ok = False
         # Live monitor: mirrors the mic to a speaker while recording, e.g.
         # when the mic is in a different room from the machine running
         # SOTA. Deliberately a SEPARATE sd.OutputStream, not one combined
@@ -349,6 +364,15 @@ class AudioRecorder(threading.Thread):
         with self._lock:
             samples = self._recorded_samples
         return samples / self.sample_rate if self.sample_rate else 0.0
+
+    @property
+    def mp3_path(self):
+        """The streamed MP3 sibling of the WAV, or None — set once in
+        _start_mp3_stream and never reassigned, so reading it from the UI
+        thread needs no lock. Kept flushed to disk on every write (see
+        _flush_mp3) so it's safe for another process/handle — "Open in
+        Edit" while recording, in particular — to read at any moment."""
+        return self._mp3_path
 
     @property
     def audio_path(self):
@@ -502,9 +526,79 @@ class AudioRecorder(threading.Thread):
             wav.setsampwidth(3 if self.bit_depth == 24 else 2)
             wav.setframerate(self.sample_rate)
             self._wav, self._audio_path = wav, path
+            if self.want_mp3:
+                self._start_mp3_stream(path)
         except Exception:
             settings.log_exception("Could not create the Audio Studio recording file:")
             self._wav, self._audio_path = None, None
+
+    def _start_mp3_stream(self, wav_path):
+        try:
+            import lameenc
+
+            encoder = lameenc.Encoder()
+            encoder.set_bit_rate(192)
+            encoder.set_in_sample_rate(self.sample_rate)
+            encoder.set_channels(self.channels)
+            encoder.set_quality(2)
+            mp3_path = os.path.splitext(wav_path)[0] + ".mp3"
+            self._mp3_file = open(mp3_path, "wb")
+            self._mp3_encoder = encoder
+            self._mp3_path = mp3_path
+            self.mp3_streamed_ok = True
+        except Exception:
+            settings.log_exception(
+                "Could not start streaming MP3 encode, will convert from the WAV at Stop instead:")
+            self._disable_mp3_stream()
+
+    def _disable_mp3_stream(self):
+        self._mp3_encoder = None
+        if self._mp3_file is not None:
+            try:
+                self._mp3_file.close()
+            except Exception:
+                pass
+            self._mp3_file = None
+        if self._mp3_path and os.path.exists(self._mp3_path):
+            try:
+                os.remove(self._mp3_path)
+            except Exception:
+                pass
+        self._mp3_path = None
+        self.mp3_streamed_ok = False
+
+    def _flush_mp3(self, audio):
+        if self._mp3_encoder is None:
+            return
+        try:
+            pcm16 = (np.clip(audio, -1.0, 1.0) * 32767.0).astype(np.int16)
+            data = self._mp3_encoder.encode(pcm16.tobytes())
+            if data:
+                self._mp3_file.write(data)
+                # Python's own buffered-writer can sit on several ticks'
+                # worth of bytes before the OS ever sees them — flushed
+                # every tick so another handle (e.g. "Open in Edit" while
+                # recording, reading this same file) always sees whatever
+                # was actually encoded so far, not a stale truncated copy.
+                self._mp3_file.flush()
+        except Exception:
+            settings.log_exception(
+                "Streaming MP3 encode failed, will convert from the WAV at Stop instead:")
+            self._disable_mp3_stream()
+
+    def _finish_mp3_stream(self):
+        if self._mp3_encoder is None:
+            return
+        try:
+            data = self._mp3_encoder.flush()
+            if data:
+                self._mp3_file.write(data)
+            self._mp3_file.close()
+            self._mp3_file = None
+        except Exception:
+            settings.log_exception(
+                "Streaming MP3 finalize failed, will convert from the WAV instead:")
+            self._disable_mp3_stream()
 
     def _flush_audio(self):
         with self._lock:
@@ -520,6 +614,8 @@ class AudioRecorder(threading.Thread):
                 self._wav.writeframes(pcm16.tobytes())
         except Exception:
             settings.log_exception("Audio Studio recording write failed:")
+            return
+        self._flush_mp3(audio)
 
     def _close_wav(self):
         wav, self._wav = self._wav, None
@@ -588,7 +684,9 @@ class AudioRecorder(threading.Thread):
             self._flush_audio()
             seconds = self.elapsed_seconds
             self._close_wav()
-            self._emit("record_stopped", self._audio_path, seconds)
+            self._finish_mp3_stream()
+            mp3_path = self._mp3_path if self.mp3_streamed_ok else None
+            self._emit("record_stopped", self._audio_path, seconds, mp3_path)
 
 
 class MicTester(threading.Thread):
