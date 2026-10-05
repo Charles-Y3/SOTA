@@ -175,6 +175,118 @@ STRINGS = {
         "live_status_loading": "Loading SenseVoice model… this can take up to a minute.",
         "live_mic_label": "Microphone",
         "live_level_label": "Level",
+        "tab_live_translate": "Translate",
+        "tab_group_live_translate": "Live Translate",
+        "tab_words": "Word List",
+        "words_hint": "Names, products and jargon that the speech engine mishears or the"
+                      " translator gets wrong. \"Often heard as\" lists wrong spellings to"
+                      " fix automatically (comma separated, optional). \"Translate as\" is"
+                      " what the word must become in the translation; leave it empty to"
+                      " keep the word exactly as written. Changes apply to the next"
+                      " sentence, even while translating.",
+        "words_head_word": "Word or name",
+        "words_head_heard": "Often heard as (optional)",
+        "words_head_translation": "Translate as (optional)",
+        "words_ph_word": "e.g. Acme Dynamics",
+        "words_ph_heard": "e.g. Acne Dynamics, Acme Dinamics",
+        "words_ph_translation": "empty = keep as is",
+        "words_add": "Add word",
+        "words_import": "Import list…",
+        "words_template": "Download Excel template…",
+        "words_template_title": "Save the word list template",
+        "words_import_error": "Could not read this file:\n{error}",
+        "words_xlsx_header": "Word or name|Often heard as (optional, separate with commas)|Translate as (optional, empty = keep as written)",
+        "words_xlsx_sheets": "Word list|Examples and tips",
+        "words_xlsx_tips": "How to use this template\n"
+                           "1. Fill in the first sheet (Word list): one word or name per row.\n"
+                           "2. Word or name: write it exactly as it should appear, with capital letters and spaces.\n"
+                           "3. Often heard as (optional): wrong spellings the speech engine produces, separated by commas. They are replaced automatically.\n"
+                           "4. Translate as (optional): what the word must be in the translation. Leave it empty to keep the word exactly as written - good for names, products and acronyms.\n"
+                           "5. Save the file, then in SOTA open Live Translate > Word List > Import list... and choose it.\n"
+                           "This sheet only holds examples and is never read - you can delete it.",
+        "words_export": "Export list…",
+        "words_count": "{n} words",
+        "words_import_title": "Import a word list (Excel .xlsx, or text: word | heard as | translate as)",
+        "words_export_title": "Export the word list",
+        "live_busy_lt": "Stop Live Translate first — both use the microphone and the same speech engine.",
+        "lt_hint": "Speak and see the translation appear sentence by sentence."
+                   " Speech is recognized by SenseVoice (English, Chinese,"
+                   " Cantonese, Japanese, Korean) and translated on this"
+                   " computer by Hy-MT2-1.8B — nothing is sent anywhere and"
+                   " nothing is saved. When you press Start, subtitles open by themselves"
+                   " at the bottom of the screen chosen under Subtitles (for example a"
+                   " projector) - choose the layout and sizes there, or press Hide"
+                   " subtitles if you do not need them. Priority: Low latency translates"
+                   " each clause while you are still speaking; Accuracy waits for a short"
+                   " pause and uses the previous sentence as context.",
+        "lt_info_title": "About Live Translate",
+        "lt_source_label": "Speaking",
+        "lt_target_label": "Translate to",
+        "lt_mode_label": "Priority",
+        "lt_mode_latency": "Low latency",
+        "lt_mode_accuracy": "Accuracy",
+        "lt_mode_hint_latency": "Fastest: translates after a very short pause, and translates"
+                                " each clause while you are still speaking. Slightly more"
+                                " mistakes.",
+        "lt_mode_hint_accuracy": "More accurate: waits for a short pause and uses the previous"
+                                 " sentence as context. A little slower.",
+        "lt_sub_label": "Subtitles",
+        "lt_sub_show": "Show subtitles",
+        "lt_sub_hide": "Hide subtitles",
+        "lt_sub_original": "Show original",
+        "lt_sub_layout_label": "Layout",
+        "lt_sub_layout_two": "2 lines: current sentence",
+        "lt_sub_layout_three": "3 lines: + previous translation",
+        "lt_sub_layout_four": "4 lines: + previous sentence",
+        "lt_sub_scroll_lines_label": "Scroll lines",
+        "lt_sub_layout_none": "No lines (subtitles off)",
+        "lt_sub_layout_scroll": "Scroll: translations + live strip",
+        "lt_sub_cmp_button": "Compare layouts…",
+        "lt_sub_cmp_title": "Compare subtitle layouts",
+        "lt_sub_cmp_intro": "Every layout plays the same sample speech. The translation deliberately"
+                            " arrives late, so you can see how each one copes when the speaker has"
+                            " already moved on. Press Use this on the one you want - it is applied to"
+                            " the subtitle screen at once.",
+        "lt_sub_cmp_use": "Use this",
+        "lt_sub_cmp_in_use": "in use",
+        "lt_sub_cmp_with_original": "with original",
+        "lt_sub_cmp_translation_only": "translation only",
+        "lt_sub_scale_label": "Size",
+        "lt_sub_ratio_label": "Original line",
+        "lt_sub_demo_prev_original": "The previous sentence stays above, dimmer",
+        "lt_sub_demo_prev_translation": "Its translation",
+        "lt_sub_size_small": "Small",
+        "lt_sub_size_medium": "Medium",
+        "lt_sub_size_large": "Large",
+        "lt_sub_screen_main": "main",
+        "lt_sub_demo_original": "The words being spoken appear here, live",
+        "lt_sub_demo_translation": "The translation appears under them",
+        "lt_translation_failed": "translation unavailable for this sentence",
+        "lt_start_button": "Start",
+        "lt_stop_button": "Stop",
+        "lt_text_hint": "Original text is shown in grey, its translation below it.",
+        "lt_placeholder": "Press Start and begin speaking — translations appear here.",
+        "lt_busy_live": "Stop Live Transcription first — both use the microphone and the"
+                        " same speech engine.",
+        "lt_metrics": "Translation {mt} s · delay after sentence {e2e} s",
+        "lt_status_preparing": "Starting…",
+        "lt_status_loading_asr": "Loading the speech engine… this can take up to a minute.",
+        "lt_status_downloading_asr": "Downloading SenseVoice model (~{size_mb} MB,"
+                                     " one-time) — {pct}%",
+        "lt_status_loading_mt": "Loading the translation model…",
+        "lt_status_downloading_mt": "Downloading translation model (~{size} GB,"
+                                     " one-time) — {pct}%",
+        "lt_status_calibrating": "Optimizing for this computer (one-time, a few seconds)…",
+        "lt_status_listening": "Listening…",
+        "lt_status_finishing": "Finishing the last sentences…",
+        "lt_status_stopped": "Stopped.",
+        "lt_status_mic_failed": "Could not access the microphone. Check that no other"
+                                " app is using it.",
+        "lt_status_engine_failed": "SenseVoice could not be loaded. See sota.log.",
+        "lt_status_failed": "Live Translate stopped unexpectedly. See sota.log.",
+        "lt_status_slow": "Listening… this computer translates slowly ({ms} ms for a"
+                          " short sentence); expect a noticeable delay.",
+        "lt_status_idle_stop": "No speech for {minutes} min, so Live Translate stopped.",
         "mic_default": "System default",
         # --- AI Summary & Translate tab
         "tab_llm": "AI Summary & Translate",
@@ -919,6 +1031,102 @@ STRINGS = {
         "live_status_loading": "正在載入 SenseVoice 模型…可能需要一分鐘左右。",
         "live_mic_label": "麥克風",
         "live_level_label": "音量",
+        "tab_live_translate": "翻譯",
+        "tab_group_live_translate": "即時翻譯",
+        "tab_words": "詞彙表",
+        "words_hint": "語音引擎常聽錯、或翻譯器常翻錯的人名、產品名與專業術語。"
+                      "「常被聽成」填入要自動修正的錯誤拼法（以逗號分隔，選填）；"
+                      "「翻譯成」是該詞在譯文中必須使用的寫法，留空則保持原樣。"
+                      "修改會從下一句開始生效，翻譯進行中也可以編輯。",
+        "words_head_word": "詞彙或名稱",
+        "words_head_heard": "常被聽成（選填）",
+        "words_head_translation": "翻譯成（選填）",
+        "words_ph_word": "例如：Acme Dynamics",
+        "words_ph_heard": "例如：Acne Dynamics, Acme Dinamics",
+        "words_ph_translation": "留空＝保持原樣",
+        "words_add": "新增詞彙",
+        "words_import": "匯入清單…",
+        "words_template": "下載 Excel 範本…",
+        "words_template_title": "儲存詞彙表範本",
+        "words_import_error": "無法讀取此檔案：\n{error}",
+        "words_xlsx_header": "詞彙或名稱|常被聽成（選填，以逗號分隔）|翻譯成（選填，留空＝保持原樣）",
+        "words_xlsx_sheets": "詞彙表|範例與說明",
+        "words_xlsx_tips": "範本使用說明\n"
+                           "1. 在第一個工作表（詞彙表）填寫：每列一個詞彙或名稱。\n"
+                           "2. 詞彙或名稱：照它應有的寫法填入，包含大小寫與空格。\n"
+                           "3. 常被聽成（選填）：語音引擎常寫錯的拼法，以逗號分隔，會自動替換。\n"
+                           "4. 翻譯成（選填）：該詞在譯文中必須使用的寫法。留空則保持原樣，適合人名、產品名與縮寫。\n"
+                           "5. 儲存後，在 SOTA 開啟「即時翻譯 > 詞彙表 > 匯入清單…」並選擇此檔案。\n"
+                           "此工作表只放範例，不會被讀取，可以刪除。",
+        "words_export": "匯出清單…",
+        "words_count": "{n} 個詞彙",
+        "words_import_title": "匯入詞彙清單（Excel .xlsx，或文字檔：詞彙 | 常被聽成 | 翻譯成）",
+        "words_export_title": "匯出詞彙清單",
+        "live_busy_lt": "請先停止「即時翻譯」— 兩者都使用麥克風與同一個語音引擎。",
+        "lt_hint": "開口說話，翻譯會逐句顯示。語音由 SenseVoice 辨識"
+                   "（英文、中文、粵語、日文、韓文），並由 Hy-MT2-1.8B 在本機翻譯"
+                   " — 不會傳送到任何地方，也不會儲存。按下「開始」後，字幕會自動顯示在「字幕」所選螢幕"
+                   "（例如投影機）的底部；版面與大小可在該處調整，不需要時按「隱藏字幕」。"
+                   "優先考量：低延遲會在你還在說話時就逐個子句翻譯；高準確度則等待短暫停頓，並以前一句作為上下文。",
+        "lt_info_title": "關於即時翻譯",
+        "lt_source_label": "說話語言",
+        "lt_target_label": "翻譯成",
+        "lt_mode_label": "優先考量",
+        "lt_mode_latency": "低延遲",
+        "lt_mode_accuracy": "高準確度",
+        "lt_mode_hint_latency": "最快：短暫停頓後立即翻譯，而且在你還在說話時就逐個子句翻譯。錯誤可能稍多。",
+        "lt_mode_hint_accuracy": "較準確：等待短暫停頓，並以前一句作為上下文。速度稍慢。",
+        "lt_sub_label": "字幕",
+        "lt_sub_show": "顯示字幕",
+        "lt_sub_hide": "隱藏字幕",
+        "lt_sub_original": "顯示原文",
+        "lt_sub_layout_label": "版面",
+        "lt_sub_layout_two": "2 行：目前這句",
+        "lt_sub_layout_three": "3 行：加上一句的譯文",
+        "lt_sub_layout_four": "4 行：加上上一句（原文與譯文）",
+        "lt_sub_scroll_lines_label": "捲動行數",
+        "lt_sub_layout_none": "無字幕行（關閉字幕）",
+        "lt_sub_layout_scroll": "捲動：譯文＋即時原文列",
+        "lt_sub_cmp_button": "比較版面…",
+        "lt_sub_cmp_title": "比較字幕版面",
+        "lt_sub_cmp_intro": "所有版面都播放同一段示範語音。示範中的譯文刻意延遲出現，"
+                            "好讓你看到說話者已經繼續往下說時，各種版面如何呈現。"
+                            "按「使用這個」即可立即套用到字幕畫面。",
+        "lt_sub_cmp_use": "使用這個",
+        "lt_sub_cmp_in_use": "使用中",
+        "lt_sub_cmp_with_original": "含原文",
+        "lt_sub_cmp_translation_only": "僅譯文",
+        "lt_sub_scale_label": "大小",
+        "lt_sub_ratio_label": "原文大小",
+        "lt_sub_demo_prev_original": "上一句會留在上方，顏色較淡",
+        "lt_sub_demo_prev_translation": "上一句的譯文",
+        "lt_sub_size_small": "小",
+        "lt_sub_size_medium": "中",
+        "lt_sub_size_large": "大",
+        "lt_sub_screen_main": "主螢幕",
+        "lt_sub_demo_original": "正在說的話會即時顯示在這裡",
+        "lt_sub_demo_translation": "譯文會顯示在下方",
+        "lt_translation_failed": "此句暫時無法翻譯",
+        "lt_start_button": "開始",
+        "lt_stop_button": "停止",
+        "lt_text_hint": "原文以灰色顯示，譯文在其下方。",
+        "lt_placeholder": "按下「開始」後開始說話 — 翻譯會顯示於此。",
+        "lt_busy_live": "請先停止「即時轉錄」— 兩者都使用麥克風與同一個語音引擎。",
+        "lt_metrics": "翻譯 {mt} 秒 · 句子結束後延遲 {e2e} 秒",
+        "lt_status_preparing": "正在啟動…",
+        "lt_status_loading_asr": "正在載入語音引擎…可能需要一分鐘左右。",
+        "lt_status_downloading_asr": "正在下載 SenseVoice 模型（約 {size_mb} MB，僅此一次）— {pct}%",
+        "lt_status_loading_mt": "正在載入翻譯模型…",
+        "lt_status_downloading_mt": "正在下載翻譯模型（約 {size} GB，僅此一次）— {pct}%",
+        "lt_status_calibrating": "正在針對這台電腦最佳化（僅此一次，數秒）…",
+        "lt_status_listening": "聆聽中…",
+        "lt_status_finishing": "正在完成最後幾句…",
+        "lt_status_stopped": "已停止。",
+        "lt_status_mic_failed": "無法存取麥克風。請確認沒有其他程式正在使用。",
+        "lt_status_engine_failed": "無法載入 SenseVoice。詳情請見 sota.log。",
+        "lt_status_failed": "即時翻譯意外停止。詳情請見 sota.log。",
+        "lt_status_slow": "聆聽中…這台電腦翻譯較慢（短句需 {ms} 毫秒），延遲會比較明顯。",
+        "lt_status_idle_stop": "已 {minutes} 分鐘沒有語音，即時翻譯已停止。",
         "mic_default": "系統預設",
         # --- AI Summary & Translate tab
         "tab_llm": "AI 摘要與翻譯",
@@ -1470,6 +1678,26 @@ _LANG_INDEX = {code: (en, zh) for code, en, zh in TRANSCRIBE_LANGUAGES}
 # Live Transcription tab only ever runs SenseVoice, so its language picker is
 # a subset of TRANSCRIBE_LANGUAGES restricted to what that engine covers.
 LIVE_LANGUAGE_CODES = ["auto", "en", "zh", "yue", "ja", "ko"]
+
+
+LT_MODE_KEYS = ["latency", "accuracy"]
+_LT_MODE_ALIASES = {"balanced": "accuracy"}      # the old middle mode is what "accuracy" is now
+
+
+def normalize_lt_mode(value):
+    value = _LT_MODE_ALIASES.get(value, value)
+    return value if value in LT_MODE_KEYS else "latency"
+
+
+def lt_mode_options(ui_lang):
+    return [t(ui_lang, f"lt_mode_{k}") for k in LT_MODE_KEYS]
+
+
+def lt_mode_key_for_display(display, ui_lang):
+    for k in LT_MODE_KEYS:
+        if t(ui_lang, f"lt_mode_{k}") == display:
+            return k
+    return "latency"
 
 
 def live_language_options(ui_lang):

@@ -6,7 +6,7 @@ import os
 import sys
 import traceback
 
-APP_VERSION = "2.2.0"
+APP_VERSION = "2.3.0"
 
 
 def _default_app_dir():
@@ -156,6 +156,25 @@ DEFAULTS = {
     "llm_panel_split": 0.5,
     "live_language": "auto",
     "live_text_font_size": 14,
+    # Live Translate tab
+    "lt_source": "auto",
+    "lt_target": "en",
+    "lt_mode": "latency",
+    "lt_mic_device": "",
+    "lt_text_font_size": 15,
+    # Subtitle bar for an audience screen (subtitles.py): screen index, size, original line.
+    "lt_sub_monitor": 0,
+    "lt_sub_size": "medium",
+    "lt_sub_original": True,
+    "lt_sub_scroll_lines": 2,       # lines of translation in the scroll layout: 2 / 3 / 4
+    "lt_sub_layout": "scroll",      # "three" / "four" / "scroll" (subtitles.CHOICES)
+    "lt_sub_show": True,            # open the subtitle screen automatically when translating starts
+    "lt_sub_scale": 1.0,            # overall subtitle size, 0.5 - 2.0 (subtitles.py)
+    "lt_sub_orig_ratio": 0.66,      # original line size relative to the translation, 0.4 - 1.0
+    # Live Translate word list: [{"word", "heard": [..], "translation"}] (wordlist.py)
+    "lt_wordlist": [],
+    # Result of live_translate.calibrate() for this machine (dict) or None.
+    "lt_calibration": None,
     # Convert Mandarin/Cantonese transcripts to Traditional Chinese (OpenCC).
     "chinese_traditional": True,
     # Timestamp-marker visibility is deliberately NOT here — it's a

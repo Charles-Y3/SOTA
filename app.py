@@ -42,11 +42,15 @@ import audio_record
 import docx_export
 import i18n
 import live_transcription
+import live_translate
 import llm
 import settings
+import subtitles
 import sysinfo
 import timestamps
 import transcriber
+import wordlist
+import wordlist_xlsx
 from llm import LLMWorker
 from player import SPEED_OPTIONS, Player
 from transcriber import Job, TranscriberWorker, is_supported
@@ -227,7 +231,7 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         self.prefs = settings.load()
         settings.set_output_base(self.prefs.get("output_folder"))
         for key in ("editor_font_size", "llm_source_font_size", "llm_output_font_size",
-                    "live_text_font_size"):
+                    "live_text_font_size", "lt_text_font_size"):
             self.prefs[key] = self._clamp_font_size(self.prefs.get(key, 14))
         self.sys_ram_gb = sysinfo.total_ram_gb()
         self.ui_lang = self.prefs["ui_language"] if self.prefs["ui_language"] in i18n.UI_LANGUAGES else "en"
@@ -348,6 +352,29 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         self._playhead_item = None    # canvas line item id — moved, not recreated, on every tick
         self.active_effects_panel = None  # "enhance" | "clean" | None — mutually exclusive
         self._tooltips = []  # keeps _Tooltip instances alive (see _add_tooltip)
+
+        # Live Translate tab state
+        self.lt_worker = None
+        self.lt_running = False
+        self.lt_status_key = None
+        self.lt_status_detail = {}
+        self.lt_segments = {}          # id -> {"src", "tr", "state"}, in arrival order
+        self.lt_preview_src = ""
+        self.lt_preview_tr = ""
+        self.lt_metrics = None
+        self._lt_render_pending = False
+        self.lt_wordlist = wordlist.WordList()
+        self.words_rows = []
+        self._words_save_job = None
+        self._lt_rebuild = True
+        self._lt_dirty_ids = set()
+        self._lt_evicted = []
+        self._lt_preview_dirty = False
+        self.lt_sub_ctrl = subtitles.SubtitleController()
+        self.lt_sub_window = None
+        self._lt_sub_job = None
+        self._lt_sub_demo_until = 0.0
+        self._lt_monitors = []
 
         # Live Transcription tab state
         self.live_worker = None
@@ -617,6 +644,8 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         self.audio_edit_frame = ctk.CTkFrame(self.content, fg_color="transparent")
         self.transcribe_frame = ctk.CTkFrame(self.content, fg_color="transparent")
         self.live_frame = ctk.CTkFrame(self.content, fg_color="transparent")
+        self.live_translate_frame = ctk.CTkFrame(self.content, fg_color="transparent")
+        self.words_frame = ctk.CTkFrame(self.content, fg_color="transparent")
         self.edit_frame = ctk.CTkFrame(self.content, fg_color="transparent")
         self.llm_frame = ctk.CTkFrame(self.content, fg_color="transparent")
         self.settings_frame = ctk.CTkFrame(self.content, fg_color="transparent")
@@ -635,6 +664,8 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         self._build_audio_edit_tab(self.audio_edit_frame)
         self._build_transcribe_tab(self.transcribe_frame)
         self._build_live_tab(self.live_frame)
+        self._build_live_translate_tab(self.live_translate_frame)
+        self._build_words_tab(self.words_frame)
         self._build_edit_tab(self.edit_frame)
         self._build_llm_tab(self.llm_frame)
         self._build_settings_tab(self.settings_frame)
@@ -6144,6 +6175,742 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         self.live_status_line = ctk.CTkLabel(bottom, text="", anchor="w", text_color=self.MUTED_TEXT)
         self.live_status_line.grid(row=0, column=3, sticky="ew")
 
+    # ============================================================ live translate
+
+    LT_MAX_SEGMENTS = 300       # older sentences scroll off the screen state
+    SHOW_LAYOUT_COMPARE = False  # the "Compare layouts..." window is built but hidden
+    LT_SOURCE_COLOR = "#8a8a8a"
+
+    def _build_live_translate_tab(self, parent):
+        parent.grid_columnconfigure(0, weight=1)
+        parent.grid_rowconfigure(2, weight=1)
+
+        options = ctk.CTkFrame(parent)
+        options.grid(row=0, column=0, sticky="ew", padx=12, pady=(8, 6))
+        options.grid_columnconfigure(6, weight=1)
+
+        self.lt_source_label = ctk.CTkLabel(options, text="")
+        self.lt_source_label.grid(row=0, column=0, padx=(12, 6), pady=(10, 4))
+        self.lt_source_menu = ctk.CTkOptionMenu(
+            options, width=130, command=self._on_lt_pref_change)
+        self.lt_source_menu.grid(row=0, column=1, padx=(0, 16), pady=(10, 4))
+
+        self.lt_target_label = ctk.CTkLabel(options, text="")
+        self.lt_target_label.grid(row=0, column=2, padx=(0, 6), pady=(10, 4))
+        self.lt_target_menu = ctk.CTkOptionMenu(
+            options, width=170, command=self._on_lt_pref_change)
+        self.lt_target_menu.grid(row=0, column=3, sticky="w", padx=(0, 16), pady=(10, 4))
+
+        self.lt_mode_label = ctk.CTkLabel(options, text="")
+        self.lt_mode_label.grid(row=1, column=0, padx=(12, 6), pady=(4, 4))
+        self.lt_mode_menu = ctk.CTkOptionMenu(
+            options, width=130, command=self._on_lt_pref_change)
+        self.lt_mode_menu.grid(row=1, column=1, padx=(0, 16), pady=(4, 4))
+
+        self.lt_mic_label = ctk.CTkLabel(options, text="")
+        self.lt_mic_label.grid(row=1, column=2, padx=(0, 6), pady=(4, 4))
+        self.lt_mic_menu = ctk.CTkOptionMenu(
+            options, width=230, command=self._on_lt_pref_change, dynamic_resizing=False)
+        self.lt_mic_menu.grid(row=1, column=3, sticky="w", padx=(0, 16), pady=(4, 4))
+        self.lt_level_label = ctk.CTkLabel(options, text="")
+        self.lt_level_label.grid(row=1, column=4, padx=(0, 6), pady=(4, 4))
+        self.lt_level_bar = ctk.CTkProgressBar(options, width=90)
+        self.lt_level_bar.set(0)
+        self.lt_level_bar.grid(row=1, column=5, sticky="w", padx=(0, 12), pady=(4, 4))
+
+        self.lt_sub_label = ctk.CTkLabel(options, text="")
+        self.lt_sub_label.grid(row=3, column=0, padx=(12, 6), pady=(4, 4))
+        self.lt_sub_monitor_menu = ctk.CTkOptionMenu(
+            options, width=190, command=self._on_lt_sub_pref_change, dynamic_resizing=False)
+        self.lt_sub_monitor_menu.grid(row=3, column=1, columnspan=2, sticky="w",
+                                      padx=(0, 10), pady=(4, 4))
+        sub_row = ctk.CTkFrame(options, fg_color="transparent")
+        sub_row.grid(row=3, column=3, columnspan=4, sticky="w", pady=(4, 4))
+        self.lt_sub_original_var = ctk.BooleanVar(value=True)
+        self.lt_sub_original_switch = ctk.CTkSwitch(
+            sub_row, text="", variable=self.lt_sub_original_var,
+            command=self._on_lt_sub_pref_change)
+        self.lt_sub_original_switch.grid(row=0, column=0, padx=(0, 12))
+        self.lt_sub_layout_label = ctk.CTkLabel(sub_row, text="")
+        self.lt_sub_layout_label.grid(row=0, column=1, padx=(0, 6))
+        self.lt_sub_layout_menu = ctk.CTkOptionMenu(
+            sub_row, width=250, command=self._on_lt_sub_pref_change, dynamic_resizing=False)
+        self.lt_sub_layout_menu.grid(row=0, column=2, padx=(0, 12))
+        self.lt_sub_button = ctk.CTkButton(
+            sub_row, text="", width=140, command=self._toggle_lt_subtitles)
+        self.lt_sub_button.grid(row=0, column=3)
+
+        size_row = ctk.CTkFrame(options, fg_color="transparent")
+        size_row.grid(row=4, column=0, columnspan=7, sticky="w", padx=(12, 0), pady=(0, 10))
+        self.lt_sub_scale_label = ctk.CTkLabel(size_row, text="")
+        self.lt_sub_scale_label.grid(row=0, column=0, padx=(0, 6))
+        self.lt_sub_scale_slider = ctk.CTkSlider(
+            size_row, from_=50, to=200, number_of_steps=30, width=220,
+            command=self._on_lt_sub_slider)
+        self.lt_sub_scale_slider.grid(row=0, column=1)
+        self.lt_sub_scale_value = ctk.CTkLabel(size_row, text="", width=52, anchor="w")
+        self.lt_sub_scale_value.grid(row=0, column=2, padx=(6, 24))
+        self.lt_sub_ratio_label = ctk.CTkLabel(size_row, text="")
+        self.lt_sub_ratio_label.grid(row=0, column=3, padx=(0, 6))
+        self.lt_sub_ratio_slider = ctk.CTkSlider(
+            size_row, from_=40, to=100, number_of_steps=30, width=180,
+            command=self._on_lt_sub_slider)
+        self.lt_sub_ratio_slider.grid(row=0, column=4)
+        self.lt_sub_ratio_value = ctk.CTkLabel(size_row, text="", width=52, anchor="w")
+        self.lt_sub_ratio_value.grid(row=0, column=5, padx=(6, 0))
+        self.lt_sub_compare_button = ctk.CTkButton(
+            size_row, text="", width=150, fg_color="transparent", border_width=1,
+            text_color=self.OUTLINE_BUTTON_TEXT, command=self._open_lt_layout_preview)
+        self.lt_sub_compare_button.grid(row=0, column=8, padx=(24, 0))
+        if not self.SHOW_LAYOUT_COMPARE:
+            self.lt_sub_compare_button.grid_remove()
+        self.lt_sub_lines_label = ctk.CTkLabel(size_row, text="")
+        self.lt_sub_lines_label.grid(row=0, column=6, padx=(24, 6))
+        self.lt_sub_lines_menu = ctk.CTkOptionMenu(
+            size_row, width=70, values=[str(n) for n in subtitles.SCROLL_LINES_CHOICES],
+            command=self._on_lt_sub_pref_change)
+        self.lt_sub_lines_menu.grid(row=0, column=7)
+
+        self.lt_mode_hint_label = ctk.CTkLabel(
+            options, text="", anchor="w", text_color=self.MUTED_TEXT, wraplength=640,
+            justify="left")
+        self.lt_mode_hint_label.grid(row=2, column=0, columnspan=7, sticky="ew",
+                                     padx=12, pady=(0, 6))
+        # Plain-language explainer, behind the same round "i" button the
+        # Transcribe tab uses, instead of a paragraph that is always on screen.
+        self.lt_info_button = ctk.CTkButton(
+            options, text="\u24d8", width=26, height=26, corner_radius=13,
+            fg_color="transparent", text_color=self.MUTED_TEXT,
+            hover_color=("gray80", "gray25"), command=self._show_lt_info)
+        self.lt_info_button.grid(row=0, column=6, sticky="e", padx=(0, 10), pady=(10, 4))
+
+        font_row = ctk.CTkFrame(parent, fg_color="transparent")
+        font_row.grid(row=1, column=0, sticky="ew", padx=16, pady=(0, 2))
+        font_row.grid_columnconfigure(0, weight=1)
+        self.lt_text_hint_label = ctk.CTkLabel(
+            font_row, text="", anchor="w", text_color=self.MUTED_TEXT)
+        self.lt_text_hint_label.grid(row=0, column=0, sticky="w")
+        self.lt_text_font = ctk.CTkFont(size=self.prefs["lt_text_font_size"])
+        self._build_font_size_row(
+            font_row, self.lt_text_font, "lt_text_font_size"
+        ).grid(row=0, column=1, sticky="e")
+
+        self.lt_text = ctk.CTkTextbox(parent, wrap="word", font=self.lt_text_font)
+        self.lt_text.grid(row=2, column=0, sticky="nsew", padx=12, pady=6)
+        self.lt_text.tag_config("src", foreground=self.LT_SOURCE_COLOR)
+        self.lt_text.tag_config("draft", foreground=self.LT_SOURCE_COLOR)
+        self.lt_text.configure(state="disabled")
+
+        bottom = ctk.CTkFrame(parent, fg_color="transparent")
+        bottom.grid(row=3, column=0, sticky="ew", padx=12, pady=(2, 4))
+        bottom.grid_columnconfigure(1, weight=1)
+        self.lt_toggle_button = ctk.CTkButton(
+            bottom, text="", height=36, width=110,
+            font=ctk.CTkFont(size=14, weight="bold"), command=self._toggle_live_translate)
+        self.lt_toggle_button.grid(row=0, column=0, padx=(0, 10))
+        self.lt_status_line = ctk.CTkLabel(
+            bottom, text="", anchor="w", text_color=self.MUTED_TEXT, wraplength=520,
+            justify="left")
+        self.lt_status_line.grid(row=0, column=1, sticky="ew")
+        self.lt_metrics_label = ctk.CTkLabel(
+            bottom, text="", anchor="e", text_color=self.MUTED_TEXT, width=300)
+        self.lt_metrics_label.grid(row=0, column=2, sticky="e", padx=(10, 0))
+
+    def _show_lt_info(self):
+        messagebox.showinfo(i18n.t(self.ui_lang, "lt_info_title"), i18n.t(self.ui_lang, "lt_hint"))
+
+    def _retranslate_live_translate_tab(self):
+        t = lambda key, **kw: i18n.t(self.ui_lang, key, **kw)   # noqa: E731
+        self.lt_source_label.configure(text=t("lt_source_label"))
+        self.lt_target_label.configure(text=t("lt_target_label"))
+        self.lt_mode_label.configure(text=t("lt_mode_label"))
+        self.lt_mic_label.configure(text=t("live_mic_label"))
+        self.lt_level_label.configure(text=t("live_level_label"))
+        self.lt_text_hint_label.configure(text=t("lt_text_hint"))
+        self.lt_source_menu.configure(values=i18n.live_language_options(self.ui_lang))
+        self.lt_source_menu.set(i18n.language_display(self.prefs["lt_source"], self.ui_lang))
+        self.lt_target_menu.configure(values=i18n.llm_target_options(self.ui_lang))
+        self.lt_target_menu.set(i18n.llm_target_display(self.prefs["lt_target"], self.ui_lang))
+        self.lt_mode_menu.configure(values=i18n.lt_mode_options(self.ui_lang))
+        self.lt_mode_menu.set(t(f"lt_mode_{self.prefs['lt_mode']}"))
+        self.lt_mode_hint_label.configure(text=t(f"lt_mode_hint_{self.prefs['lt_mode']}"))
+        self._refresh_lt_mic_menu()
+        self.lt_sub_label.configure(text=t("lt_sub_label"))
+        self.lt_sub_original_switch.configure(text=t("lt_sub_original"))
+        self.lt_sub_layout_label.configure(text=t("lt_sub_layout_label"))
+        self.lt_sub_compare_button.configure(text=t("lt_sub_cmp_button"))
+        self.lt_sub_layout_menu.configure(
+            values=[t(f"lt_sub_layout_{k}") for k in subtitles.CHOICES])
+        self.lt_sub_layout_menu.set(t(f"lt_sub_layout_{self.prefs['lt_sub_layout']}"))
+        self.lt_sub_lines_label.configure(text=t("lt_sub_scroll_lines_label"))
+        self.lt_sub_lines_menu.set(str(self.prefs["lt_sub_scroll_lines"]))
+        self._render_lt_scroll_lines_state()
+        self.lt_sub_scale_label.configure(text=t("lt_sub_scale_label"))
+        self.lt_sub_ratio_label.configure(text=t("lt_sub_ratio_label"))
+        self.lt_sub_original_var.set(bool(self.prefs["lt_sub_original"]))
+        self.lt_sub_scale_slider.set(round(self.prefs["lt_sub_scale"] * 100))
+        self.lt_sub_ratio_slider.set(round(self.prefs["lt_sub_orig_ratio"] * 100))
+        self._render_lt_sub_values()
+        self._refresh_lt_monitor_menu()
+        self._render_lt_sub_button()
+        self._render_lt_toggle_button()
+        self._render_lt_status()
+        self._render_lt_metrics()
+        self._lt_rebuild = True
+        self._lt_mark_dirty()
+        self._retranslate_words_tab()
+
+    def _on_lt_pref_change(self, _value=None):
+        self.prefs["lt_source"] = i18n.live_language_key_for_display(
+            self.lt_source_menu.get(), self.ui_lang)
+        self.prefs["lt_target"] = i18n.llm_target_key_for_display(
+            self.lt_target_menu.get(), self.ui_lang)
+        self.prefs["lt_mode"] = i18n.lt_mode_key_for_display(
+            self.lt_mode_menu.get(), self.ui_lang)
+        self.lt_mode_hint_label.configure(
+            text=i18n.t(self.ui_lang, f"lt_mode_hint_{self.prefs['lt_mode']}"))
+        mic = self.lt_mic_menu.get()
+        self.prefs["lt_mic_device"] = \
+            "" if mic == i18n.t(self.ui_lang, "mic_default") else mic
+        settings.save(self.prefs)
+
+    def _refresh_lt_mic_menu(self):
+        default_label = i18n.t(self.ui_lang, "mic_default")
+        devices = live_transcription.list_input_devices()
+        self.lt_mic_menu.configure(values=[default_label] + devices)
+        preferred = self.prefs.get("lt_mic_device", "")
+        self.lt_mic_menu.set(preferred if preferred in devices else default_label)
+
+    def _render_lt_toggle_button(self):
+        if self.lt_running:
+            self.lt_toggle_button.configure(
+                text=i18n.t(self.ui_lang, "lt_stop_button"),
+                fg_color="#8a3535", hover_color="#a04040")
+        else:
+            theme = ctk.ThemeManager.theme["CTkButton"]
+            self.lt_toggle_button.configure(
+                text=i18n.t(self.ui_lang, "lt_start_button"),
+                state="normal" if self.sensevoice_available else "disabled",
+                fg_color=theme["fg_color"], hover_color=theme["hover_color"])
+
+    def _set_lt_status(self, key, detail):
+        self.lt_status_key = key
+        self.lt_status_detail = detail if isinstance(detail, dict) else {}
+        self._render_lt_status()
+
+    def _render_lt_status(self):
+        if self.lt_status_key is None:
+            self.lt_status_line.configure(text="")
+            return
+        if self.lt_status_key == "!busy":
+            self.lt_status_line.configure(text=i18n.t(self.ui_lang, "lt_busy_live"))
+            return
+        self.lt_status_line.configure(text=i18n.t(
+            self.ui_lang, f"lt_status_{self.lt_status_key}", **self.lt_status_detail))
+
+    def _render_lt_metrics(self):
+        if not self.lt_metrics or not self.lt_running:
+            self.lt_metrics_label.configure(text="")
+            return
+        self.lt_metrics_label.configure(text=i18n.t(
+            self.ui_lang, "lt_metrics",
+            mt=f"{self.lt_metrics['mt_ms'] / 1000:.1f}",
+            e2e=f"{self.lt_metrics['e2e_ms'] / 1000:.1f}"))
+
+    def _lt_mark_dirty(self):
+        """Coalesces the burst of per-token events into one redraw."""
+        if not self._lt_render_pending:
+            self._lt_render_pending = True
+            self.after(60, self._lt_render)
+
+    def _lt_segment_text(self, seg):
+        if seg["state"] == "failed":
+            shown = "\u26a0 " + i18n.t(self.ui_lang, "lt_translation_failed")
+        else:
+            shown = seg["tr"] or ("\u2026" if seg["state"] != "final" else "")
+        return seg["src"] + "\n", shown + "\n\n"
+
+    def _lt_render(self):
+        """Brings the text area up to date by touching ONLY what changed: a
+        sentence's own lines are rewritten in place (each sentence carries its
+        own tag), new sentences are inserted above the grey in-progress line,
+        and that line is only redrawn when its own text changed. Clearing and
+        refilling the box, or redrawing unchanged lines on every tick, made
+        the whole area flash."""
+        self._lt_render_pending = False
+        if not (self._lt_rebuild or self._lt_dirty_ids or self._lt_evicted
+                or self._lt_preview_dirty):
+            return
+        box = self.lt_text._textbox
+        at_bottom = box.yview()[1] >= 0.98
+        self.lt_text.configure(state="normal")
+        if self._lt_rebuild:
+            box.delete("1.0", "end")
+            self._lt_rebuild = False
+            self._lt_dirty_ids = set(self.lt_segments)
+            self._lt_evicted = []
+            self._lt_preview_dirty = True
+        placeholder = box.tag_ranges("placeholder")
+        if placeholder and (self.lt_segments or self.lt_preview_src):
+            box.delete(placeholder[0], placeholder[-1])
+        for old in self._lt_evicted:
+            r = box.tag_ranges(f"seg{old}")
+            if r:
+                box.delete(r[0], r[-1])
+        self._lt_evicted = []
+        for seg_id in sorted(self._lt_dirty_ids):
+            seg = self.lt_segments.get(seg_id)
+            if seg is None:
+                continue
+            src_line, tr_line = self._lt_segment_text(seg)
+            tag = f"seg{seg_id}"
+            r = box.tag_ranges(tag)
+            if r:
+                if box.get(r[0], r[-1]) == src_line + tr_line:
+                    continue
+                box.mark_set("lt_ins", r[0])
+                box.delete(r[0], r[-1])
+            else:
+                preview = box.tag_ranges("preview")
+                box.mark_set("lt_ins", preview[0] if preview else "end-1c")
+            box.mark_gravity("lt_ins", "right")
+            box.insert("lt_ins", src_line, (tag, "src"))
+            box.insert("lt_ins", tr_line, (tag,))
+        self._lt_dirty_ids = set()
+        if self._lt_preview_dirty:
+            self._lt_preview_dirty = False
+            preview = box.tag_ranges("preview")
+            if preview:
+                box.delete(preview[0], preview[-1])
+            if self.lt_preview_src:
+                box.insert("end-1c", self.lt_preview_src + "\n", ("draft", "preview"))
+                if self.lt_preview_tr:
+                    box.insert("end-1c", self.lt_preview_tr + "\n", ("draft", "preview"))
+        if not self.lt_segments and not self.lt_preview_src and not box.tag_ranges("placeholder"):
+            box.insert("end-1c", i18n.t(self.ui_lang, "lt_placeholder"), ("src", "placeholder"))
+        self.lt_text.configure(state="disabled")
+        if at_bottom:
+            self.lt_text.see("end")
+
+    # ================================================================ word list
+
+    def _build_words_tab(self, parent):
+        parent.grid_columnconfigure(0, weight=1)
+        parent.grid_rowconfigure(2, weight=1)
+        self.words_hint_label = ctk.CTkLabel(
+            parent, text="", anchor="w", justify="left", wraplength=820,
+            text_color=self.MUTED_TEXT)
+        self.words_hint_label.grid(row=0, column=0, sticky="ew", padx=16, pady=(10, 6))
+
+        head = ctk.CTkFrame(parent, fg_color="transparent")
+        head.grid(row=1, column=0, sticky="ew", padx=(18, 30))
+        self._words_configure_columns(head)
+        self.words_head_labels = []
+        for col in range(3):
+            lab = ctk.CTkLabel(head, text="", anchor="w", text_color=self.MUTED_TEXT)
+            lab.grid(row=0, column=col, sticky="ew", padx=4)
+            self.words_head_labels.append(lab)
+
+        self.words_list = ctk.CTkScrollableFrame(parent)
+        self.words_list.grid(row=2, column=0, sticky="nsew", padx=12, pady=(2, 6))
+        self._words_configure_columns(self.words_list)
+
+        bottom = ctk.CTkFrame(parent, fg_color="transparent")
+        bottom.grid(row=3, column=0, sticky="ew", padx=12, pady=(2, 8))
+        self.words_add_button = ctk.CTkButton(
+            bottom, text="", height=34, command=lambda: self._words_add_row(focus=True))
+        self.words_add_button.grid(row=0, column=0, padx=(0, 8))
+        self.words_import_button = ctk.CTkButton(
+            bottom, text="", height=34, fg_color="transparent", border_width=1,
+            text_color=self.OUTLINE_BUTTON_TEXT, command=self._words_import)
+        self.words_import_button.grid(row=0, column=1, padx=(0, 8))
+        self.words_export_button = ctk.CTkButton(
+            bottom, text="", height=34, fg_color="transparent", border_width=1,
+            text_color=self.OUTLINE_BUTTON_TEXT, command=self._words_export)
+        self.words_export_button.grid(row=0, column=2, padx=(0, 8))
+        self.words_template_button = ctk.CTkButton(
+            bottom, text="", height=34, fg_color="transparent", border_width=1,
+            text_color=self.OUTLINE_BUTTON_TEXT, command=self._words_download_template)
+        self.words_template_button.grid(row=0, column=3, padx=(0, 12))
+        self.words_count_label = ctk.CTkLabel(bottom, text="", text_color=self.MUTED_TEXT)
+        self.words_count_label.grid(row=0, column=4, sticky="w")
+
+        for entry in wordlist.clean_entries(self.prefs.get("lt_wordlist")):
+            self._words_add_row(entry)
+        if not self.words_rows:
+            self._words_add_row()
+
+    @staticmethod
+    def _words_configure_columns(frame):
+        frame.grid_columnconfigure(0, weight=3, uniform="w")
+        frame.grid_columnconfigure(1, weight=4, uniform="w")
+        frame.grid_columnconfigure(2, weight=3, uniform="w")
+        frame.grid_columnconfigure(3, weight=0)
+
+    def _retranslate_words_tab(self):
+        t = lambda key, **kw: i18n.t(self.ui_lang, key, **kw)   # noqa: E731
+        self.words_hint_label.configure(text=t("words_hint"))
+        for lab, key in zip(self.words_head_labels,
+                            ("words_head_word", "words_head_heard", "words_head_translation")):
+            lab.configure(text=t(key))
+        self.words_add_button.configure(text=t("words_add"))
+        self.words_import_button.configure(text=t("words_import"))
+        self.words_export_button.configure(text=t("words_export"))
+        self.words_template_button.configure(text=t("words_template"))
+        for row in self.words_rows:
+            for key, ph in (("word", "words_ph_word"), ("heard", "words_ph_heard"),
+                            ("translation", "words_ph_translation")):
+                row[key].configure(placeholder_text=t(ph))
+        self._words_update_count()
+
+    def _words_add_row(self, entry=None, focus=False):
+        entry = entry or {}
+        index = len(self.words_rows)
+        row = {}
+        specs = (("word", entry.get("word", "")),
+                 ("heard", ", ".join(entry.get("heard", []))),
+                 ("translation", entry.get("translation", "")))
+        for col, (key, value) in enumerate(specs):
+            e = ctk.CTkEntry(self.words_list, placeholder_text=i18n.t(
+                self.ui_lang, f"words_ph_{key}"))
+            e.grid(row=index, column=col, sticky="ew", padx=4, pady=2)
+            if value:
+                e.insert(0, value)
+            e.bind("<KeyRelease>", lambda _e: self._words_changed())
+            row[key] = e
+        row["delete"] = ctk.CTkButton(
+            self.words_list, text="\u2715", width=30, height=28, fg_color="transparent",
+            border_width=1, text_color=self.OUTLINE_BUTTON_TEXT,
+            command=lambda r=row: self._words_delete_row(r))
+        row["delete"].grid(row=index, column=3, padx=(4, 4), pady=2)
+        self.words_rows.append(row)
+        if focus:
+            row["word"].focus_set()
+        self._words_update_count()
+
+    def _words_delete_row(self, row):
+        for key in ("word", "heard", "translation", "delete"):
+            row[key].destroy()
+        self.words_rows.remove(row)
+        for i, r in enumerate(self.words_rows):          # close the gap
+            for col, key in enumerate(("word", "heard", "translation", "delete")):
+                r[key].grid_configure(row=i)
+        if not self.words_rows:
+            self._words_add_row()
+        self._words_changed()
+
+    def _words_collect(self):
+        return wordlist.clean_entries([
+            {"word": r["word"].get(), "heard": r["heard"].get(),
+             "translation": r["translation"].get()} for r in self.words_rows])
+
+    def _words_update_count(self):
+        self.words_count_label.configure(text=i18n.t(
+            self.ui_lang, "words_count", n=len(self._words_collect())))
+
+    def _words_changed(self):
+        """Saves a moment after the last keystroke (and applies it to the
+        running translation straight away)."""
+        if self._words_save_job is not None:
+            self.after_cancel(self._words_save_job)
+        self._words_save_job = self.after(500, self._words_save)
+
+    def _words_save(self):
+        self._words_save_job = None
+        entries = self._words_collect()
+        self.prefs["lt_wordlist"] = entries
+        settings.save(self.prefs)
+        self.lt_wordlist.set_entries(entries)
+        self._words_update_count()
+
+    def _words_reload_rows(self, entries):
+        for row in list(self.words_rows):
+            for key in ("word", "heard", "translation", "delete"):
+                row[key].destroy()
+        self.words_rows = []
+        for entry in entries:
+            self._words_add_row(entry)
+        if not self.words_rows:
+            self._words_add_row()
+
+    def _words_xlsx_texts(self):
+        t = lambda key: i18n.t(self.ui_lang, key)   # noqa: E731
+        header = tuple(t("words_xlsx_header").split("|"))
+        sheets = tuple(t("words_xlsx_sheets").split("|"))
+        return header, sheets, t("words_xlsx_tips").split("\n")
+
+    def _words_download_template(self):
+        """Saves an empty Excel word list (plus a sheet of examples and tips)."""
+        path = filedialog.asksaveasfilename(
+            title=i18n.t(self.ui_lang, "words_template_title"), defaultextension=".xlsx",
+            initialfile="SOTA word list template.xlsx", filetypes=[("Excel", "*.xlsx")])
+        if not path:
+            return
+        header, sheets, tips = self._words_xlsx_texts()
+        try:
+            wordlist_xlsx.write_xlsx(path, [], header, examples=wordlist_xlsx.EXAMPLE_ENTRIES,
+                                     tips=tips, sheet_names=sheets)
+        except OSError as err:
+            settings.log_exception("Word list template save failed:")
+            messagebox.showerror(i18n.t(self.ui_lang, "words_template_title"), str(err))
+
+    def _words_import(self):
+        path = filedialog.askopenfilename(
+            title=i18n.t(self.ui_lang, "words_import_title"),
+            filetypes=[("Excel / text", "*.xlsx *.txt *.csv *.tsv"), ("Excel", "*.xlsx"),
+                       ("Text", "*.txt *.csv *.tsv"), ("All", "*.*")])
+        if not path:
+            return
+        try:
+            if path.lower().endswith(".xlsx"):
+                incoming = wordlist_xlsx.read_xlsx(path)
+            else:
+                with open(path, "r", encoding="utf-8-sig") as f:
+                    incoming = wordlist.parse_text(f.read())
+        except Exception as err:
+            settings.log_exception("Word list import failed:")
+            messagebox.showerror(i18n.t(self.ui_lang, "words_import"),
+                                 i18n.t(self.ui_lang, "words_import_error", error=err))
+            return
+        merged = wordlist.clean_entries(self._words_collect() + incoming)
+        self._words_reload_rows(merged)
+        self._words_save()
+
+    def _words_export(self):
+        path = filedialog.asksaveasfilename(
+            title=i18n.t(self.ui_lang, "words_export_title"), defaultextension=".xlsx",
+            initialfile="word-list.xlsx", filetypes=[("Excel", "*.xlsx"), ("Text", "*.txt")])
+        if not path:
+            return
+        try:
+            if path.lower().endswith(".txt"):
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(wordlist.to_text(self._words_collect()))
+            else:
+                header, sheets, _tips = self._words_xlsx_texts()
+                wordlist_xlsx.write_xlsx(path, self._words_collect(), header, sheet_names=sheets)
+        except OSError as err:
+            settings.log_exception("Word list export failed:")
+            messagebox.showerror(i18n.t(self.ui_lang, "words_export"), str(err))
+
+    # -- subtitles on an audience screen ---------------------------------------
+
+    def _lt_monitor_labels(self):
+        self._lt_monitors = subtitles.list_monitors(self)
+        main = i18n.t(self.ui_lang, "lt_sub_screen_main")
+        return [subtitles.monitor_label(i, m, main) for i, m in enumerate(self._lt_monitors)]
+
+    def _refresh_lt_monitor_menu(self):
+        labels = self._lt_monitor_labels()
+        self.lt_sub_monitor_menu.configure(values=labels)
+        idx = self.prefs["lt_sub_monitor"]
+        self.lt_sub_monitor_menu.set(labels[idx if 0 <= idx < len(labels) else 0])
+
+    def _lt_selected_monitor(self):
+        labels = self._lt_monitor_labels()
+        current = self.lt_sub_monitor_menu.get()
+        idx = labels.index(current) if current in labels else 0
+        return idx, self._lt_monitors[idx]
+
+    def _render_lt_scroll_lines_state(self):
+        """The line count only matters for the scroll layout."""
+        scroll = self.prefs.get("lt_sub_layout") == "scroll"
+        self.lt_sub_lines_menu.configure(state="normal" if scroll else "disabled")
+        self.lt_sub_lines_label.configure(text_color=("gray10", "gray90") if scroll else ("gray55", "gray45"))
+
+    def _render_lt_sub_button(self):
+        self.lt_sub_button.configure(text=i18n.t(
+            self.ui_lang, "lt_sub_hide" if self.lt_sub_window else "lt_sub_show"))
+
+    def _render_lt_sub_values(self):
+        self.lt_sub_scale_value.configure(text=f"{round(self.lt_sub_scale_slider.get())}%")
+        self.lt_sub_ratio_value.configure(text=f"{round(self.lt_sub_ratio_slider.get())}%")
+
+    def _on_lt_sub_slider(self, _value=None):
+        """Dragging a size slider: show the new size on the subtitle screen at
+        once; save to the settings file a moment after the last movement."""
+        self._render_lt_sub_values()
+        self.prefs["lt_sub_scale"] = round(self.lt_sub_scale_slider.get()) / 100
+        self.prefs["lt_sub_orig_ratio"] = round(self.lt_sub_ratio_slider.get()) / 100
+        if self.lt_sub_window is not None:
+            self.lt_sub_window.set_scale(self.prefs["lt_sub_scale"])
+            self.lt_sub_window.set_orig_ratio(self.prefs["lt_sub_orig_ratio"])
+            self._lt_sub_demo_until = max(self._lt_sub_demo_until, time.monotonic() + 2.0)
+        if getattr(self, "_lt_sub_save_job", None) is not None:
+            self.after_cancel(self._lt_sub_save_job)
+        self._lt_sub_save_job = self.after(500, lambda: settings.save(self.prefs))
+
+    def _on_lt_sub_pref_change(self, _value=None):
+        idx, monitor = self._lt_selected_monitor()
+        self.prefs["lt_sub_monitor"] = idx
+        self.prefs["lt_sub_original"] = bool(self.lt_sub_original_var.get())
+        self.prefs["lt_sub_layout"] = next(
+            (k for k in subtitles.CHOICES
+             if i18n.t(self.ui_lang, f"lt_sub_layout_{k}") == self.lt_sub_layout_menu.get()),
+            subtitles.DEFAULT_LAYOUT)
+        self.prefs["lt_sub_scroll_lines"] = subtitles.normalize_scroll_lines(self.lt_sub_lines_menu.get())
+        self._render_lt_scroll_lines_state()
+        settings.save(self.prefs)
+        if self.lt_sub_window is not None:
+            self.lt_sub_window.set_monitor(monitor)
+            self.lt_sub_window.set_show_original(self.prefs["lt_sub_original"])
+            self.lt_sub_window.set_layout(self.prefs["lt_sub_layout"])
+            self.lt_sub_window.set_scroll_lines(self.prefs["lt_sub_scroll_lines"])
+            self._lt_sub_demo_until = time.monotonic() + 3.0
+
+    def _lt_preview_strings(self):
+        t = lambda key: i18n.t(self.ui_lang, key)   # noqa: E731
+        strings = {k: t(f"lt_sub_layout_{k}") for k in subtitles.LAYOUTS}
+        strings.update(title=t("lt_sub_cmp_title"), intro=t("lt_sub_cmp_intro"),
+                       use=t("lt_sub_cmp_use"), in_use=t("lt_sub_cmp_in_use"),
+                       with_original=t("lt_sub_cmp_with_original"),
+                       translation_only=t("lt_sub_cmp_translation_only"))
+        return strings
+
+    def _open_lt_layout_preview(self):
+        """All layouts side by side, running the same demo speech."""
+        preview = getattr(self, "_lt_preview", None)
+        if preview is not None and preview.exists():
+            preview.top.lift()
+            preview.top.focus_force()
+            return
+        self._lt_preview = subtitles.LayoutPreview(
+            self, self._lt_preview_strings(), self.prefs["lt_sub_layout"],
+            self.prefs["lt_sub_original"], self._use_lt_layout,
+            scroll_lines=self.prefs["lt_sub_scroll_lines"])
+
+    def _use_lt_layout(self, layout, show_original):
+        self.lt_sub_layout_menu.set(i18n.t(self.ui_lang, f"lt_sub_layout_{layout}"))
+        if layout != "none":
+            self.lt_sub_original_var.set(bool(show_original))
+        self._on_lt_sub_pref_change()
+
+    def _open_lt_subtitles(self, demo=True):
+        if self.lt_sub_window is not None:
+            return
+        _idx, monitor = self._lt_selected_monitor()
+        self.lt_sub_window = subtitles.SubtitleWindow(
+            self, monitor, self.prefs["lt_sub_scale"], self.prefs["lt_sub_orig_ratio"],
+            self.prefs["lt_sub_original"], self.prefs["lt_sub_layout"],
+            self.prefs["lt_sub_scroll_lines"])
+        if demo:
+            self._lt_sub_demo_until = time.monotonic() + 4.0     # lets the user line the screen up
+        self._render_lt_sub_button()
+        self._lt_sub_tick()
+
+    def _toggle_lt_subtitles(self):
+        """Show/Hide subtitles. The choice is remembered: subtitles are on by
+        default and open by themselves when translating starts, unless the
+        user hid them."""
+        if self.lt_sub_window is not None:
+            self.prefs["lt_sub_show"] = False
+            self._close_lt_subtitles()
+        else:
+            self.prefs["lt_sub_show"] = True
+            self._open_lt_subtitles(demo=True)
+        settings.save(self.prefs)
+
+    def _close_lt_subtitles(self):
+        if self._lt_sub_job is not None:
+            try:
+                self.after_cancel(self._lt_sub_job)
+            except Exception:
+                pass
+            self._lt_sub_job = None
+        if self.lt_sub_window is not None:
+            self.lt_sub_window.destroy()
+            self.lt_sub_window = None
+        if hasattr(self, "lt_sub_button"):
+            self._render_lt_sub_button()
+
+    def _lt_sub_tick(self):
+        window = self.lt_sub_window
+        if window is None:
+            return
+        try:
+            view = self.lt_sub_ctrl.view()
+            if view is None and time.monotonic() < self._lt_sub_demo_until:
+                t = lambda key: i18n.t(self.ui_lang, key)   # noqa: E731
+                view = {"current": (t("lt_sub_demo_original"), t("lt_sub_demo_translation")),
+                        "previous": (t("lt_sub_demo_prev_original"),
+                                     t("lt_sub_demo_prev_translation")),
+                        "seq": -1, "prev_seq": -2}
+            window.render(view)
+        except Exception:
+            settings.log_exception("Subtitle window update failed:")
+        self._lt_sub_job = self.after(100, self._lt_sub_tick)
+
+    def _toggle_live_translate(self):
+        if self.lt_running:
+            self._stop_live_translate()
+        else:
+            self._start_live_translate()
+
+    def _start_live_translate(self):
+        if self.lt_running or not self.sensevoice_available:
+            return
+        if self.live_running:
+            self._set_lt_status("!busy", {})
+            return
+        if not self._confirm_sensevoice_download():
+            return
+        spec = llm.TRANSLATE_LLM["fast"]
+        if not llm.llm_model_is_downloaded(spec):
+            if not self._confirm_model_download(
+                    "Hy-MT2-1.8B", spec["ram_gb"], spec["size_gb"], "Hy-MT2-1.8B"):
+                return
+        settings.log_action("Start (Live Translate)")
+        code = self.prefs["lt_source"]
+        self.lt_running = True
+        self.lt_segments.clear()
+        self._lt_rebuild = True
+        self.lt_sub_ctrl.reset()
+        self.lt_preview_src = self.lt_preview_tr = ""
+        self._lt_preview_dirty = True
+        self.lt_metrics = None
+        self._lt_mark_dirty()
+        for menu in (self.lt_source_menu, self.lt_target_menu, self.lt_mode_menu, self.lt_mic_menu):
+            menu.configure(state="disabled")
+        self._render_lt_toggle_button()
+        self._style_tab_buttons()
+        self._set_lt_status("preparing", {})
+        self.lt_worker = live_translate.LiveTranslator(
+            self.events,
+            source_language="" if code == "auto" else code,
+            target_key=self.prefs["lt_target"],
+            profile=self.prefs["lt_mode"],
+            device_name=self.prefs.get("lt_mic_device", ""),
+            traditional_chinese=bool(self.prefs.get("chinese_traditional")),
+            calibration=self.prefs.get("lt_calibration"),
+            wordlist=self.lt_wordlist)
+        self.lt_worker.start()
+        if self.prefs.get("lt_sub_show", True):
+            self._open_lt_subtitles(demo=False)
+
+    def _stop_live_translate(self):
+        settings.log_action("Stop (Live Translate)")
+        if self.lt_worker:
+            self.lt_worker.stop()
+        self.lt_toggle_button.configure(state="disabled")
+        self._set_lt_status("finishing", {})
+
+    def _on_lt_stopped(self):
+        self.lt_running = False
+        self.lt_worker = None
+        self.lt_preview_src = self.lt_preview_tr = ""
+        self._lt_preview_dirty = True
+        state = "normal" if self.sensevoice_available else "disabled"
+        for menu in (self.lt_source_menu, self.lt_target_menu, self.lt_mode_menu, self.lt_mic_menu):
+            menu.configure(state=state)
+        self.lt_level_bar.set(0)
+        if self.lt_status_key not in ("mic_failed", "engine_failed", "failed", "idle_stop"):
+            self._set_lt_status("stopped", {})
+        self._render_lt_toggle_button()
+        self._render_lt_metrics()
+        self._lt_mark_dirty()
+        self._style_tab_buttons()
+        self._refresh_models_if_visible()
+
     # ------------------------------------------------------------ edit tab
 
     def _build_edit_tab(self, parent):
@@ -6761,7 +7528,7 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
             text=t("settings_total_usage", size=_fmt_size(total)))
 
     def _models_busy(self):
-        return self.running or self.live_running or self.llm_running
+        return self.running or self.live_running or self.llm_running or self.lt_running
 
     def _download_model(self, spec):
         key = spec["key"]
@@ -7041,6 +7808,7 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         self.llm_source_font.configure(size=self.prefs["llm_source_font_size"])
         self.llm_output_font.configure(size=self.prefs["llm_output_font_size"])
         self.live_text_font.configure(size=self.prefs["live_text_font_size"])
+        self.lt_text_font.configure(size=self.prefs["lt_text_font_size"])
         self.llm_split = self._clamp_split(self.prefs["llm_panel_split"])
         self._apply_llm_split()
         self._apply_prefs()
@@ -7285,15 +8053,16 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
     # switch away. AI moved from being its own top-level group to
     # Transcription Studio's 4th subtab, alongside Transcribe/Live/Edit.
     LEAF_AUDIO_RECORD, LEAF_AUDIO_EDIT, \
-        LEAF_TRANSCRIBE, LEAF_LIVE, LEAF_EDIT, LEAF_AI, LEAF_SETTINGS = range(7)
+        LEAF_TRANSCRIBE, LEAF_LIVE, LEAF_EDIT, LEAF_AI, LEAF_SETTINGS, \
+        LEAF_LIVE_TRANSLATE, LEAF_WORDS = range(9)
     LEAF_KEYS = [
         "tab_audio_record", "tab_audio_edit",
         "tab_transcribe", "tab_live", "tab_edit", "tab_llm",
-        "tab_settings",
+        "tab_settings", "tab_live_translate", "tab_words",
     ]
     GROUP_KEYS = [
         "tab_group_audio_studio", "tab_group_transcription_studio",
-        "tab_group_settings",
+        "tab_group_live_translate", "tab_group_settings",
     ]
     # Leaves (indices into LEAF_KEYS), in on-screen order, belonging to
     # each group. A group with only one leaf gets no inner strip at all —
@@ -7301,9 +8070,11 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
     GROUP_LEAVES = [
         [LEAF_AUDIO_RECORD, LEAF_AUDIO_EDIT],
         [LEAF_TRANSCRIBE, LEAF_LIVE, LEAF_EDIT, LEAF_AI],
+        [LEAF_LIVE_TRANSLATE, LEAF_WORDS],
         [LEAF_SETTINGS],
     ]
     GROUP_TRANSCRIPTION_STUDIO = 1  # index into GROUP_KEYS/GROUP_LEAVES — for the Live-badge tint
+    GROUP_LIVE_TRANSLATE = 2        # likewise, for the Live Translate badge
 
     # Selected tab matches the content panel's background (so it visually
     # merges into it); unselected tabs use the app's normal frame color.
@@ -7512,7 +8283,7 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
     def _leaf_frames(self):
         return [self.audio_record_frame, self.audio_edit_frame,
                 self.transcribe_frame, self.live_frame, self.edit_frame, self.llm_frame,
-                self.settings_frame]
+                self.settings_frame, self.live_translate_frame, self.words_frame]
 
     def _show_group(self, group_index):
         """Outer tab bar click: shows whichever leaf was last active in
@@ -7555,6 +8326,10 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
                 frame.grid_remove()
         if index == self.LEAF_LIVE:
             self._refresh_mic_menu()
+            self._maybe_preload_sensevoice()
+        elif index == self.LEAF_LIVE_TRANSLATE:
+            self._refresh_lt_mic_menu()
+            self._refresh_lt_monitor_menu()
             self._maybe_preload_sensevoice()
         elif index == self.LEAF_EDIT:
             self._maybe_autoload_edit()
@@ -7798,6 +8573,9 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
             if (i == self.GROUP_TRANSCRIPTION_STUDIO and self.live_running
                     and self.current_tab != self.LEAF_LIVE):
                 text_color = live_color
+            if (i == self.GROUP_LIVE_TRANSLATE and self.lt_running
+                    and self.current_group != self.GROUP_LIVE_TRANSLATE):
+                text_color = live_color
             btn.configure(
                 fg_color=self.TAB_SELECTED_BG if selected else self.TAB_UNSELECTED_BG,
                 hover_color=self.TAB_SELECTED_BG if selected else self.TAB_UNSELECTED_HOVER,
@@ -7811,6 +8589,8 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
                 selected = group_active and leaf == self.current_tab
                 text_color = ("gray10", "gray95") if selected else self.MUTED_TEXT
                 if leaf == self.LEAF_LIVE and self.live_running and not selected:
+                    text_color = live_color
+                if leaf == self.LEAF_LIVE_TRANSLATE and self.lt_running and not selected:
                     text_color = live_color
                 btn.configure(
                     fg_color=self.TAB_SELECTED_BG if selected else "transparent",
@@ -7887,6 +8667,28 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
             self.prefs["llm_target"] = "zh-hant"
         if self.prefs["llm_quality"] not in i18n.LLM_TRANSLATE_QUALITY_KEYS:
             self.prefs["llm_quality"] = "fast"
+        if self.prefs["lt_source"] not in i18n.LIVE_LANGUAGE_CODES:
+            self.prefs["lt_source"] = "auto"
+        if self.prefs["lt_target"] not in valid_targets:
+            self.prefs["lt_target"] = "en"
+        self.prefs["lt_mode"] = i18n.normalize_lt_mode(self.prefs.get("lt_mode"))
+        self.prefs["lt_sub_show"] = bool(self.prefs.get("lt_sub_show", True))
+        self.prefs["lt_wordlist"] = wordlist.clean_entries(self.prefs.get("lt_wordlist"))
+        self.lt_wordlist.set_entries(self.prefs["lt_wordlist"])
+        self.prefs["lt_sub_scale"] = subtitles.clamp(
+            self.prefs.get("lt_sub_scale"), subtitles.SCALE_MIN, subtitles.SCALE_MAX,
+            subtitles.DEFAULT_SCALE)
+        self.prefs["lt_sub_orig_ratio"] = subtitles.clamp(
+            self.prefs.get("lt_sub_orig_ratio"), subtitles.ORIG_RATIO_MIN,
+            subtitles.ORIG_RATIO_MAX, subtitles.DEFAULT_ORIG_RATIO)
+        self.prefs["lt_sub_layout"] = subtitles.normalize_choice(self.prefs.get("lt_sub_layout"))
+        self.prefs["lt_sub_scroll_lines"] = subtitles.normalize_scroll_lines(
+            self.prefs.get("lt_sub_scroll_lines"))
+        if not isinstance(self.prefs["lt_sub_monitor"], int) or self.prefs["lt_sub_monitor"] < 0:
+            self.prefs["lt_sub_monitor"] = 0
+        self.prefs["lt_sub_original"] = bool(self.prefs["lt_sub_original"])
+        if not isinstance(self.prefs.get("lt_calibration"), dict):
+            self.prefs["lt_calibration"] = None
 
     # --------------------------------------------------------- translation
 
@@ -7958,6 +8760,7 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         self.live_text_hint_label.configure(text=t("live_text_hint"))
         self.live_open_folder_button.configure(text=t("open_output_folder"))
         self.live_draft_button.configure(text=t("live_draft_button"))
+        self._retranslate_live_translate_tab()
         self.live_language_menu.configure(values=i18n.live_language_options(self.ui_lang))
         self.live_language_menu.set(
             i18n.language_display(self.prefs["live_language"], self.ui_lang))
@@ -8261,7 +9064,15 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
                 if tokens:
                     self._append_llm_output("".join(tokens))
                     tokens = []
-                self._handle_event(event)
+                if event[0].startswith("lt_"):
+                    # A bug in the Live Translate handlers must never stop the
+                    # whole app's event polling.
+                    try:
+                        self._handle_event(event)
+                    except Exception:
+                        settings.log_exception("Live Translate event failed:")
+                else:
+                    self._handle_event(event)
         except queue.Empty:
             pass
         if tokens:
@@ -8388,6 +9199,34 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
                 self.edit_new_live_button.grid()
         elif kind == "live_stopped":
             self._on_live_stopped()
+        elif kind == "lt_status":
+            self._set_lt_status(event[1], event[2])
+        elif kind == "lt_segment":
+            _, seg_id, source, translation, state = event
+            seg = self.lt_segments.setdefault(seg_id, {"src": source, "tr": "", "state": state})
+            seg["src"], seg["tr"], seg["state"] = source, translation, state
+            self._lt_dirty_ids.add(seg_id)
+            while len(self.lt_segments) > self.LT_MAX_SEGMENTS:
+                old = next(iter(self.lt_segments))
+                self.lt_segments.pop(old)
+                self._lt_evicted.append(old)
+            self.lt_sub_ctrl.on_segment(seg_id, source, translation, state)
+            self._lt_mark_dirty()
+        elif kind == "lt_preview":
+            _, src, tr = event
+            self.lt_sub_ctrl.on_preview(src, tr)
+            if (src, tr) != (self.lt_preview_src, self.lt_preview_tr):
+                self.lt_preview_src, self.lt_preview_tr = src, tr
+                self._lt_preview_dirty = True
+                self._lt_mark_dirty()
+        elif kind == "lt_metrics":
+            self.lt_metrics = event[1]
+            self._render_lt_metrics()
+        elif kind == "lt_calibrated":
+            self.prefs["lt_calibration"] = event[1]
+            settings.save(self.prefs)
+        elif kind == "lt_stopped":
+            self._on_lt_stopped()
         elif kind == "llm_status":
             _, key, detail = event
             self.llm_status_key, self.llm_status_detail = key, detail
@@ -8555,6 +9394,9 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
 
     def _start_live_recording(self):
         if self.live_running or not self.sensevoice_available:
+            return
+        if self.lt_running:
+            self._set_live_status("live_busy_lt", {})
             return
         # First-ever session downloads the engine (~900 MB) — the tab's
         # preload deliberately doesn't (see SenseVoicePreloader), so this
@@ -9160,6 +10002,8 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
                     "player_preparing", {"speed": _speed_label(speed), "pct": 0})
 
     def _tick_player(self):
+        if self.current_tab == self.LEAF_LIVE_TRANSLATE and self.lt_running and self.lt_worker:
+            self.lt_level_bar.set(min(1.0, self.lt_worker.level * 12))
         if self.current_tab == self.LEAF_LIVE and self.live_running and self.live_worker:
             # Rough perceptual scaling: speech RMS sits around 0.02–0.2, so
             # ×12 maps quiet speech near 1/4 bar and normal speech near full.
@@ -9576,6 +10420,13 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
             # would otherwise be killed mid-write).
             self.live_worker.stop()
             self.live_worker.join(timeout=5.0)
+        self._close_lt_subtitles()
+        preview = getattr(self, "_lt_preview", None)
+        if preview is not None and preview.exists():
+            preview.close()
+        if self.lt_running and self.lt_worker:
+            self.lt_worker.stop()
+            self.lt_worker.join(timeout=5.0)
         if self.audio_recording and self.audio_recorder:
             # Same reasoning as live_worker just above — this used to be
             # missing entirely, so closing SOTA mid-recording in Audio

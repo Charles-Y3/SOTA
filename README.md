@@ -1,6 +1,6 @@
 # SOTA — Smart Offline Transcription & Audio
 
-**Version 2.2.0**
+**Version 2.3.0**
 
 Drop in audio files, click **Transcribe All**, and get a transcript for each
 file — saved as `.docx` if Microsoft Word is installed, otherwise `.txt`. Or
@@ -160,10 +160,11 @@ squeak, a cough) still isn't speech either, so it's flagged too.
 
 1. **Transcribe** — drop audio files in, get a transcript for each.
 2. **Live Transcription** — dictate from the microphone; auto-saves when you stop.
-3. **Edit & Export** — replay a file, fix the transcript, save a copy;
+3. **Live Translate** — speak, and read the translation sentence by sentence.
+4. **Edit & Export** — replay a file, fix the transcript, save a copy;
    click a paragraph's timestamp to jump the playback there.
-4. **AI Summary & Translate** — summarize and/or translate a transcript with a local AI model.
-5. **Settings** — manage downloaded models, pick the output folder, check for updates.
+5. **AI Summary & Translate** — summarize and/or translate a transcript with a local AI model.
+6. **Settings** — manage downloaded models, pick the output folder, check for updates.
 
 ### Transcribe tab
 
@@ -257,6 +258,111 @@ The recording is written to its `.wav` file continuously while you speak
 (not held in memory until you press Stop), so sessions can run for hours
 without eating RAM — and even if the app or the PC dies mid-session,
 everything captured up to that moment is already on disk and playable.
+
+### Live Translate (its own tab, beside Transcription Studio and Settings)
+
+It has two subtabs: **Translate** and **Word List**.
+
+#### Translate
+
+Speak into the microphone and get a running translation: each finished
+sentence appears in grey with its translation underneath. Speech is
+recognized by SenseVoice (English, Chinese, Cantonese, Japanese, Korean) and
+translated on your computer by Tencent's Hy-MT2-1.8B (the same model as
+**Fast** in the AI tab). Nothing is sent anywhere and, for now, nothing is
+recorded or saved.
+
+1. Pick the language you speak (or **Auto-detect**), the language to
+   **Translate to**, and a microphone.
+2. Choose a **Priority** (just two, **Low latency** is the default):
+   - **Low latency** — the fastest: a sentence is translated after a ~0.5 s
+     pause, and each clause of a long sentence (up to a comma) is translated
+     **while you are still speaking**, so when the sentence ends only its last
+     part is left to translate - on fast speech with many clauses the delay
+     after a sentence was about a third shorter in testing (about 0.6 s instead
+     of 1.0 s here); sentences without commas see no change. Slightly more
+     mistakes, because the early clauses are translated without the rest of
+     the sentence.
+   - **Accuracy** — waits for a ~0.8 s pause and gives the translator the
+     previous sentence as context. A little slower, more accurate.
+3. Press **Start**. The first start downloads the translation model (about
+   1.1 GB, once) and runs a few-second self-test that picks the best CPU
+   thread split for *your* computer (remembered afterwards). The status line
+   shows the translation time and the delay after each sentence; on a slow
+   computer it warns you. The subtitles open by themselves (see below).
+
+#### Subtitles on a projector or second screen
+
+Subtitles are **on by default**: when you press Start they open on the screen
+chosen under **Subtitles** (plugged-in projectors appear in the list). Press
+**Hide subtitles** to turn them off (that is remembered) and **Show subtitles**
+to bring them back. Only text is drawn - white with a black outline,
+no background box - at the bottom of that screen; on Windows the rest of the
+screen (slides, video) stays visible and clickable. They roll like broadcast
+captions. Choose how much to show with **Layout**:
+
+| Layout | What is on screen (top to bottom) |
+|---|---|
+| **3 lines: + previous translation** | the previous sentence's translation (dimmer), then the current sentence's original (live) and its translation |
+| **4 lines: + previous sentence** | the previous sentence's original and translation (dimmer), then the two above |
+| **Scroll: translations + live strip** (default) | a scroll of the latest translations (newest white, older dimmer), and right under it a one-line strip with the original words as they are being spoken |
+
+For the **Scroll** layout, **Scroll lines** (2, 3 or 4) sets how many lines of
+translation stay on screen. They are counted in screen lines, not sentences: a
+long sentence that wraps onto two lines uses two of them, and older text
+scrolls off the top. The strip stays at the bottom and is always one line (the
+most recent words that fit, like a ticker), so the translations sit right on
+top of it and never move when it changes.
+
+**Show original** turns the original lines off for an audience that cannot read
+that language: the layouts then show translations only.
+
+The *current* sentence's original appears **live, as the words are spoken**, and
+its translation **streams in** underneath as the model writes it (that line is
+kept free, so nothing jumps). The previous lines are there for when a
+translation arrives after the speaker has already moved on.
+
+When a new sentence starts the picture **rolls**: the old lines slide up and
+away, the current one slides up into the previous slot, and the new sentence
+slides in from below. Nothing blinks off: lines stay on screen until something
+pushes them out, and after a long silence the older line rolls away first and
+the last one a few seconds after it.
+
+Two sliders set the size: **Size** (50% - 200% of the default) and **Original
+line** (40% - 100% of the translation's size). Changes show immediately on the
+subtitle screen, with a sample text for a moment while you drag. To feed a
+recording instead of a live voice, choose the input that carries it (a
+line-in, a virtual audio cable, or *Stereo Mix*) as the **Microphone**. To burn
+the subtitles into a recorded video, capture that screen in your recording
+software (for example OBS).
+
+It cannot run at the same time as Live Transcription (both use the
+microphone and the same speech engine).
+
+#### Word List
+
+Names, products and jargon that get misheard or mistranslated. Each row has:
+
+- **Word or name** — the correct spelling (`Acme Dynamics`, `Dr. Okafor`, `kanban`).
+- **Often heard as** (optional) — wrong spellings the speech engine produces
+  (`Acne Dynamics, Acme Dinamics`); they are replaced by the correct word.
+  Longer Latin words (6+ letters) that are only one or two letters off are
+  also fixed automatically, so you usually only need to list the short or very
+  different mishearings.
+- **Translate as** (optional) — what the word must become in the translation
+  (`看板` for `kanban`). Leave it empty to keep the word exactly as written
+  (good for names, products and acronyms such as `Lumora` or `OKR`).
+
+Changes apply from the next sentence, even while translating.
+
+**Filling in a long list is easier in Excel.** Press **Download Excel
+template...**: it saves an empty `.xlsx` with the three columns, plus a second
+sheet with examples and instructions (that sheet is never read, so the examples
+cannot be imported by accident). Fill in the first sheet, save it, then press
+**Import list...** and choose it. **Export list...** saves the current list the
+same way (as `.xlsx`, or as a plain text file with one word per line:
+`word | heard as, heard as | translate as`). Import also reads Excel files saved
+by LibreOffice or Google Sheets, and text files.
 
 ### Edit & Export tab
 
@@ -428,11 +534,11 @@ macOS `.app`.
   **Run workflow**. When it finishes, download `SOTA-windows` and
   `SOTA-macOS` from the run's **Artifacts** section.
 - **Automatically**: every push to `main` builds both platforms.
-- **Releases**: pushing a tag like `v2.2.0` also publishes a GitHub Release
+- **Releases**: pushing a tag like `v2.3.0` also publishes a GitHub Release
   with both zips attached:
   ```
-  git tag v2.2.0
-  git push origin v2.2.0
+  git tag v2.3.0
+  git push origin v2.3.0
   ```
 
 ### Running the unsigned macOS build
@@ -469,6 +575,10 @@ py -3.11 -m venv .venv
 pip install -r requirements.txt
 python app.py
 ```
+
+Python 3.14 is **not** supported yet (no `torch` / `llama-cpp-python` builds
+for it) — use 3.11–3.13. Pure-logic tests (no models needed):
+`python -m unittest tests.test_live_translate tests.test_subtitles -v`.
 
 ## Troubleshooting
 
